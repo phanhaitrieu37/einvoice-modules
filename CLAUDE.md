@@ -39,8 +39,8 @@ Muốn đổi một dòng ở trên: trình bày quyết định gốc, lý do, 
 |---|---|---|---|
 | Người dùng | chủ dự án | mọi thứ | Chốt quyết định, cấp credential, chuyển câu hỏi kế toán, xử lý review case (SLO 1 ngày làm việc), push và release. |
 | Coordinator | phiên Claude chính | `plans/`, file cấu hình repo, merge nhánh phase | Lập plan, chia file ownership, dispatch worker qua orca (run riêng cho module này), gom kết quả, hỏi người dùng. Không tự code phase đã giao cho worker. |
-| Worker | orca, model `claude-opus-5-5` hoặc model người dùng chỉ định | chỉ các file được giao trong phase, trong worktree riêng | Code và test một phase, ghi report phase vào `plans/reports/`. Không merge, không sửa file ngoài ownership, không sửa plan. |
-| Reviewer | agent `code-reviewer` độc lập, không phải worker vừa code | không sửa code | Đọc diff, chạy lại test, trả PASS hoặc CHANGES_REQUESTED kèm bằng chứng. Bắt buộc sau mỗi phase. |
+| Worker | codex qua orca, model `gpt-6-luna` effort `high` (hoặc model người dùng chỉ định) | chỉ các file được giao trong phase, trong worktree riêng | Thực thi plan: code và test một phase, ghi report phase vào `plans/reports/`. Không merge, không sửa file ngoài ownership, không sửa plan. Deny rule của `.claude/settings.json` không ràng buộc codex, nên brief phải ghi lại đủ các ràng buộc ở mục "SePay và secret" và "Git". |
+| Reviewer | agent Claude `code-reviewer` độc lập, không phải worker vừa code | không sửa code | Review khắt khe theo plan: chạy lại mọi Verify, đối chiếu từng dòng với spec và ý định của spec, thử làm hỏng code để chứng minh test bắt được lỗi, kiểm bất biến trên Postgres thật, kiểm hard rule. Trả PASS hoặc CHANGES_REQUESTED kèm bằng chứng. Bắt buộc sau mỗi phase và sau mỗi vòng sửa. |
 | Kongming gate | agent `kongming` | không sửa code | Tư vấn go/no-go sau reviewer ở mỗi phase và khi bế tắc. |
 | Codex review | `codex exec --sandbox read-only` | không sửa gì | Review khắt khe trước release hoặc khi người dùng yêu cầu. |
 
