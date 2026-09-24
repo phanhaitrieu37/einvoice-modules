@@ -101,6 +101,12 @@ def test_schema_v1_has_no_invoice_module_imports() -> None:
         / "src/invoice_module/adapters/sqlalchemy/migrations/schema_v1.py"
     )
     tree = ast.parse(path.read_text())
+    relative = [
+        node.module or "."
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.level > 0
+    ]
+    assert not relative
     imported = [node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
     imported.extend(
         alias.name

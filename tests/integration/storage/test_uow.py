@@ -181,10 +181,10 @@ async def test_lock_host_ref_serializes_two_sessions(
             async with SqlAlchemyInvoiceUnitOfWork.joined(session, inv_tables) as uow:
                 attempted_b.set()
                 await uow.lock_host_ref("tenant-test", "order", "same")
+                acquired_b.set()
+                await a_committed.wait()
+                order.append("b_acquired")
             await session.commit()
-            await a_committed.wait()
-            order.append("b_acquired")
-            acquired_b.set()
 
     await asyncio.wait_for(asyncio.gather(session_a(), session_b()), timeout=5)
     assert order == ["a_commit", "b_acquired"]
@@ -233,6 +233,21 @@ async def test_joined_write_then_lock_fails_without_losing_row(
             with pytest.raises(RuntimeError, match="lock_host_ref must precede joined work"):
                 await uow.lock_host_ref("tenant-test", "order", "written-first")
             await uow.commit()
+        await host.commit()
+    assert await _present(engine, inv_tables.invoice_drafts, row["id"])  # type: ignore[arg-type]
+
+
+async def test_joined_committed_write_then_lock_fails_without_losing_row(
+    engine: AsyncEngine, inv_tables: InvoiceTables
+) -> None:
+    row = draft_row(inv_tables)
+    async with AsyncSession(engine) as host:
+        await host.begin()
+        async with SqlAlchemyInvoiceUnitOfWork.joined(host, inv_tables) as uow:
+            await uow.session.execute(inv_tables.invoice_drafts.insert().values(**row))
+            await uow.commit()
+            with pytest.raises(RuntimeError, match="lock_host_ref must precede joined work"):
+                await uow.lock_host_ref("tenant-test", "order", "committed-first")
         await host.commit()
     assert await _present(engine, inv_tables.invoice_drafts, row["id"])  # type: ignore[arg-type]
 
