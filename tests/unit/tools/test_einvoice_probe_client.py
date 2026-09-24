@@ -2,9 +2,12 @@ import base64
 import hashlib
 import inspect
 import json
+from datetime import datetime
+from itertools import pairwise
 from pathlib import Path
 
 import httpx
+import pytest
 
 from tools.einvoice_probe.candidates import CANDIDATES
 from tools.einvoice_probe.client import SANDBOX_BASE_URL, ProbeClient
@@ -159,6 +162,9 @@ def test_api_candidate_routes_match_raw_docs() -> None:
     assert CANDIDATES["list_invoices"]["source"] == "danh-sach-hoa-don"
     assert CANDIDATES["download"]["parameter"] == "type=pdf|xml"
     assert CANDIDATES["download"]["source"] == "tai-hoa-don"
+    assert CANDIDATES["download"]["identifier"] == "tracking_code"
+    assert CANDIDATES["download"]["fallback_identifier"] == "reference_code"
+    assert CANDIDATES["download"]["fallback_source"] == "chi-tiet-hoa-don"
     assert CANDIDATES["quota"]["path"] == "/v1/usage"
     assert CANDIDATES["quota"]["source"] == "kiem-tra-han-ngach"
     assert CANDIDATES["publish"]["path"] == "/v1/invoices/issue"
@@ -203,6 +209,8 @@ def test_ambiguous_template_error_suggests_selector() -> None:
         select_provider_account({"body": {"data": {"items": [account], "paging": PAGING}}})
     except RuntimeError as error:
         assert "--template-code" in str(error)
+        assert "Multiple invoice templates or series are available" in str(error)
+        assert "found 0" not in str(error)
     else:
         raise AssertionError("ambiguous account should request a selector")
 
@@ -307,6 +315,7 @@ def test_s1_flow_with_mock_transport(monkeypatch) -> None:
 
     polls = 0
     creates: list[dict] = []
+    create_methods: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal polls
@@ -314,8 +323,9 @@ def test_s1_flow_with_mock_transport(monkeypatch) -> None:
         if setup:
             return setup
         if request.url.path == "/v1/invoices/create":
+            create_methods.append(request.method)
             creates.append(json.loads(request.content))
-            return httpx.Response(202, json={"success": True, "data": {"tracking_code": "track-1"}})
+            return httpx.Response(200, json={"success": True, "data": {"tracking_code": "track-1"}})
         if request.url.path.endswith("/track-1"):
             polls += 1
             state = "Pending" if polls == 1 else "Success"
@@ -344,6 +354,7 @@ def test_s1_flow_with_mock_transport(monkeypatch) -> None:
     assert payload["items"][0]["item_name"] == "Probe item"
     assert payload["total_amount"] == 1100
     assert sleeps == [2.5]
+    assert create_methods == ["POST"]
 
 
 def test_s2_records_409_and_lookup(monkeypatch) -> None:
@@ -363,10 +374,10 @@ def test_s2_records_409_and_lookup(monkeypatch) -> None:
             body = json.loads(request.content)
             if creates == 1:
                 sent_reference = body["reference_code"]
-            status = 202 if creates == 1 else 409
+            status = 200 if creates == 1 else 409
             body = (
                 {"success": True, "data": {"tracking_code": "tr-1"}}
-                if status == 202
+                if status == 200
                 else {
                     "success": False,
                     "error": {"code": "DOCUMENT_EXISTS", "message": "Already exists"},
@@ -399,7 +410,7 @@ def test_s2_records_409_and_lookup(monkeypatch) -> None:
             probe, tax_rate="10", issued_date=ISSUED, sleep=clock.sleep, clock=clock
         )
     assert result["scenario"] == "PASS"
-    assert result["first"]["status"] == 202
+    assert result["first"]["status"] == 200
     assert result["first_polls"][-1]["body"]["data"]["status"] == "Success"
     assert result["first_polls"][-1]["retry_next_at"] is None
     assert result["duplicate"]["status"] == 409
@@ -422,12 +433,12 @@ def test_s2_pending_first_create_is_not_a_pass() -> None:
             creates += 1
             if creates == 1:
                 sent_reference = json.loads(request.content)["reference_code"]
-            status = 202 if creates == 1 else 409
+            status = 200 if creates == 1 else 409
             return httpx.Response(
                 status,
                 json=(
                     {"success": True, "data": {"tracking_code": "pending"}}
-                    if status == 202
+                    if status == 200
                     else {
                         "success": False,
                         "error": {"code": "DOCUMENT_EXISTS", "message": "Already exists"},
@@ -483,7 +494,7 @@ def test_s2_lookup_must_match_reference_code() -> None:
             creates += 1
             if creates == 1:
                 return httpx.Response(
-                    202, json={"success": True, "data": {"tracking_code": "track"}}
+                    200, json={"success": True, "data": {"tracking_code": "track"}}
                 )
             return httpx.Response(
                 409,
@@ -535,7 +546,7 @@ def test_s2_duplicate_without_409_is_fail() -> None:
         if request.url.path == "/v1/invoices/create":
             creates += 1
             sent_reference = json.loads(request.content)["reference_code"]
-            return httpx.Response(202, json={"success": True, "data": {"tracking_code": "track"}})
+            return httpx.Response(200, json={"success": True, "data": {"tracking_code": "track"}})
         if request.url.path.endswith("/track"):
             return httpx.Response(
                 200,
@@ -563,7 +574,7 @@ def test_s2_duplicate_without_409_is_fail() -> None:
             probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
         )
     assert result["first_state"] == "Success"
-    assert result["duplicate"]["status"] == 202
+    assert result["duplicate"]["status"] == 200
     assert result["scenario"] == "FAIL"
 
 
@@ -624,7 +635,7 @@ def test_s2_failed_first_create_is_not_successful() -> None:
             if creates == 1:
                 reference = json.loads(request.content)["reference_code"]
                 return httpx.Response(
-                    202, json={"success": True, "data": {"tracking_code": "failed-track"}}
+                    200, json={"success": True, "data": {"tracking_code": "failed-track"}}
                 )
             return httpx.Response(
                 409,
@@ -667,7 +678,7 @@ def test_s2_detail_with_different_reference_does_not_match() -> None:
             if creates == 1:
                 reference = json.loads(request.content)["reference_code"]
                 return httpx.Response(
-                    202, json={"success": True, "data": {"tracking_code": "track"}}
+                    200, json={"success": True, "data": {"tracking_code": "track"}}
                 )
             return httpx.Response(
                 409,
@@ -712,7 +723,7 @@ def test_s3_sync_reject_is_inconclusive(monkeypatch) -> None:
             creates += 1
             if creates == 1:
                 return httpx.Response(
-                    202, json={"success": True, "data": {"tracking_code": "control"}}
+                    200, json={"success": True, "data": {"tracking_code": "control"}}
                 )
             return httpx.Response(422, json={"success": False, "error": {"code": "INVALID"}})
         if request.url.path.endswith("/control"):
@@ -767,7 +778,7 @@ def test_evidence_file_shape(monkeypatch) -> None:
                 )
             track_count += 1
             return httpx.Response(
-                202, json={"success": True, "data": {"tracking_code": f"track-{track_count}"}}
+                200, json={"success": True, "data": {"tracking_code": f"track-{track_count}"}}
             )
         if "/create/check/" in request.url.path:
             tracking = request.url.path.rsplit("/", 1)[-1]
@@ -799,6 +810,10 @@ def test_evidence_file_shape(monkeypatch) -> None:
 
     with client_with(handler) as probe:
         result = evidence(probe, tax_rate="10", issued_date=ISSUED, sleep=clock.sleep, clock=clock)
+    assert result["environment"] == "test"
+    assert datetime.fromisoformat(result["generated_at"]).tzinfo is not None
+    assert result["details"]["s3_variant"] == "async_failed"
+    assert result["details"]["s3_variant"] == result["details"]["s3"]["variant"]
     assert result["scenarios"] == {
         "s1": "PASS",
         "s2": "PASS",
@@ -818,6 +833,12 @@ def test_evidence_file_shape(monkeypatch) -> None:
     assert result["details"]["s4"]["xml_url"] is None
     assert download_types == ["pdf", "xml"]
     assert all("files.example.test" not in url for url in request_urls)
+    s4_tracking = result["details"]["s4"]["issue"]["tracking_code"]
+    download_paths = [httpx.URL(url).path for url in request_urls if "/download" in url]
+    assert download_paths == [f"/v1/invoices/{s4_tracking}/download"] * 2
+    for item in result["details"]["s4"]["downloads"].values():
+        assert item["identifier"] == "tracking_code"
+        assert item["attempts"] == [{"identifier": "tracking_code", "status": 200}]
 
 
 def test_evidence_async_failed_resend_success_is_pass(monkeypatch) -> None:
@@ -842,7 +863,7 @@ def test_evidence_async_failed_resend_success_is_pass(monkeypatch) -> None:
             tracking = f"evidence-track-{track_count}"
             reference_by_track[tracking] = ref
             return httpx.Response(
-                202,
+                200,
                 json={"success": True, "data": {"tracking_code": tracking}},
             )
         if "/create/check/" in request.url.path:
@@ -871,7 +892,7 @@ def test_evidence_async_failed_resend_success_is_pass(monkeypatch) -> None:
     with client_with(handler) as probe:
         result = evidence(probe, tax_rate="10", issued_date=ISSUED, sleep=clock.sleep, clock=clock)
     assert result["scenarios"]["s3"] == "PASS"
-    assert result["details"]["s3"]["retry_create_status"] == 202
+    assert result["details"]["s3"]["retry_create_status"] == 200
 
 
 def test_evidence_download_metadata_must_match_requested_type(monkeypatch) -> None:
@@ -887,7 +908,7 @@ def test_evidence_download_metadata_must_match_requested_type(monkeypatch) -> No
         if request.url.path == "/v1/invoices/create":
             creates += 1
             return httpx.Response(
-                202, json={"success": True, "data": {"tracking_code": f"t{creates}"}}
+                200, json={"success": True, "data": {"tracking_code": f"t{creates}"}}
             )
         if "/create/check/" in request.url.path:
             return check_response("Success", invoice={"pdf_url": "/sandbox/p.pdf", "xml_url": None})
@@ -967,7 +988,7 @@ def test_s4_download_404_marks_evidence_failed(monkeypatch) -> None:
         if request.url.path == "/v1/invoices/create":
             created += 1
             return httpx.Response(
-                202, json={"success": True, "data": {"tracking_code": f"track-{created}"}}
+                200, json={"success": True, "data": {"tracking_code": f"track-{created}"}}
             )
         if "/create/check/" in request.url.path:
             return httpx.Response(
@@ -1005,6 +1026,7 @@ def test_s4_download_404_marks_evidence_failed(monkeypatch) -> None:
 
 def test_s4_issue_failure_stays_fail_even_when_downloads_succeed() -> None:
     downloads = 0
+    clock = FakeClock()
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal downloads
@@ -1012,20 +1034,16 @@ def test_s4_issue_failure_stays_fail_even_when_downloads_succeed() -> None:
         if setup:
             return setup
         if request.url.path == "/v1/invoices/create":
-            return httpx.Response(
-                400,
-                json={
-                    "success": False,
-                    "error": {"code": "BAD_REQUEST", "message": "Invalid request"},
-                },
-            )
+            return httpx.Response(200, json={"success": True, "data": {"tracking_code": "track"}})
+        if request.url.path.endswith("/create/check/track"):
+            return check_response("Failed")
         if request.url.path.endswith("/download"):
             downloads += 1
             return download_response(request)
         raise AssertionError(request.url.path)
 
     with client_with(handler) as probe:
-        result = s4_download(probe, tax_rate=10, issued_date=ISSUED)
+        result = s4_download(probe, tax_rate=10, issued_date=ISSUED, sleep=clock.sleep, clock=clock)
     assert result["issue"]["scenario"] == "FAIL"
     assert result["scenario"] == "FAIL"
     assert downloads == 2
@@ -1062,7 +1080,7 @@ def test_s1_check_4xx_stops_polling_as_inconclusive() -> None:
         if setup:
             return setup
         if request.url.path == "/v1/invoices/create":
-            return httpx.Response(202, json={"success": True, "data": {"tracking_code": "track"}})
+            return httpx.Response(200, json={"success": True, "data": {"tracking_code": "track"}})
         if request.url.path.endswith("/track"):
             checks += 1
             return httpx.Response(
@@ -1127,13 +1145,13 @@ def test_s3_async_failed_retries_same_reference_and_polls_success(monkeypatch) -
             create_payloads.append(payload)
             if create_count == 1:
                 return httpx.Response(
-                    202, json={"success": True, "data": {"tracking_code": "control"}}
+                    200, json={"success": True, "data": {"tracking_code": "control"}}
                 )
             if create_count == 2:
                 return httpx.Response(
-                    202, json={"success": True, "data": {"tracking_code": "failed"}}
+                    200, json={"success": True, "data": {"tracking_code": "failed"}}
                 )
-            return httpx.Response(202, json={"success": True, "data": {"tracking_code": "retry"}})
+            return httpx.Response(200, json={"success": True, "data": {"tracking_code": "retry"}})
         if request.url.path.endswith("/control"):
             return httpx.Response(
                 200,
@@ -1177,7 +1195,7 @@ def test_s3_async_failed_retries_same_reference_and_polls_success(monkeypatch) -
             probe, tax_rate="10", issued_date=ISSUED, sleep=clock.sleep, clock=clock
         )
     assert result["scenario"] == "PASS"
-    assert result["retry_create_status"] == 202
+    assert result["retry_create_status"] == 200
     assert create_payloads[1]["reference_code"] == create_payloads[2]["reference_code"]
     assert "tax_code" in create_payloads[1]["buyer"]
     assert "tax_code" not in create_payloads[2]["buyer"]
@@ -1195,7 +1213,7 @@ def test_s3_resend_ending_failed_is_inconclusive() -> None:
         if request.url.path == "/v1/invoices/create":
             creates += 1
             tracking = {1: "control", 2: "original", 3: "retry"}[creates]
-            return httpx.Response(202, json={"success": True, "data": {"tracking_code": tracking}})
+            return httpx.Response(200, json={"success": True, "data": {"tracking_code": tracking}})
         state = "Success" if request.url.path.endswith("/control") else "Failed"
         return httpx.Response(
             200,
@@ -1261,10 +1279,10 @@ def test_s3_404_is_not_triggerable(monkeypatch) -> None:
             return setup
         if request.url.path == "/v1/invoices/create":
             creates += 1
-            status = 202 if creates == 1 else 404
+            status = 200 if creates == 1 else 404
             body = (
                 {"success": True, "data": {"tracking_code": "control"}}
-                if status == 202
+                if status == 200
                 else {"success": False, "error": {"code": "NOT_FOUND", "message": "Not found"}}
             )
             return httpx.Response(status, json=body)
@@ -1300,7 +1318,7 @@ def test_s3_pending_at_bound_is_reported(monkeypatch) -> None:
         if setup:
             return setup
         if request.url.path == "/v1/invoices/create":
-            return httpx.Response(202, json={"success": True, "data": {"tracking_code": "control"}})
+            return httpx.Response(200, json={"success": True, "data": {"tracking_code": "control"}})
         if request.url.path.endswith("/control"):
             polls += 1
             return httpx.Response(
@@ -1338,7 +1356,7 @@ def test_s3_pending_at_bound_records_reason(monkeypatch) -> None:
         if request.url.path == "/v1/invoices/create":
             create_count += 1
             return httpx.Response(
-                202,
+                200,
                 json={"success": True, "data": {"tracking_code": f"track-{create_count}"}},
             )
         return httpx.Response(
@@ -1359,6 +1377,8 @@ def test_s3_pending_at_bound_records_reason(monkeypatch) -> None:
         )
     assert result["poll_exhausted"] is True
     assert result["reason"] == "pending_at_bound"
+    assert result["variant"] == "not_triggerable"
+    assert result["scenario"] == "INCONCLUSIVE"
 
 
 def test_s3_pending_then_failed_records_each_poll() -> None:
@@ -1374,7 +1394,7 @@ def test_s3_pending_then_failed_records_each_poll() -> None:
         if request.url.path == "/v1/invoices/create":
             create_count += 1
             code = "control" if create_count == 1 else "failed-track"
-            return httpx.Response(202, json={"success": True, "data": {"tracking_code": code}})
+            return httpx.Response(200, json={"success": True, "data": {"tracking_code": code}})
         if request.url.path.endswith("failed-track"):
             poll_count += 1
             state = "Pending" if poll_count == 1 else "Failed"
@@ -1398,7 +1418,7 @@ def test_evidence_s1_failed_and_pending_statuses() -> None:
     assert (
         _success(
             {
-                "create": {"status": 202},
+                "create": {"status": 200},
                 "polls": [{"status": 200, "body": {"data": {"status": "Failed"}}}],
             }
         )
@@ -1407,7 +1427,7 @@ def test_evidence_s1_failed_and_pending_statuses() -> None:
     assert (
         _success(
             {
-                "create": {"status": 202},
+                "create": {"status": 200},
                 "polls": [{"status": 200, "body": {"data": {"status": "Pending"}}}],
                 "poll_exhausted": True,
             }
@@ -1434,7 +1454,7 @@ def test_evidence_preserves_s1_failed_and_pending_status(monkeypatch) -> None:
         "s1_create_poll",
         lambda *args, **kwargs: {
             "scenario": "FAIL",
-            "create": {"status": 202},
+            "create": {"status": 200},
             "polls": [{"body": {"data": {"status": "Failed"}}}],
         },
     )
@@ -1455,7 +1475,7 @@ def test_evidence_preserves_s1_failed_and_pending_status(monkeypatch) -> None:
         "s1_create_poll",
         lambda *args, **kwargs: {
             "scenario": "INCONCLUSIVE",
-            "create": {"status": 202},
+            "create": {"status": 200},
             "polls": [{"body": {"data": {"status": "Pending"}}}],
             "poll_exhausted": True,
         },
@@ -1594,3 +1614,396 @@ def test_cli_validates_datetime_without_rewriting_value() -> None:
         assert "YYYY-MM-DD HH:mm:ss" in str(error)
     else:
         raise AssertionError("date-only input should be rejected")
+
+
+def s3_handler(invalid_create: httpx.Response, invalid_state: str | None = None):
+    """Control create succeeds; the invalid-MST create answers as given."""
+    creates = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal creates
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            creates += 1
+            if creates == 1:
+                return httpx.Response(
+                    200, json={"success": True, "data": {"tracking_code": "control"}}
+                )
+            return invalid_create
+        if request.url.path.endswith("/control"):
+            return check_response("Success")
+        if invalid_state and request.url.path.endswith("/invalid"):
+            return check_response(invalid_state)
+        raise AssertionError(request.url.path)
+
+    return handler
+
+
+def test_s3_invalid_create_ending_success_is_not_triggerable() -> None:
+    clock = FakeClock()
+    accepted = httpx.Response(200, json={"success": True, "data": {"tracking_code": "invalid"}})
+    with client_with(s3_handler(accepted, "Success")) as probe:
+        result = s3_failed_then_retry(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=clock.sleep, clock=clock
+        )
+    assert result["variant"] == "not_triggerable"
+    assert result["reason"] == "created_success"
+    assert result["retry"] is None
+    assert result["scenario"] == "INCONCLUSIVE"
+
+
+def test_s3_sync_reject_400_is_sync_reject() -> None:
+    rejected = httpx.Response(
+        400, json={"success": False, "error": {"code": "INVALID_TAX_CODE", "message": "Bad"}}
+    )
+    with client_with(s3_handler(rejected)) as probe:
+        result = s3_failed_then_retry(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    assert result["variant"] == "sync_reject"
+    assert result["reason"] is None
+    assert result["create_status"] == 400
+    assert result["scenario"] == "INCONCLUSIVE"
+
+
+@pytest.mark.parametrize("duplicate_status", [400, 422])
+def test_s2_duplicate_rejected_without_409_is_fail(duplicate_status: int) -> None:
+    creates = 0
+    reference = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal creates, reference
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            creates += 1
+            if creates == 1:
+                reference = json.loads(request.content)["reference_code"]
+                return httpx.Response(
+                    200, json={"success": True, "data": {"tracking_code": "track"}}
+                )
+            return httpx.Response(
+                duplicate_status,
+                json={"success": False, "error": {"code": "INVALID", "message": "Rejected"}},
+            )
+        if request.url.path.endswith("/track"):
+            return check_response("Success")
+        if request.url.path == f"/v1/invoices/{reference}":
+            return httpx.Response(
+                200, json={"success": True, "data": {"reference_code": reference}}
+            )
+        if request.url.path == "/v1/invoices":
+            return httpx.Response(
+                200, json={"success": True, "data": paging([{"reference_code": reference}])}
+            )
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        result = s2_duplicate_reference(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    assert result["first_state"] == "Success"
+    assert any(item["matched"] for item in result["lookups"])
+    assert result["duplicate"]["status"] == duplicate_status
+    assert result["scenario"] == "FAIL"
+
+
+def s4_handler(download):
+    """s4 issue succeeds with tracking code "track"; downloads answer via `download`."""
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            return httpx.Response(200, json={"success": True, "data": {"tracking_code": "track"}})
+        if request.url.path.endswith("/create/check/track"):
+            return check_response("Success")
+        if request.url.path.endswith("/download"):
+            paths.append(request.url.path)
+            return download(request)
+        raise AssertionError(request.url.path)
+
+    return handler, paths
+
+
+def with_content(request: httpx.Request, content: str) -> httpx.Response:
+    body = download_response(request).json()
+    body["data"]["content"] = content
+    return httpx.Response(200, json=body)
+
+
+def test_s4_empty_xml_content_is_fail() -> None:
+    def download(request: httpx.Request) -> httpx.Response:
+        if request.url.params["type"] == "xml":
+            return with_content(request, "")
+        return download_response(request)
+
+    handler, paths = s4_handler(download)
+    with client_with(handler) as probe:
+        result = s4_download(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    assert result["issue"]["scenario"] == "PASS"
+    assert result["downloads"]["pdf"]["size"] > 0
+    assert result["downloads"]["xml"]["status"] == 200
+    assert result["downloads"]["xml"]["size"] == 0
+    assert result["downloads"]["xml"]["sha256"] is None
+    assert result["scenario"] == "FAIL"
+    assert paths == ["/v1/invoices/track/download"] * 2
+
+
+def test_s4_accepts_mime_wrapped_base64_and_rejects_undecodable() -> None:
+    xml = b"<invoice>" + b"sandbox-line " * 20 + b"</invoice>"
+    encoded = base64.encodebytes(xml).decode()
+    assert "\n" in encoded
+
+    def download(request: httpx.Request) -> httpx.Response:
+        if request.url.params["type"] == "xml":
+            return with_content(request, encoded)
+        return download_response(request)
+
+    handler, _ = s4_handler(download)
+    with client_with(handler) as probe:
+        result = s4_download(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    assert result["downloads"]["xml"]["size"] == len(xml)
+    assert result["downloads"]["xml"]["sha256"] == hashlib.sha256(xml).hexdigest()
+    assert result["scenario"] == "PASS"
+
+    for garbage in ("%%%%", "abc"):
+        handler, _ = s4_handler(
+            lambda request, garbage=garbage: (
+                with_content(request, garbage)
+                if request.url.params["type"] == "pdf"
+                else download_response(request)
+            )
+        )
+        with client_with(handler) as probe:
+            result = s4_download(
+                probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+            )
+        assert result["downloads"]["pdf"]["size"] == 0, garbage
+        assert result["scenario"] == "FAIL", garbage
+
+
+def test_s4_download_falls_back_to_reference_code_on_404() -> None:
+    def download(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/invoices/track/download":
+            return httpx.Response(
+                404, json={"success": False, "error": {"code": "NOT_FOUND", "message": "No"}}
+            )
+        return download_response(request)
+
+    handler, paths = s4_handler(download)
+    with client_with(handler) as probe:
+        result = s4_download(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    reference = result["issue"]["reference_code"]
+    assert (
+        paths
+        == [
+            "/v1/invoices/track/download",
+            f"/v1/invoices/{reference}/download",
+        ]
+        * 2
+    )
+    for item in result["downloads"].values():
+        assert item["identifier"] == "reference_code"
+        assert item["attempts"] == [
+            {"identifier": "tracking_code", "status": 404},
+            {"identifier": "reference_code", "status": 200},
+        ]
+    assert result["scenario"] == "PASS"
+
+
+def test_s4_download_does_not_fall_back_on_non_404() -> None:
+    def download(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400, json={"success": False, "error": {"code": "BAD_REQUEST", "message": "type"}}
+        )
+
+    handler, paths = s4_handler(download)
+    with client_with(handler) as probe:
+        result = s4_download(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    assert paths == ["/v1/invoices/track/download"] * 2
+    for item in result["downloads"].values():
+        assert item["identifier"] == "tracking_code"
+        assert item["attempts"] == [{"identifier": "tracking_code", "status": 400}]
+    assert result["scenario"] == "FAIL"
+
+
+def test_s4_skips_download_without_tracking_code() -> None:
+    downloads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal downloads
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            return httpx.Response(
+                400, json={"success": False, "error": {"code": "BAD_REQUEST", "message": "No"}}
+            )
+        if request.url.path.endswith("/download"):
+            downloads += 1
+            return download_response(request)
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        result = s4_download(probe, tax_rate=10, issued_date=ISSUED)
+    assert downloads == 0
+    for item in result["downloads"].values():
+        assert item["skipped"] == "missing_tracking_code"
+        assert item["status"] is None
+        assert item["attempts"] == []
+    assert result["scenario"] == "FAIL"
+
+
+def test_docs_shaped_account_selects_template_by_code_only() -> None:
+    two_templates = {
+        "success": True,
+        "data": {
+            "id": "account-1",
+            "templates": [
+                {"template_code": "2", "invoice_series": "C26TMA"},
+                {"template_code": "1", "invoice_series": "C26TSE"},
+            ],
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/token":
+            return token(request)
+        if request.url.path == "/v1/provider-accounts":
+            return httpx.Response(200, json=LIST_BODY)
+        if request.url.path == "/v1/provider-accounts/account-1":
+            return httpx.Response(200, json=two_templates)
+        raise AssertionError(request.url.path)
+
+    from tools.einvoice_probe.scenarios import select_provider_account
+
+    with client_with(handler) as probe:
+        selected = select_provider_account(accounts(probe), probe, template_code="1")
+    assert selected == {
+        "provider_account_id": "account-1",
+        "template_code": "1",
+        "invoice_series": "C26TSE",
+    }
+
+
+def test_inactive_account_is_skipped() -> None:
+    from tools.einvoice_probe.scenarios import select_provider_account
+
+    rows = [
+        {"id": "inactive", "active": False, "template_code": "1", "invoice_series": "C26TOLD"},
+        {"id": "active", "active": True, "template_code": "1", "invoice_series": "C26TSE"},
+    ]
+    selected = select_provider_account({"body": {"data": {"items": rows, "paging": PAGING}}})
+    assert selected["provider_account_id"] == "active"
+    assert selected["invoice_series"] == "C26TSE"
+
+
+def test_list_requests_use_documented_max_per_page() -> None:
+    per_page: dict[str, str] = {}
+    reference = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reference
+        if request.url.path in {"/v1/provider-accounts", "/v1/invoices"}:
+            per_page[request.url.path] = request.url.params["per_page"]
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            reference = json.loads(request.content)["reference_code"]
+            return httpx.Response(200, json={"success": True, "data": {"tracking_code": "track"}})
+        if request.url.path.endswith("/track"):
+            return check_response("Success")
+        if request.url.path == "/v1/invoices":
+            return httpx.Response(200, json={"success": True, "data": paging([])})
+        if request.url.path.startswith("/v1/invoices/"):
+            return httpx.Response(404, json={"success": False})
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        s2_duplicate_reference(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    assert per_page == {"/v1/provider-accounts": "100", "/v1/invoices": "100"}
+
+
+def test_token_is_cached_across_requests() -> None:
+    token_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_requests
+        if request.url.path == "/v1/token":
+            token_requests += 1
+            return token(request)
+        assert request.headers["Authorization"] == "Bearer mock.jwt.token"
+        return httpx.Response(200, json=LIST_BODY)
+
+    with client_with(handler) as probe:
+        probe.request_json("GET", "/v1/provider-accounts")
+        probe.request_json("GET", "/v1/provider-accounts")
+    assert token_requests == 1
+
+
+def test_requests_are_paced_half_a_second_apart(pace_clock) -> None:
+    sent_at: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent_at.append(pace_clock.now)
+        if request.url.path == "/v1/token":
+            return token(request)
+        return httpx.Response(200, json=LIST_BODY)
+
+    with client_with(handler) as probe:
+        probe.request_json("GET", "/v1/provider-accounts")
+        probe.request_json("GET", "/v1/provider-accounts")
+    assert len(sent_at) == 3
+    assert all(later - earlier >= 0.5 for earlier, later in pairwise(sent_at))
+    assert pace_clock.sleeps == [0.5, 0.5]
+
+
+def test_cli_requires_issued_date(tmp_path: Path, monkeypatch, capsys) -> None:
+    import tools.einvoice_probe.__main__ as cli
+
+    env_file = tmp_path / "probe.env"
+    env_file.write_text(
+        "SEPAY_EINVOICE_ENVIRONMENT=test\n"
+        "SEPAY_EINVOICE_SANDBOX_CLIENT_ID=offline-id\n"
+        "SEPAY_EINVOICE_SANDBOX_CLIENT_SECRET=offline-secret\n",
+        encoding="utf-8",
+    )
+
+    def no_network(*_args, **_kwargs):
+        raise AssertionError("the CLI built a client without --issued-date")
+
+    monkeypatch.setattr(cli, "ProbeClient", no_network)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "einvoice_probe",
+            "s1",
+            "--env",
+            str(env_file),
+            "--out",
+            str(tmp_path),
+            "--tax-rate",
+            "10",
+        ],
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+    assert exit_info.value.code == 2
+    assert "--issued-date is required" in capsys.readouterr().err

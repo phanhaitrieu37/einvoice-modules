@@ -44,6 +44,9 @@ CANDIDATES: dict[str, dict[str, str | bool | None]] = {
         "path": "/v1/invoices/{tracking_code}/download",
         "source": "tai-hoa-don",
         "parameter": "type=pdf|xml",
+        "identifier": "tracking_code",
+        "fallback_identifier": "reference_code",
+        "fallback_source": "chi-tiet-hoa-don",
         "verified": False,
     },
     "list_invoices": {

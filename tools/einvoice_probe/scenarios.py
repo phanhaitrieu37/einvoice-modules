@@ -21,10 +21,15 @@ POLL_INTERVAL_SECONDS = 2.5
 POLL_TIMEOUT_SECONDS = 150.0
 POLL_LIMIT = 61
 INVALID_NONEXISTENT_TAX_CODE = "9999999997"
+MAX_PER_PAGE = "100"
+AMBIGUOUS_TEMPLATE_MESSAGE = (
+    "Multiple invoice templates or series are available; supply "
+    "--template-code and --invoice-series."
+)
 
 
 def accounts(client: ProbeClient, out_dir: str | Path | None = None) -> dict[str, Any]:
-    listing = _call(client, "provider_accounts", params={"page": "1", "per_page": "200"})
+    listing = _call(client, "provider_accounts", params={"page": "1", "per_page": MAX_PER_PAGE})
     records = _account_records(_value(listing.get("body", {}), "data"))
     details = [
         _call(
@@ -55,6 +60,7 @@ def select_provider_account(
     data = envelope.get("data", {}) if isinstance(envelope, dict) else {}
     records = _account_records(data)
     selected: list[dict[str, str]] = []
+    ambiguous = False
     for record in records:
         if record.get("active") is False:
             continue
@@ -75,6 +81,7 @@ def select_provider_account(
         )
         nested = _find_provider_details(saved, template_code, invoice_series)
         detail.update({key: value or nested[key] for key, value in detail.items()})
+        sources = [record, saved]
         if (
             client
             and detail["provider_account_id"]
@@ -87,10 +94,17 @@ def select_provider_account(
             )
             nested = _find_provider_details(_data(response_detail), template_code, invoice_series)
             detail.update({key: value or nested[key] for key, value in detail.items()})
+            sources.append(_data(response_detail))
         if all(
             detail.get(key) for key in ("provider_account_id", "template_code", "invoice_series")
         ):
             selected.append(detail)
+        elif any(
+            len(_template_choices(source, template_code, invoice_series)) > 1 for source in sources
+        ):
+            ambiguous = True
+    if not selected and ambiguous:
+        raise RuntimeError(AMBIGUOUS_TEMPLATE_MESSAGE)
     if len(selected) != 1:
         hint = " Use --template-code and --invoice-series to select an option." if records else ""
         raise RuntimeError(
@@ -162,7 +176,7 @@ def s2_duplicate_reference(
             client,
             key,
             path_values={"reference_code": ref},
-            params={"page": "1", "per_page": "200"} if key == "list_invoices" else None,
+            params={"page": "1", "per_page": MAX_PER_PAGE} if key == "list_invoices" else None,
         )
         response["candidate"] = key
         response["matched"] = _lookup_matches(key, response, ref)
@@ -251,6 +265,8 @@ def s3_failed_then_retry(
             variant = "async_failed"
         elif poll_exhausted:
             variant, reason = "not_triggerable", "pending_at_bound"
+        elif final_state == "Success":
+            variant, reason = "not_triggerable", "created_success"
         else:
             variant, reason = "not_triggerable", "failed_create_or_poll_missing_tracking"
     result = {
@@ -304,7 +320,9 @@ def s4_download(
     invoice = _value(_data(final), "invoice") or {}
     urls = {"pdf": _value(invoice, "pdf_url"), "xml": _value(invoice, "xml_url")}
     downloads = {
-        kind: _download_artifact(client, issued.get("tracking_code"), kind)
+        kind: _download_with_fallback(
+            client, issued.get("tracking_code"), issued.get("reference_code"), kind
+        )
         for kind in ("pdf", "xml")
     }
     result = {
@@ -379,10 +397,7 @@ def evidence(
     except Exception as error:
         message = str(error)
         if "--template-code" in message:
-            message = (
-                "Multiple invoice templates or series are available; supply "
-                "--template-code and --invoice-series."
-            )
+            message = AMBIGUOUS_TEMPLATE_MESSAGE
         account_error = {
             "scenario": "ERROR",
             "error_class": type(error).__name__,
@@ -588,15 +603,42 @@ def _retry_next_at(result: dict[str, Any]) -> Any:
     return _value(retry, "next_retry_at") if isinstance(retry, dict) else None
 
 
-def _download_artifact(client: ProbeClient, tracking_code: str | None, kind: str) -> dict[str, Any]:
-    path = str(CANDIDATES["download"]["path"]).replace("{tracking_code}", str(tracking_code or ""))
+def _download_with_fallback(
+    client: ProbeClient, tracking_code: str | None, reference_code: str | None, kind: str
+) -> dict[str, Any]:
+    """Try the tai-hoa-don identifier, then the chi-tiet-hoa-don one once on 404."""
+    if not tracking_code:
+        return {
+            "status": None,
+            "size": 0,
+            "sha256": None,
+            "file_type": None,
+            "file_name": None,
+            "content_type": None,
+            "identifier": None,
+            "attempts": [],
+            "skipped": "missing_tracking_code",
+        }
+    result = _download_artifact(client, tracking_code, kind)
+    identifier = "tracking_code"
+    attempts = [{"identifier": identifier, "status": result["status"]}]
+    if result["status"] == 404 and reference_code:
+        result = _download_artifact(client, reference_code, kind)
+        identifier = "reference_code"
+        attempts.append({"identifier": identifier, "status": result["status"]})
+    return {**result, "identifier": identifier, "attempts": attempts}
+
+
+def _download_artifact(client: ProbeClient, identifier: str, kind: str) -> dict[str, Any]:
+    path = str(CANDIDATES["download"]["path"]).replace("{tracking_code}", identifier)
     status, response, headers = client.request_json("GET", path, params={"type": kind})
     data = _data({"body": response})
     encoded = _value(data, "content")
     decoded = b""
     if isinstance(encoded, str):
         try:
-            decoded = base64.b64decode(encoded, validate=True)
+            # Non-strict decoding drops MIME line breaks; garbage still decodes to nothing.
+            decoded = base64.b64decode(encoded)
         except (ValueError, TypeError):
             decoded = b""
     return {
@@ -622,15 +664,7 @@ def _find_provider_details(
         template = template or _value(details, "template_code")
         series = series or _value(details, "invoice_series")
     if isinstance(details, list):
-        choices = [item for item in details if isinstance(item, dict)]
-        if preferred_template:
-            choices = [
-                item for item in choices if _value(item, "template_code") == preferred_template
-            ]
-        if preferred_series:
-            choices = [
-                item for item in choices if _value(item, "invoice_series") == preferred_series
-            ]
+        choices = _template_choices(record, preferred_template, preferred_series)
         templates = {_value(item, "template_code") for item in choices}
         series_values = {_value(item, "invoice_series") for item in choices}
         if len(templates) == 1:
@@ -642,6 +676,22 @@ def _find_provider_details(
         "template_code": str(template or ""),
         "invoice_series": str(series or ""),
     }
+
+
+def _template_choices(
+    record: dict[str, Any],
+    preferred_template: str | None = None,
+    preferred_series: str | None = None,
+) -> list[dict[str, Any]]:
+    details = record.get("details", record.get("templates", []))
+    if not isinstance(details, list):
+        return []
+    choices = [item for item in details if isinstance(item, dict)]
+    if preferred_template:
+        choices = [item for item in choices if _value(item, "template_code") == preferred_template]
+    if preferred_series:
+        choices = [item for item in choices if _value(item, "invoice_series") == preferred_series]
+    return choices
 
 
 def _account_records(value: Any) -> list[dict[str, Any]]:

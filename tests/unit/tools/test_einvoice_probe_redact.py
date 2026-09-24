@@ -5,6 +5,7 @@ def test_redact_tokens() -> None:
     result = redact(
         {
             "access_token": "secret",
+            "client_id": "secret",
             "client_secret": "secret",
             "Authorization": "Bearer secret",
             "token": "secret",
@@ -12,6 +13,7 @@ def test_redact_tokens() -> None:
     )
     assert result == {
         "access_token": "REDACTED",
+        "client_id": "REDACTED",
         "client_secret": "REDACTED",
         "Authorization": "REDACTED",
         "token": "REDACTED",
@@ -21,12 +23,22 @@ def test_redact_tokens() -> None:
 def test_redact_buyer_and_seller_pii() -> None:
     result = redact(
         {
-            "buyer": {"name": "Jane", "email": "jane@real.test", "tax_code": "1234567890"},
+            "buyer": {
+                "name": "Jane",
+                "email": "jane@real.test",
+                "tax_code": "1234567890",
+                "national_id": "001099012345",
+            },
             "seller": {"legal_name": "Seller", "address": "Street"},
         }
     )
     assert result == {
-        "buyer": {"name": "REDACTED", "email": "REDACTED", "tax_code": "0000000000"},
+        "buyer": {
+            "name": "REDACTED",
+            "email": "REDACTED",
+            "tax_code": "0000000000",
+            "national_id": "REDACTED",
+        },
         "seller": {"legal_name": "REDACTED", "address": "REDACTED"},
     }
 
