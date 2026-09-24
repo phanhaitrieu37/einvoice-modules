@@ -4,7 +4,11 @@ from typing import Self
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from invoice_module.adapters.sqlalchemy.repositories.base import SqlAlchemyRepository
+from invoice_module.adapters.sqlalchemy.repositories.documents import DocumentRepository
+from invoice_module.adapters.sqlalchemy.repositories.drafts import DraftRepository
+from invoice_module.adapters.sqlalchemy.repositories.issuer_accounts import IssuerAccountRepository
+from invoice_module.adapters.sqlalchemy.repositories.receipts import ReceiptRepository
+from invoice_module.adapters.sqlalchemy.repositories.review_cases import ReviewCaseRepository
 from invoice_module.adapters.sqlalchemy.tables import InvoiceTables
 
 
@@ -21,11 +25,11 @@ class SqlAlchemyInvoiceUnitOfWork:
         self._joined_committed_work = False
         self._locked_host_refs: set[str] = set()
         self._tracking_connection = None
-        self.issuer_accounts: SqlAlchemyRepository
-        self.drafts: SqlAlchemyRepository
-        self.receipts: SqlAlchemyRepository
-        self.documents: SqlAlchemyRepository
-        self.review_cases: SqlAlchemyRepository
+        self.issuer_accounts: IssuerAccountRepository
+        self.drafts: DraftRepository
+        self.receipts: ReceiptRepository
+        self.documents: DocumentRepository
+        self.review_cases: ReviewCaseRepository
 
     @classmethod
     def joined(cls, session: AsyncSession, tables: InvoiceTables) -> Self:
@@ -59,8 +63,11 @@ class SqlAlchemyInvoiceUnitOfWork:
         else:
             assert self._session_factory is not None
             self._session = self._session_factory()
-        for name in ("issuer_accounts", "drafts", "receipts", "documents", "review_cases"):
-            setattr(self, name, SqlAlchemyRepository(self.session, self._tables))
+        self.issuer_accounts = IssuerAccountRepository(self.session, self._tables)
+        self.drafts = DraftRepository(self.session, self._tables)
+        self.receipts = ReceiptRepository(self.session, self._tables)
+        self.documents = DocumentRepository(self.session, self._tables)
+        self.review_cases = ReviewCaseRepository(self.session, self._tables)
         return self
 
     async def __aexit__(
