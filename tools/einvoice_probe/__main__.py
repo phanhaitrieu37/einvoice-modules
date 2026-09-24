@@ -36,7 +36,9 @@ def main() -> int:
     )
     parser.add_argument("--env", required=True, help="sandbox environment file")
     parser.add_argument("--out", default=".evidence/p0", help="directory for redacted JSON output")
-    parser.add_argument("--tax-rate", help="required for invoice scenarios; supplied by the user")
+    parser.add_argument(
+        "--tax-rate", type=int, help="required integer tax rate; supplied by the user"
+    )
     parser.add_argument(
         "--issued-date",
         type=_issued_date,
@@ -106,12 +108,17 @@ def main() -> int:
         elif args.command == "s6":
             result = s6_quota(client)
         else:
+
+            def save_scenario(name: str, result: dict[str, object]) -> None:
+                write_json(output_dir, f"evidence_{name}", result)
+
             result = evidence(
                 client,
                 tax_rate=args.tax_rate,
                 issued_date=args.issued_date,
                 template_code=args.template_code,
                 invoice_series=args.invoice_series,
+                on_result=save_scenario,
             )
         target = write_json(output_dir, args.command, result)
         print(f"wrote {target}")

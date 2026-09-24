@@ -31,6 +31,23 @@ def test_redact_buyer_and_seller_pii() -> None:
     }
 
 
+def test_redact_seller_store_name() -> None:
+    assert redact({"seller_store": {"name": "Private branch", "code": "branch-a"}}) == {
+        "seller_store": {"name": "REDACTED", "code": "branch-a"}
+    }
+
+
+def test_seller_store_name_is_redacted_in_saved_probe_json(tmp_path) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    path = write_json(
+        tmp_path, "store", {"seller_store": {"name": "Private counter", "code": "ST-1"}}
+    )
+    saved = path.read_text(encoding="utf-8")
+    assert "Private counter" not in saved
+    assert "REDACTED" in saved
+
+
 def test_redact_nested_lists() -> None:
     result = redact({"data": [{"buyer": {"phone": "0900000000"}}, {"provider_account_id": "abc"}]})
     assert result == {

@@ -11,7 +11,6 @@ from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit, urlunsplit
 from uuid import uuid4
 
 from .candidates import CANDIDATES
@@ -93,14 +92,17 @@ def select_provider_account(
         ):
             selected.append(detail)
     if len(selected) != 1:
-        raise RuntimeError(f"expected exactly one usable provider account; found {len(selected)}")
+        hint = " Use --template-code and --invoice-series to select an option." if records else ""
+        raise RuntimeError(
+            f"expected exactly one usable provider account; found {len(selected)}.{hint}"
+        )
     return selected[0]
 
 
 def s1_create_poll(
     client: ProbeClient,
     *,
-    tax_rate: str,
+    tax_rate: int | str,
     issued_date: str,
     account: dict[str, str] | None = None,
     template_code: str | None = None,
@@ -133,7 +135,7 @@ def s1_create_poll(
 def s2_duplicate_reference(
     client: ProbeClient,
     *,
-    tax_rate: str,
+    tax_rate: int | str,
     issued_date: str,
     account: dict[str, str] | None = None,
     template_code: str | None = None,
@@ -154,10 +156,17 @@ def s2_duplicate_reference(
         else ([], False)
     )
     duplicate = _call(client, "create", payload=payload)
-    lookups = [
-        {"candidate": key, **_call(client, key, path_values={"reference_code": ref})}
-        for key in ("get_by_reference", "get_by_reference_list")
-    ]
+    lookups = []
+    for key in ("get_by_reference", "list_invoices"):
+        response = _call(
+            client,
+            key,
+            path_values={"reference_code": ref},
+            params={"page": "1", "per_page": "200"} if key == "list_invoices" else None,
+        )
+        response["candidate"] = key
+        response["matched"] = _lookup_matches(key, response, ref)
+        lookups.append(response)
     result = {
         "first": first,
         "first_state": _state(polls[-1]) if polls else None,
@@ -172,9 +181,10 @@ def s2_duplicate_reference(
         if 200 <= first["status"] < 300
         and not exhausted
         and bool(polls)
-        and _state(polls[-1]) in {"Success", "Failed"}
+        and 200 <= polls[-1]["status"] < 300
+        and _state(polls[-1]) == "Success"
         and duplicate["status"] == 409
-        and any(200 <= item["status"] < 300 for item in lookups)
+        and any(item["matched"] for item in lookups)
         else "FAIL"
     )
     return result
@@ -183,7 +193,7 @@ def s2_duplicate_reference(
 def s3_failed_then_retry(
     client: ProbeClient,
     *,
-    tax_rate: str,
+    tax_rate: int | str,
     issued_date: str,
     account: dict[str, str] | None = None,
     template_code: str | None = None,
@@ -261,6 +271,7 @@ def s3_failed_then_retry(
         if variant == "async_failed"
         and retry
         and retry["polls"]
+        and 200 <= retry["polls"][-1]["status"] < 300
         and _state(retry["polls"][-1]) == "Success"
         else "INCONCLUSIVE"
     )
@@ -270,7 +281,7 @@ def s3_failed_then_retry(
 def s4_download(
     client: ProbeClient,
     *,
-    tax_rate: str,
+    tax_rate: int | str,
     issued_date: str,
     account: dict[str, str] | None = None,
     template_code: str | None = None,
@@ -293,21 +304,26 @@ def s4_download(
     invoice = _value(_data(final), "invoice") or {}
     urls = {"pdf": _value(invoice, "pdf_url"), "xml": _value(invoice, "xml_url")}
     downloads = {
-        kind: _download_artifact(
-            client, str(url) if url else None, issued.get("tracking_code"), kind
-        )
-        for kind, url in urls.items()
+        kind: _download_artifact(client, issued.get("tracking_code"), kind)
+        for kind in ("pdf", "xml")
     }
     result = {
         "issue": issued,
-        "pdf_url": _safe_url(urls["pdf"]),
-        "xml_url": _safe_url(urls["xml"]),
+        "pdf_url": urls["pdf"],
+        "xml_url": urls["xml"],
         "downloads": downloads,
     }
+    issue_succeeded = issued["scenario"] == "PASS"
     result["scenario"] = (
         "PASS"
-        if issued["scenario"] == "PASS"
-        and all(item["status"] < 300 and item["size"] > 0 for item in downloads.values())
+        if issue_succeeded
+        and all(
+            200 <= item["status"] < 300
+            and item["size"] > 0
+            and item["file_type"] == kind
+            and item["file_name"]
+            for kind, item in downloads.items()
+        )
         else "FAIL"
     )
     return result
@@ -315,12 +331,14 @@ def s4_download(
 
 def s6_quota(client: ProbeClient) -> dict[str, Any]:
     result = _call(client, "quota")
-    result["quota_endpoint"] = result["status"] != 404
+    result["quota_endpoint"] = (
+        True if 200 <= result["status"] < 300 else False if result["status"] == 404 else None
+    )
     result["scenario"] = (
         "ABSENT"
         if result["status"] == 404
         else "PASS"
-        if result["status"] < 400
+        if 200 <= result["status"] < 300
         else "INCONCLUSIVE"
     )
     return result
@@ -329,55 +347,101 @@ def s6_quota(client: ProbeClient) -> dict[str, Any]:
 def evidence(
     client: ProbeClient,
     *,
-    tax_rate: str,
+    tax_rate: int | str,
     issued_date: str,
     template_code: str | None = None,
     invoice_series: str | None = None,
     sleep: Callable[[float], None] | None = None,
     clock: Callable[[], float] | None = None,
+    on_result: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    selected_account = select_provider_account(
-        accounts(client), client, template_code=template_code, invoice_series=invoice_series
+    results: dict[str, dict[str, Any]] = {}
+    account: dict[str, str] | None = None
+
+    def run(name: str, operation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+        try:
+            result = operation()
+        except Exception as error:
+            result = {"scenario": "ERROR", "error_class": type(error).__name__}
+        results[name] = result
+        if on_result:
+            on_result(name, result)
+        return result
+
+    account_result = run(
+        "accounts",
+        lambda: accounts(client),
     )
-    s1 = s1_create_poll(
-        client,
-        tax_rate=tax_rate,
-        issued_date=issued_date,
-        account=selected_account,
-        sleep=sleep,
-        clock=clock,
-    )
-    s2 = s2_duplicate_reference(
-        client,
-        tax_rate=tax_rate,
-        issued_date=issued_date,
-        account=selected_account,
-        sleep=sleep,
-        clock=clock,
-    )
-    s3 = s3_failed_then_retry(
-        client,
-        tax_rate=tax_rate,
-        issued_date=issued_date,
-        account=selected_account,
-        control_create=s1["create"],
-        sleep=sleep,
-        clock=clock,
-    )
-    s4 = s4_download(
-        client,
-        tax_rate=tax_rate,
-        issued_date=issued_date,
-        account=selected_account,
-        sleep=sleep,
-        clock=clock,
-    )
-    results = {"s1": s1, "s2": s2, "s3": s3, "s4": s4, "s6": s6_quota(client)}
+    try:
+        account = select_provider_account(
+            account_result, client, template_code=template_code, invoice_series=invoice_series
+        )
+    except Exception as error:
+        message = str(error)
+        if "--template-code" in message:
+            message = (
+                "Multiple invoice templates or series are available; supply "
+                "--template-code and --invoice-series."
+            )
+        account_error = {
+            "scenario": "ERROR",
+            "error_class": type(error).__name__,
+            "message": message,
+        }
+        results["account_selection"] = account_error
+        if on_result:
+            on_result("account_selection", account_error)
+
+    def invoice_scenario(name: str, operation: Callable[..., dict[str, Any]]) -> dict[str, Any]:
+        if account is None:
+            result = {"scenario": "ERROR", "error_class": "AccountSelectionError"}
+            results[name] = result
+            if on_result:
+                on_result(name, result)
+            return result
+        return run(
+            name,
+            lambda: operation(
+                client,
+                tax_rate=tax_rate,
+                issued_date=issued_date,
+                account=account,
+                sleep=sleep,
+                clock=clock,
+            ),
+        )
+
+    s1 = invoice_scenario("s1", s1_create_poll)
+    invoice_scenario("s2", s2_duplicate_reference)
+    control = s1.get("create") if s1.get("scenario") != "ERROR" else None
+    if account is None:
+        s3 = {"scenario": "ERROR", "error_class": "AccountSelectionError"}
+        results["s3"] = s3
+        if on_result:
+            on_result("s3", s3)
+    else:
+        s3 = run(
+            "s3",
+            lambda: s3_failed_then_retry(
+                client,
+                tax_rate=tax_rate,
+                issued_date=issued_date,
+                account=account,
+                control_create=control,
+                sleep=sleep,
+                clock=clock,
+            ),
+        )
+    invoice_scenario("s4", s4_download)
+    run("s6", lambda: s6_quota(client))
     return {
         "environment": "test",
         "generated_at": datetime.now(UTC).isoformat(),
-        "scenarios": {key: value["scenario"] for key, value in results.items()},
-        "details": {"s3_variant": s3["variant"], **results},
+        "scenarios": {
+            key: results.get(key, {}).get("scenario", "ERROR")
+            for key in ("s1", "s2", "s3", "s4", "s6")
+        },
+        "details": {"s3_variant": s3.get("variant"), **results},
     }
 
 
@@ -411,7 +475,7 @@ def _call(
 
 def _invoice_payload(
     reference_code: str,
-    tax_rate: str,
+    tax_rate: str | int,
     issued_on: str,
     account: dict[str, str],
     *,
@@ -425,6 +489,7 @@ def _invoice_payload(
     tax_amount = _line_tax_amount(unit_price, rate)
     return {
         "reference_code": reference_code,
+        "is_draft": False,
         "provider_account_id": account["provider_account_id"],
         "template_code": account["template_code"],
         "invoice_series": account["invoice_series"],
@@ -439,7 +504,7 @@ def _invoice_payload(
                 "unit": "lần",
                 "quantity": 1,
                 "unit_price": int(unit_price),
-                "tax_rate": tax_rate,
+                "tax_rate": int(rate),
                 "tax_amount": tax_amount,
             }
         ],
@@ -474,6 +539,17 @@ def _as_decimal(value: str | Decimal | int | float | None, field: str) -> Decima
     result = Decimal(value)
     if not result.is_finite():
         raise ValueError(f"{field} must be finite")
+    if field == "tax_rate" and result != result.to_integral_value():
+        raise ValueError("tax_rate must be an integer")
+    if field == "tax_rate" and result not in {
+        Decimal("-2"),
+        Decimal("-1"),
+        Decimal("0"),
+        Decimal("5"),
+        Decimal("8"),
+        Decimal("10"),
+    }:
+        raise ValueError("tax_rate must be one of -2, -1, 0, 5, 8, or 10")
     return result
 
 
@@ -488,59 +564,49 @@ def _poll(
     clock = clock or time.monotonic
     deadline = clock() + POLL_TIMEOUT_SECONDS
     states: list[dict[str, Any]] = []
-    for attempt in range(POLL_LIMIT):
-        if attempt:
+    while True:
+        if states:
             remaining = deadline - clock()
             if remaining <= 0:
                 return states, True
             sleep(min(POLL_INTERVAL_SECONDS, remaining))
         result = _call(client, "check_create", path_values={"tracking_code": tracking_code})
+        result["retry_next_at"] = _retry_next_at(result)
         states.append(result)
-        if result["status"] >= 400 or _state(result) in {"Success", "Failed"}:
+        if result["status"] >= 400:
             return states, False
-        if clock() >= deadline:
+        if _state(result) in {"Success", "Failed"}:
+            return states, False
+        if clock() >= deadline or len(states) >= POLL_LIMIT:
             return states, True
-    return states, _state(states[-1]) not in {"Success", "Failed"}
 
 
-def _download_artifact(
-    client: ProbeClient, url: str | None, tracking_code: str | None, kind: str
-) -> dict[str, Any]:
-    if url:
-        parsed = urlsplit(url)
-        if parsed.scheme:
-            path, params = parsed.path, {}
-            params.update(parse_qsl(parsed.query, keep_blank_values=True))
-            path = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
-        else:
-            path, params = url, {}
-    else:
-        path = str(CANDIDATES["download"]["path"]).replace(
-            "{tracking_code}", str(tracking_code or "")
-        )
-        params = {"format": kind}
-    status, body, headers = client.request_binary("GET", path, params=params)
-    if status < 400:
+def _retry_next_at(result: dict[str, Any]) -> Any:
+    body = result.get("body", {})
+    data = body.get("data", {}) if isinstance(body, dict) else {}
+    retry = _value(data, "retry") or _value(body, "retry")
+    return _value(retry, "next_retry_at") if isinstance(retry, dict) else None
+
+
+def _download_artifact(client: ProbeClient, tracking_code: str | None, kind: str) -> dict[str, Any]:
+    path = str(CANDIDATES["download"]["path"]).replace("{tracking_code}", str(tracking_code or ""))
+    status, response, headers = client.request_json("GET", path, params={"type": kind})
+    data = _data({"body": response})
+    encoded = _value(data, "content")
+    decoded = b""
+    if isinstance(encoded, str):
         try:
-            decoded = base64.b64decode(body, validate=True)
-            if decoded:
-                body = decoded
+            decoded = base64.b64decode(encoded, validate=True)
         except (ValueError, TypeError):
-            pass
+            decoded = b""
     return {
-        "url": _safe_url(url),
         "status": status,
-        "size": len(body),
-        "sha256": hashlib.sha256(body).hexdigest() if body else None,
+        "size": len(decoded),
+        "sha256": hashlib.sha256(decoded).hexdigest() if decoded else None,
+        "file_type": _value(data, "file_type"),
+        "file_name": _value(data, "file_name"),
         "content_type": headers.get("content-type"),
     }
-
-
-def _safe_url(url: str | None) -> str | None:
-    if not url:
-        return None
-    parsed = urlsplit(url)
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
 
 
 def _find_provider_details(
@@ -608,9 +674,9 @@ def _success(result: dict[str, Any]) -> str:
         return "FAIL"
     if not polls:
         return "INCONCLUSIVE"
-    if _state(polls[-1]) == "Success":
+    if 200 <= polls[-1]["status"] < 300 and _state(polls[-1]) == "Success":
         return "PASS"
-    if _state(polls[-1]) == "Failed":
+    if 200 <= polls[-1]["status"] < 300 and _state(polls[-1]) == "Failed":
         return "FAIL"
     return "INCONCLUSIVE"
 
@@ -619,6 +685,19 @@ def _error_code(result: dict[str, Any]) -> str | None:
     body = result.get("body", {})
     error = _value(body, "error")
     return _value(error, "code") if isinstance(error, dict) else None
+
+
+def _lookup_matches(candidate: str, result: dict[str, Any], reference_code: str) -> bool:
+    if not 200 <= result["status"] < 300:
+        return False
+    data = _data(result)
+    if candidate == "get_by_reference":
+        return _value(data, "reference_code") == reference_code
+    items = _value(data, "items")
+    return isinstance(items, list) and any(
+        isinstance(item, dict) and _value(item, "reference_code") == reference_code
+        for item in items
+    )
 
 
 def _value(obj: Any, *keys: str) -> Any:

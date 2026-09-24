@@ -25,7 +25,9 @@ ENV = {
     "SEPAY_EINVOICE_SANDBOX_CLIENT_SECRET": "probe-secret",
 }
 ISSUED = "2026-09-24 00:00:00"
-LIST_BODY = {"success": True, "data": [{"id": "account-1", "active": True}]}
+LIST_ITEMS = [{"id": "account-1", "active": True}]
+PAGING = {"per_page": 200, "total": 1, "has_more": False, "current_page": 1, "page_count": 1}
+LIST_BODY = {"success": True, "data": {"items": LIST_ITEMS, "paging": PAGING}}
 DETAIL_BODY = {
     "success": True,
     "data": {
@@ -56,7 +58,10 @@ def token(request):
     assert request.headers["Authorization"] == auth
     return httpx.Response(
         200,
-        json={"success": True, "data": {"access_token": "mock.jwt.token", "expires_in": 3600}},
+        json={
+            "success": True,
+            "data": {"access_token": "mock.jwt.token", "token_type": "Bearer", "expires_in": 86400},
+        },
     )
 
 
@@ -68,6 +73,46 @@ def setup_accounts(request):
     if request.url.path == "/v1/provider-accounts/account-1":
         return httpx.Response(200, json=DETAIL_BODY)
     return None
+
+
+def paging(items):
+    return {
+        "items": items,
+        "paging": {
+            "per_page": 200,
+            "total": len(items),
+            "has_more": False,
+            "current_page": 1,
+            "page_count": 1,
+        },
+    }
+
+
+def download_response(request: httpx.Request) -> httpx.Response:
+    kind = request.url.params["type"]
+    payload = b"PDF-SANDBOX" if kind == "pdf" else b"<invoice>sandbox</invoice>"
+    name = "HD_0000589_20251215.pdf" if kind == "pdf" else "HD_0000589_20251215.xml"
+    return httpx.Response(
+        200,
+        json={
+            "success": True,
+            "data": {
+                "file_type": kind,
+                "file_name": name,
+                "content": base64.b64encode(payload).decode(),
+            },
+        },
+    )
+
+
+def check_response(status: str, **values) -> httpx.Response:
+    data = {
+        "status": status,
+        "retry": {"next_retry_at": None},
+        "invoice": {"xml_url": None},
+        **values,
+    }
+    return httpx.Response(200, json={"success": True, "data": data})
 
 
 def test_client_refuses_non_test_environment() -> None:
@@ -87,7 +132,9 @@ def test_client_has_no_base_url_override() -> None:
     assert SANDBOX_BASE_URL == "https://einvoice-api-sandbox.sepay.vn"
     assert all(not entry["verified"] for entry in CANDIDATES.values())
     assert CANDIDATES["provider_account_detail"]["path"] == "/v1/provider-accounts/{id}"
-    assert "guess" in CANDIDATES["download"]["parameter_guess"]
+    assert CANDIDATES["quota"]["path"] == "/v1/usage"
+    assert CANDIDATES["publish"]["path"] == "/v1/invoices/issue"
+    assert CANDIDATES["get_by_reference"]["source"] == "chi-tiet-hoa-don"
     with client_with(lambda _: httpx.Response(200)) as client:
         try:
             client.request_json("GET", "https://example.com/", authenticated=False)
@@ -95,6 +142,27 @@ def test_client_has_no_base_url_override() -> None:
             assert "sandbox" in str(error)
         else:
             raise AssertionError("non-sandbox host was accepted")
+
+        trailing_host = SANDBOX_BASE_URL.removeprefix("https://") + "."
+        try:
+            client.request_json("GET", f"https://{trailing_host}/v1/token", authenticated=False)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("trailing-dot SePay host was accepted")
+
+
+def test_api_candidate_routes_match_raw_docs() -> None:
+    assert CANDIDATES["get_by_reference"]["path"] == "/v1/invoices/{reference_code}"
+    assert CANDIDATES["get_by_reference"]["source"] == "chi-tiet-hoa-don"
+    assert CANDIDATES["list_invoices"]["path"] == "/v1/invoices"
+    assert CANDIDATES["list_invoices"]["source"] == "danh-sach-hoa-don"
+    assert CANDIDATES["download"]["parameter"] == "type=pdf|xml"
+    assert CANDIDATES["download"]["source"] == "tai-hoa-don"
+    assert CANDIDATES["quota"]["path"] == "/v1/usage"
+    assert CANDIDATES["quota"]["source"] == "kiem-tra-han-ngach"
+    assert CANDIDATES["publish"]["path"] == "/v1/invoices/issue"
+    assert CANDIDATES["publish"]["source"] == "phat-hanh-hoa-don-dien-tu"
 
 
 def test_account_template_and_series_selectors_are_explicit() -> None:
@@ -120,6 +188,25 @@ def test_account_template_and_series_selectors_are_explicit() -> None:
     assert selected["invoice_series"] == "C27TSE"
 
 
+def test_ambiguous_template_error_suggests_selector() -> None:
+    from tools.einvoice_probe.scenarios import select_provider_account
+
+    account = {
+        "id": "account-1",
+        "active": True,
+        "templates": [
+            {"template_code": "1", "invoice_series": "C26TSE"},
+            {"template_code": "2", "invoice_series": "C26TSE"},
+        ],
+    }
+    try:
+        select_provider_account({"body": {"data": {"items": [account], "paging": PAGING}}})
+    except RuntimeError as error:
+        assert "--template-code" in str(error)
+    else:
+        raise AssertionError("ambiguous account should request a selector")
+
+
 def test_account_selection_rejects_zero_and_ambiguous_matches() -> None:
     from tools.einvoice_probe.scenarios import select_provider_account
 
@@ -134,6 +221,8 @@ def test_account_selection_rejects_zero_and_ambiguous_matches() -> None:
             select_provider_account({"body": {"data": rows}})
         except RuntimeError as error:
             assert f"found {count}" in str(error)
+            if count:
+                assert "--template-code" in str(error)
         else:
             raise AssertionError("ambiguous provider account selection was accepted")
 
@@ -177,7 +266,7 @@ def test_token_never_written_to_output(tmp_path: Path, capsys, caplog) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         result = setup_accounts(request)
-        return result or httpx.Response(200, json={"success": True, "data": {"items": []}})
+        return result or httpx.Response(200, json=LIST_BODY)
 
     with client_with(handler) as probe:
         probe.request_json("GET", "/v1/provider-accounts")
@@ -231,8 +320,11 @@ def test_s1_flow_with_mock_transport(monkeypatch) -> None:
             polls += 1
             state = "Pending" if polls == 1 else "Success"
             data = {"status": state}
+            if state == "Pending":
+                data["retry"] = {"next_retry_at": "2026-09-24 12:00:00"}
             if state == "Success":
-                data["invoice"] = {"pdf_url": "/files/p.pdf", "xml_url": "/files/p.xml"}
+                data["invoice"] = {"pdf_url": "/sandbox/p.pdf", "xml_url": None}
+                data["retry"] = {"next_retry_at": None}
             return httpx.Response(200, json={"success": True, "data": data})
         raise AssertionError(request.url.path)
 
@@ -240,12 +332,15 @@ def test_s1_flow_with_mock_transport(monkeypatch) -> None:
         result = s1_create_poll(probe, tax_rate="10", issued_date=ISSUED, sleep=sleep, clock=clock)
     assert result["scenario"] == "PASS"
     assert [row["body"]["data"]["status"] for row in result["polls"]] == ["Pending", "Success"]
+    assert result["polls"][0]["retry_next_at"] == "2026-09-24 12:00:00"
     payload = creates[0]
     assert payload["provider_account_id"] == "account-1"
     assert payload["template_code"] == "1"
     assert payload["invoice_series"] == "C26TSE"
     assert payload["issued_date"] == ISSUED
     assert payload["currency"] == "VND"
+    assert payload["is_draft"] is False
+    assert payload["items"][0]["tax_rate"] == 10
     assert payload["items"][0]["item_name"] == "Probe item"
     assert payload["total_amount"] == 1100
     assert sleeps == [2.5]
@@ -255,23 +350,48 @@ def test_s2_records_409_and_lookup(monkeypatch) -> None:
     clock = FakeClock()
     creates = 0
     paths: list[str] = []
+    sent_reference = ""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal creates
+        nonlocal creates, sent_reference
         paths.append(request.url.path)
         setup = setup_accounts(request)
         if setup:
             return setup
         if request.url.path == "/v1/invoices/create":
             creates += 1
+            body = json.loads(request.content)
+            if creates == 1:
+                sent_reference = body["reference_code"]
             status = 202 if creates == 1 else 409
-            return httpx.Response(status, json={"success": True, "data": {"tracking_code": "tr-1"}})
+            body = (
+                {"success": True, "data": {"tracking_code": "tr-1"}}
+                if status == 202
+                else {
+                    "success": False,
+                    "error": {"code": "DOCUMENT_EXISTS", "message": "Already exists"},
+                }
+            )
+            return httpx.Response(status, json=body)
         if request.url.path.endswith("/tr-1"):
-            return httpx.Response(200, json={"success": True, "data": {"status": "Success"}})
-        if request.url.path.startswith("/v1/invoices/"):
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "status": "Success",
+                        "retry": {"next_retry_at": None},
+                        "invoice": {"xml_url": None},
+                    },
+                },
+            )
+        if request.url.path == f"/v1/invoices/{sent_reference}":
             return httpx.Response(404, json={"success": False})
         if request.url.path == "/v1/invoices":
-            return httpx.Response(200, json={"success": True, "data": {"items": []}})
+            return httpx.Response(
+                200,
+                json={"success": True, "data": paging([{"reference_code": sent_reference}])},
+            )
         raise AssertionError(request.url.path)
 
     with client_with(handler) as probe:
@@ -281,32 +401,64 @@ def test_s2_records_409_and_lookup(monkeypatch) -> None:
     assert result["scenario"] == "PASS"
     assert result["first"]["status"] == 202
     assert result["first_polls"][-1]["body"]["data"]["status"] == "Success"
+    assert result["first_polls"][-1]["retry_next_at"] is None
     assert result["duplicate"]["status"] == 409
     assert [item["status"] for item in result["lookups"]] == [404, 200]
+    assert [item["matched"] for item in result["lookups"]] == [False, True]
     assert "/v1/invoices" in paths
 
 
 def test_s2_pending_first_create_is_not_a_pass() -> None:
     clock = FakeClock()
     creates = 0
+    sent_reference = ""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal creates
+        nonlocal creates, sent_reference
         setup = setup_accounts(request)
         if setup:
             return setup
         if request.url.path == "/v1/invoices/create":
             creates += 1
+            if creates == 1:
+                sent_reference = json.loads(request.content)["reference_code"]
             status = 202 if creates == 1 else 409
             return httpx.Response(
-                status, json={"success": True, "data": {"tracking_code": "pending"}}
+                status,
+                json=(
+                    {"success": True, "data": {"tracking_code": "pending"}}
+                    if status == 202
+                    else {
+                        "success": False,
+                        "error": {"code": "DOCUMENT_EXISTS", "message": "Already exists"},
+                    }
+                ),
             )
         if request.url.path.endswith("/pending"):
-            return httpx.Response(200, json={"success": True, "data": {"status": "Pending"}})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "status": "Pending",
+                        "retry": {"next_retry_at": "2026-09-24 12:00:00"},
+                        "invoice": {"xml_url": None},
+                    },
+                },
+            )
         if request.url.path.startswith("/v1/invoices/"):
-            return httpx.Response(404, json={"success": False})
+            return httpx.Response(
+                404,
+                json={
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "Invoice not found"},
+                },
+            )
         if request.url.path == "/v1/invoices":
-            return httpx.Response(200, json={"success": True, "data": {"items": []}})
+            return httpx.Response(
+                200,
+                json={"success": True, "data": paging([{"reference_code": sent_reference}])},
+            )
         raise AssertionError(request.url.path)
 
     with client_with(handler) as probe:
@@ -315,6 +467,235 @@ def test_s2_pending_first_create_is_not_a_pass() -> None:
         )
     assert result["first_poll_exhausted"] is True
     assert result["first_state"] == "Pending"
+    assert result["scenario"] == "FAIL"
+
+
+def test_s2_lookup_must_match_reference_code() -> None:
+    creates = 0
+    sent_reference = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal creates, sent_reference
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            creates += 1
+            if creates == 1:
+                return httpx.Response(
+                    202, json={"success": True, "data": {"tracking_code": "track"}}
+                )
+            return httpx.Response(
+                409,
+                json={
+                    "success": False,
+                    "error": {"code": "DOCUMENT_EXISTS", "message": "Already exists"},
+                },
+            )
+        if request.url.path.endswith("/track"):
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "status": "Success",
+                        "retry": {"next_retry_at": None},
+                        "invoice": {"xml_url": None},
+                    },
+                },
+            )
+        if request.url.path.startswith("/v1/invoices/"):
+            return httpx.Response(
+                404, json={"success": False, "error": {"code": "NOT_FOUND", "message": "Not found"}}
+            )
+        if request.url.path == "/v1/invoices":
+            unrelated = {"reference_code": "different-reference"}
+            return httpx.Response(200, json={"success": True, "data": paging([unrelated])})
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        result = s2_duplicate_reference(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    assert result["lookups"][0]["status"] == 404
+    assert result["lookups"][1]["status"] == 200
+    assert all(not row["matched"] for row in result["lookups"])
+    assert result["scenario"] == "FAIL"
+
+
+def test_s2_duplicate_without_409_is_fail() -> None:
+    creates = 0
+    sent_reference = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal creates, sent_reference
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            creates += 1
+            sent_reference = json.loads(request.content)["reference_code"]
+            return httpx.Response(202, json={"success": True, "data": {"tracking_code": "track"}})
+        if request.url.path.endswith("/track"):
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "status": "Success",
+                        "retry": {"next_retry_at": None},
+                        "invoice": {"xml_url": None},
+                    },
+                },
+            )
+        if request.url.path == f"/v1/invoices/{sent_reference}":
+            return httpx.Response(
+                200, json={"success": True, "data": {"reference_code": sent_reference}}
+            )
+        if request.url.path == "/v1/invoices":
+            return httpx.Response(
+                200, json={"success": True, "data": paging([{"reference_code": sent_reference}])}
+            )
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        result = s2_duplicate_reference(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    assert result["first_state"] == "Success"
+    assert result["duplicate"]["status"] == 202
+    assert result["scenario"] == "FAIL"
+
+
+def test_s2_rejected_first_create_is_fail() -> None:
+    creates = 0
+    sent_reference = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal creates, sent_reference
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            creates += 1
+            if creates == 1:
+                sent_reference = json.loads(request.content)["reference_code"]
+                return httpx.Response(
+                    400,
+                    json={
+                        "success": False,
+                        "error": {"code": "BAD_REQUEST", "message": "Invalid request"},
+                    },
+                )
+            return httpx.Response(
+                409,
+                json={
+                    "success": False,
+                    "error": {"code": "DOCUMENT_EXISTS", "message": "Already exists"},
+                },
+            )
+        if request.url.path.startswith("/v1/invoices/"):
+            return httpx.Response(
+                404, json={"success": False, "error": {"code": "NOT_FOUND", "message": "Not found"}}
+            )
+        if request.url.path == "/v1/invoices":
+            return httpx.Response(200, json={"success": True, "data": paging([])})
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        result = s2_duplicate_reference(probe, tax_rate=10, issued_date=ISSUED)
+    assert result["first"]["status"] == 400
+    assert result["first_state"] is None
+    assert result["first_polls"] == []
+    assert result["scenario"] == "FAIL"
+
+
+def test_s2_failed_first_create_is_not_successful() -> None:
+    creates = 0
+    reference = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal creates, reference
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            creates += 1
+            if creates == 1:
+                reference = json.loads(request.content)["reference_code"]
+                return httpx.Response(
+                    202, json={"success": True, "data": {"tracking_code": "failed-track"}}
+                )
+            return httpx.Response(
+                409,
+                json={
+                    "success": False,
+                    "error": {"code": "DOCUMENT_EXISTS", "message": "Already exists"},
+                },
+            )
+        if request.url.path.endswith("/failed-track"):
+            return check_response("Failed")
+        if request.url.path == f"/v1/invoices/{reference}":
+            return httpx.Response(
+                200, json={"success": True, "data": {"reference_code": reference, "xml_url": None}}
+            )
+        if request.url.path == "/v1/invoices":
+            return httpx.Response(
+                200, json={"success": True, "data": paging([{"reference_code": reference}])}
+            )
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        result = s2_duplicate_reference(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    assert result["first_state"] == "Failed"
+    assert result["scenario"] == "FAIL"
+
+
+def test_s2_detail_with_different_reference_does_not_match() -> None:
+    creates = 0
+    reference = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal creates, reference
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            creates += 1
+            if creates == 1:
+                reference = json.loads(request.content)["reference_code"]
+                return httpx.Response(
+                    202, json={"success": True, "data": {"tracking_code": "track"}}
+                )
+            return httpx.Response(
+                409,
+                json={
+                    "success": False,
+                    "error": {"code": "DOCUMENT_EXISTS", "message": "Already exists"},
+                },
+            )
+        if request.url.path.endswith("/track"):
+            return check_response("Success")
+        if request.url.path.startswith("/v1/invoices/"):
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {"reference_code": "different-reference", "xml_url": None},
+                },
+            )
+        if request.url.path == "/v1/invoices":
+            return httpx.Response(200, json={"success": True, "data": paging([])})
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        result = s2_duplicate_reference(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    assert result["lookups"][0]["status"] == 200
+    assert result["lookups"][0]["matched"] is False
     assert result["scenario"] == "FAIL"
 
 
@@ -335,7 +716,17 @@ def test_s3_sync_reject_is_inconclusive(monkeypatch) -> None:
                 )
             return httpx.Response(422, json={"success": False, "error": {"code": "INVALID"}})
         if request.url.path.endswith("/control"):
-            return httpx.Response(200, json={"success": True, "data": {"status": "Success"}})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "status": "Success",
+                        "retry": {"next_retry_at": None},
+                        "invoice": {"xml_url": None},
+                    },
+                },
+            )
         raise AssertionError(request.url.path)
 
     with client_with(handler) as probe:
@@ -351,18 +742,29 @@ def test_evidence_file_shape(monkeypatch) -> None:
     clock = FakeClock()
     created_by_reference: dict[str, int] = {}
     track_count = 0
+    last_reference = ""
+    request_urls: list[str] = []
+    download_types: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal track_count
+        nonlocal track_count, last_reference
+        request_urls.append(str(request.url))
         setup = setup_accounts(request)
         if setup:
             return setup
         if request.url.path == "/v1/invoices/create":
             payload = json.loads(request.content)
             reference = payload["reference_code"]
+            last_reference = reference
             created_by_reference[reference] = created_by_reference.get(reference, 0) + 1
             if created_by_reference[reference] > 1:
-                return httpx.Response(409, json={"success": False, "error": {"code": "EXISTS"}})
+                return httpx.Response(
+                    409,
+                    json={
+                        "success": False,
+                        "error": {"code": "DOCUMENT_EXISTS", "message": "Invoice already exists"},
+                    },
+                )
             track_count += 1
             return httpx.Response(
                 202, json={"success": True, "data": {"tracking_code": f"track-{track_count}"}}
@@ -370,19 +772,29 @@ def test_evidence_file_shape(monkeypatch) -> None:
         if "/create/check/" in request.url.path:
             tracking = request.url.path.rsplit("/", 1)[-1]
             state = "Failed" if tracking == "track-3" else "Success"
-            invoice = {"pdf_url": "/files/probe.pdf", "xml_url": "/files/probe.xml"}
-            data = {"status": state, "invoice": invoice}
+            invoice = {
+                "pdf_url": "https://files.example.test/p.pdf?signature=private",
+                "xml_url": None,
+            }
+            data = {"status": state, "retry": {"next_retry_at": None}, "invoice": invoice}
             return httpx.Response(200, json={"success": True, "data": data})
-        if request.url.path.startswith("/files/"):
-            return httpx.Response(
-                200, content=request.url.path.rsplit(".", 1)[-1].encode() + b"-data"
-            )
-        if request.url.path == "/v1/quota":
-            return httpx.Response(200, json={"success": True, "data": {"remaining": 2}})
+        if request.url.path.endswith("/download"):
+            download_types.append(request.url.params["type"])
+            return download_response(request)
+        if request.url.path == "/v1/usage":
+            return httpx.Response(200, json={"success": True, "data": {"quota_remaining": "534"}})
         if request.url.path.startswith("/v1/invoices/"):
-            return httpx.Response(200, json={"success": True, "data": {"invoice": {}}})
+            return httpx.Response(
+                404,
+                json={
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "Invoice not found"},
+                },
+            )
         if request.url.path == "/v1/invoices":
-            return httpx.Response(200, json={"success": True, "data": {"items": []}})
+            return httpx.Response(
+                200, json={"success": True, "data": paging([{"reference_code": last_reference}])}
+            )
         raise AssertionError(request.url.path)
 
     with client_with(handler) as probe:
@@ -397,10 +809,15 @@ def test_evidence_file_shape(monkeypatch) -> None:
     assert result["details"]["s3"]["retry_create_status"] == 409
     assert result["details"]["s3"]["retry"]["polls"] == []
     assert set(result["details"]["s4"]["downloads"]) == {"pdf", "xml"}
-    assert all(
-        item["sha256"] == hashlib.sha256(f"{kind}-data".encode()).hexdigest()
-        for kind, item in result["details"]["s4"]["downloads"].items()
-    )
+    expected_files = {"pdf": b"PDF-SANDBOX", "xml": b"<invoice>sandbox</invoice>"}
+    for kind, item in result["details"]["s4"]["downloads"].items():
+        assert item["sha256"] == hashlib.sha256(expected_files[kind]).hexdigest()
+        assert item["size"] == len(expected_files[kind])
+        assert item["file_type"] == kind
+        assert item["file_name"].endswith(f".{kind}")
+    assert result["details"]["s4"]["xml_url"] is None
+    assert download_types == ["pdf", "xml"]
+    assert all("files.example.test" not in url for url in request_urls)
 
 
 def test_evidence_async_failed_resend_success_is_pass(monkeypatch) -> None:
@@ -433,24 +850,61 @@ def test_evidence_async_failed_resend_success_is_pass(monkeypatch) -> None:
             state = "Failed" if tracking == "evidence-track-3" else "Success"
             if state == "Failed":
                 failed_references.add(reference_by_track[tracking])
-            invoice = {"pdf_url": "/files/a.pdf", "xml_url": "/files/a.xml"}
+            invoice = {"pdf_url": "/sandbox/a.pdf", "xml_url": None}
             return httpx.Response(
-                200, json={"success": True, "data": {"status": state, "invoice": invoice}}
+                200,
+                json={
+                    "success": True,
+                    "data": {"status": state, "retry": {"next_retry_at": None}, "invoice": invoice},
+                },
             )
-        if request.url.path.startswith("/files/"):
-            return httpx.Response(200, content=b"artifact")
-        if request.url.path == "/v1/quota":
-            return httpx.Response(200, json={"success": True, "data": {}})
+        if request.url.path.endswith("/download"):
+            return download_response(request)
+        if request.url.path == "/v1/usage":
+            return httpx.Response(200, json={"success": True, "data": {"quota_remaining": "534"}})
         if request.url.path.startswith("/v1/invoices/"):
             return httpx.Response(200, json={"success": True, "data": {}})
         if request.url.path == "/v1/invoices":
-            return httpx.Response(200, json={"success": True, "data": {"items": []}})
+            return httpx.Response(200, json={"success": True, "data": paging([])})
         raise AssertionError(request.url.path)
 
     with client_with(handler) as probe:
         result = evidence(probe, tax_rate="10", issued_date=ISSUED, sleep=clock.sleep, clock=clock)
     assert result["scenarios"]["s3"] == "PASS"
     assert result["details"]["s3"]["retry_create_status"] == 202
+
+
+def test_evidence_download_metadata_must_match_requested_type(monkeypatch) -> None:
+    clock = FakeClock()
+    creates = 0
+    downloads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal creates, downloads
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            creates += 1
+            return httpx.Response(
+                202, json={"success": True, "data": {"tracking_code": f"t{creates}"}}
+            )
+        if "/create/check/" in request.url.path:
+            return check_response("Success", invoice={"pdf_url": "/sandbox/p.pdf", "xml_url": None})
+        if request.url.path.endswith("/download"):
+            downloads += 1
+            response = download_response(request)
+            body = response.json()
+            if request.url.params["type"] == "xml":
+                body["data"]["file_type"] = "pdf"
+            return httpx.Response(200, json=body)
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        result = s4_download(probe, tax_rate=10, issued_date=ISSUED, sleep=clock.sleep, clock=clock)
+    assert result["downloads"]["xml"]["file_type"] == "pdf"
+    assert result["scenario"] == "FAIL"
+    assert downloads == 2
 
 
 def test_probe_tax_rounding_edge_matrix() -> None:
@@ -469,6 +923,9 @@ def test_probe_tax_rounding_edge_matrix() -> None:
         ("-3", ValueError),
         ("NaN", ValueError),
         ("Infinity", ValueError),
+        ("10.5", ValueError),
+        ("7", ValueError),
+        (None, ValueError),
         (10.0, TypeError),
     ]:
         try:
@@ -519,12 +976,22 @@ def test_s4_download_404_marks_evidence_failed(monkeypatch) -> None:
                     "success": True,
                     "data": {
                         "status": "Success",
-                        "invoice": {"pdf_url": "/files/p.pdf", "xml_url": "/files/p.xml"},
+                        "retry": {"next_retry_at": None},
+                        "invoice": {
+                            "pdf_url": "https://docs.example.test/p.pdf?private=x",
+                            "xml_url": None,
+                        },
                     },
                 },
             )
-        if request.url.path.startswith("/files/"):
-            return httpx.Response(404, json={"success": False})
+        if request.url.path.endswith("/download"):
+            return httpx.Response(
+                404,
+                json={
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "Tracking code not found"},
+                },
+            )
         raise AssertionError(request.url.path)
 
     with client_with(handler) as probe:
@@ -536,27 +1003,112 @@ def test_s4_download_404_marks_evidence_failed(monkeypatch) -> None:
     assert result["downloads"]["xml"]["status"] == 404
 
 
-def test_artifact_urls_are_fetched_without_forwarding_bearer_token() -> None:
+def test_s4_issue_failure_stays_fail_even_when_downloads_succeed() -> None:
+    downloads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal downloads
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            return httpx.Response(
+                400,
+                json={
+                    "success": False,
+                    "error": {"code": "BAD_REQUEST", "message": "Invalid request"},
+                },
+            )
+        if request.url.path.endswith("/download"):
+            downloads += 1
+            return download_response(request)
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        result = s4_download(probe, tax_rate=10, issued_date=ISSUED)
+    assert result["issue"]["scenario"] == "FAIL"
+    assert result["scenario"] == "FAIL"
+    assert downloads == 2
+
+
+def test_s1_create_400_is_fail() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            return httpx.Response(
+                400,
+                json={
+                    "success": False,
+                    "error": {"code": "BAD_REQUEST", "message": "Invalid request"},
+                },
+            )
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        result = s1_create_poll(probe, tax_rate=10, issued_date=ISSUED)
+    assert result["scenario"] == "FAIL"
+    assert result["polls"] == []
+
+
+def test_s1_check_4xx_stops_polling_as_inconclusive() -> None:
+    checks = 0
+    clock = FakeClock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal checks
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            return httpx.Response(202, json={"success": True, "data": {"tracking_code": "track"}})
+        if request.url.path.endswith("/track"):
+            checks += 1
+            return httpx.Response(
+                404,
+                json={
+                    "success": False,
+                    "error": {"code": "NOT_FOUND", "message": "Tracking code not found"},
+                },
+            )
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        result = s1_create_poll(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=clock.sleep, clock=clock
+        )
+    assert result["scenario"] == "INCONCLUSIVE"
+    assert len(result["polls"]) == 1
+    assert checks == 1
+
+
+def test_artifact_download_uses_sandbox_type_and_base64_content() -> None:
     observed: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         observed.append(request)
-        return httpx.Response(200, content=b"pdf artifact")
+        if request.url.path == "/v1/token":
+            return token(request)
+        return download_response(request)
 
     from tools.einvoice_probe.scenarios import _download_artifact
 
     with client_with(handler) as probe:
-        artifact = _download_artifact(
-            probe,
-            "https://files.example.test/invoice.pdf?format=pdf",
-            "tracking-code",
-            "pdf",
-        )
-    assert artifact["status"] == 200
-    assert artifact["sha256"] == hashlib.sha256(b"pdf artifact").hexdigest()
-    assert observed[0].url.host == "files.example.test"
-    assert "Authorization" not in observed[0].headers
-    assert artifact["url"] == "https://files.example.test/invoice.pdf"
+        artifact = _download_artifact(probe, "tracking-code", "pdf")
+    expected = b"PDF-SANDBOX"
+    assert artifact == {
+        "status": 200,
+        "size": len(expected),
+        "sha256": hashlib.sha256(expected).hexdigest(),
+        "file_type": "pdf",
+        "file_name": "HD_0000589_20251215.pdf",
+        "content_type": "application/json",
+    }
+    download = next(item for item in observed if item.url.path.endswith("/download"))
+    assert download.url.host == "einvoice-api-sandbox.sepay.vn"
+    assert download.url.params["type"] == "pdf"
+    assert download.headers["Authorization"] == "Bearer mock.jwt.token"
 
 
 def test_s3_async_failed_retries_same_reference_and_polls_success(monkeypatch) -> None:
@@ -583,11 +1135,41 @@ def test_s3_async_failed_retries_same_reference_and_polls_success(monkeypatch) -
                 )
             return httpx.Response(202, json={"success": True, "data": {"tracking_code": "retry"}})
         if request.url.path.endswith("/control"):
-            return httpx.Response(200, json={"success": True, "data": {"status": "Success"}})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "status": "Success",
+                        "retry": {"next_retry_at": None},
+                        "invoice": {"xml_url": None},
+                    },
+                },
+            )
         if request.url.path.endswith("/failed"):
-            return httpx.Response(200, json={"success": True, "data": {"status": "Failed"}})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "status": "Failed",
+                        "retry": {"next_retry_at": None},
+                        "invoice": {"xml_url": None},
+                    },
+                },
+            )
         if request.url.path.endswith("/retry"):
-            return httpx.Response(200, json={"success": True, "data": {"status": "Success"}})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "status": "Success",
+                        "retry": {"next_retry_at": None},
+                        "invoice": {"xml_url": None},
+                    },
+                },
+            )
         raise AssertionError(request.url.path)
 
     with client_with(handler) as probe:
@@ -599,6 +1181,52 @@ def test_s3_async_failed_retries_same_reference_and_polls_success(monkeypatch) -
     assert create_payloads[1]["reference_code"] == create_payloads[2]["reference_code"]
     assert "tax_code" in create_payloads[1]["buyer"]
     assert "tax_code" not in create_payloads[2]["buyer"]
+
+
+def test_s3_resend_ending_failed_is_inconclusive() -> None:
+    clock = FakeClock()
+    creates = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal creates
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            creates += 1
+            tracking = {1: "control", 2: "original", 3: "retry"}[creates]
+            return httpx.Response(202, json={"success": True, "data": {"tracking_code": tracking}})
+        state = "Success" if request.url.path.endswith("/control") else "Failed"
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "status": state,
+                    "retry": {"next_retry_at": None},
+                    "invoice": {"xml_url": None},
+                },
+            },
+        )
+
+    with client_with(handler) as probe:
+        result = s3_failed_then_retry(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=clock.sleep, clock=clock
+        )
+    assert result["variant"] == "async_failed"
+    assert result["retry"]["polls"][-1]["body"]["data"]["status"] == "Failed"
+    assert result["scenario"] == "INCONCLUSIVE"
+
+
+def test_nonexistent_tax_code_has_valid_checksum() -> None:
+    from tools.einvoice_probe.scenarios import INVALID_NONEXISTENT_TAX_CODE
+
+    digits = [int(character) for character in INVALID_NONEXISTENT_TAX_CODE]
+    weights = [31, 29, 23, 19, 17, 13, 7, 5, 3]
+    checksum = (
+        10 - sum(digit * weight for digit, weight in zip(digits[:9], weights, strict=True)) % 11
+    ) % 10
+    assert digits[-1] == checksum
 
 
 def test_s3_sync_reject_requires_successful_control_create() -> None:
@@ -634,11 +1262,24 @@ def test_s3_404_is_not_triggerable(monkeypatch) -> None:
         if request.url.path == "/v1/invoices/create":
             creates += 1
             status = 202 if creates == 1 else 404
-            return httpx.Response(
-                status, json={"success": True, "data": {"tracking_code": "control"}}
+            body = (
+                {"success": True, "data": {"tracking_code": "control"}}
+                if status == 202
+                else {"success": False, "error": {"code": "NOT_FOUND", "message": "Not found"}}
             )
+            return httpx.Response(status, json=body)
         if request.url.path.endswith("/control"):
-            return httpx.Response(200, json={"success": True, "data": {"status": "Success"}})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "status": "Success",
+                        "retry": {"next_retry_at": None},
+                        "invoice": {"xml_url": None},
+                    },
+                },
+            )
         raise AssertionError(request.url.path)
 
     with client_with(handler) as probe:
@@ -662,7 +1303,17 @@ def test_s3_pending_at_bound_is_reported(monkeypatch) -> None:
             return httpx.Response(202, json={"success": True, "data": {"tracking_code": "control"}})
         if request.url.path.endswith("/control"):
             polls += 1
-            return httpx.Response(200, json={"success": True, "data": {"status": "Pending"}})
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "status": "Pending",
+                        "retry": {"next_retry_at": "2026-09-24 13:00:00"},
+                        "invoice": {"xml_url": None},
+                    },
+                },
+            )
         raise AssertionError(request.url.path)
 
     with client_with(handler) as probe:
@@ -690,7 +1341,17 @@ def test_s3_pending_at_bound_records_reason(monkeypatch) -> None:
                 202,
                 json={"success": True, "data": {"tracking_code": f"track-{create_count}"}},
             )
-        return httpx.Response(200, json={"success": True, "data": {"status": "Pending"}})
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "data": {
+                    "status": "Pending",
+                    "retry": {"next_retry_at": "2026-09-24 13:00:00"},
+                    "invoice": {"xml_url": None},
+                },
+            },
+        )
 
     with client_with(handler) as probe:
         result = s3_failed_then_retry(
@@ -717,7 +1378,7 @@ def test_s3_pending_then_failed_records_each_poll() -> None:
         if request.url.path.endswith("failed-track"):
             poll_count += 1
             state = "Pending" if poll_count == 1 else "Failed"
-            return httpx.Response(200, json={"success": True, "data": {"status": state}})
+            return check_response(state)
         raise AssertionError(request.url.path)
 
     with client_with(handler) as probe:
@@ -803,6 +1464,53 @@ def test_evidence_preserves_s1_failed_and_pending_status(monkeypatch) -> None:
     assert result["scenarios"]["s1"] == "INCONCLUSIVE"
 
 
+def test_evidence_persists_each_scenario_after_errors(tmp_path: Path, monkeypatch) -> None:
+    import tools.einvoice_probe.scenarios as scenarios
+
+    monkeypatch.setattr(
+        scenarios,
+        "accounts",
+        lambda *_: {
+            "body": {"success": True, "data": paging([])},
+            "provider_account_details": [],
+        },
+    )
+    monkeypatch.setattr(
+        scenarios,
+        "select_provider_account",
+        lambda *args, **kwargs: {
+            "provider_account_id": "account-1",
+            "template_code": "1",
+            "invoice_series": "C26TSE",
+        },
+    )
+
+    def fail_s1(*_args, **_kwargs):
+        raise RuntimeError("offline failure")
+
+    monkeypatch.setattr(scenarios, "s1_create_poll", fail_s1)
+    monkeypatch.setattr(
+        scenarios, "s2_duplicate_reference", lambda *_args, **_kwargs: {"scenario": "INCONCLUSIVE"}
+    )
+    monkeypatch.setattr(
+        scenarios,
+        "s3_failed_then_retry",
+        lambda *_args, **_kwargs: {"scenario": "INCONCLUSIVE", "variant": "not_triggerable"},
+    )
+    monkeypatch.setattr(scenarios, "s4_download", lambda *_args, **_kwargs: {"scenario": "FAIL"})
+    monkeypatch.setattr(scenarios, "s6_quota", lambda *_args: {"scenario": "ABSENT"})
+    saved: list[str] = []
+
+    def save(name: str, result: dict) -> None:
+        saved.append(name)
+        write_json(tmp_path, f"evidence_{name}", result)
+
+    result = scenarios.evidence(object(), tax_rate=10, issued_date=ISSUED, on_result=save)
+    assert saved == ["accounts", "s1", "s2", "s3", "s4", "s6"]
+    assert result["details"]["s1"]["error_class"] == "RuntimeError"
+    assert json.loads((tmp_path / "evidence_s1.json").read_text())["error_class"] == "RuntimeError"
+
+
 def test_write_json_redacts_credentials_jwt_buyer_and_account(tmp_path: Path) -> None:
     raw_token = "eyJabcdefghijk.payload.signature"
     path = write_json(
@@ -832,12 +1540,46 @@ def test_quota_404_is_absent(monkeypatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/token":
             return token(request)
-        return httpx.Response(404, json={"success": False})
+        if request.url.path == "/v1/usage":
+            return httpx.Response(
+                404, json={"success": False, "error": {"code": "NOT_FOUND", "message": "Not found"}}
+            )
+        raise AssertionError(request.url.path)
 
     with client_with(handler) as probe:
         result = s6_quota(probe)
     assert result["scenario"] == "ABSENT"
     assert result["quota_endpoint"] is False
+
+
+def test_usage_quota_string_and_server_error_status() -> None:
+    status = 200
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/token":
+            return token(request)
+        if request.url.path == "/v1/usage":
+            if status == 200:
+                return httpx.Response(
+                    200, json={"success": True, "data": {"quota_remaining": "534"}}
+                )
+            return httpx.Response(
+                503,
+                json={"success": False, "error": {"code": "TEMPORARY", "message": "Retry later"}},
+            )
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        result = s6_quota(probe)
+    assert result["scenario"] == "PASS"
+    assert result["quota_endpoint"] is True
+    assert result["body"]["data"]["quota_remaining"] == "534"
+
+    status = 503
+    with client_with(handler) as probe:
+        result = s6_quota(probe)
+    assert result["scenario"] == "INCONCLUSIVE"
+    assert result["quota_endpoint"] is None
 
 
 def test_cli_validates_datetime_without_rewriting_value() -> None:

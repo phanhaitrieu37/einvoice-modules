@@ -30,7 +30,7 @@ def _redact(obj: object, *, in_party: bool, field_name: str | None = None) -> ob
             else:
                 redacted[key] = _redact(
                     value,
-                    in_party=in_party or normalized in {"buyer", "seller"},
+                    in_party=in_party or normalized in {"buyer", "seller", "seller_store"},
                     field_name=normalized,
                 )
         return redacted

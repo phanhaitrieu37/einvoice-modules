@@ -74,36 +74,6 @@ class ProbeClient:
             },
         )
 
-    def request_binary(
-        self, method: str, path: str, *, params: Mapping[str, str] | None = None
-    ) -> tuple[int, bytes, dict[str, str | None]]:
-        initial = self._http.build_request(method, path, params=params)
-        host = initial.url.host or ""
-        if initial.url.scheme != "https" or (
-            host.endswith("sepay.vn") and host != "einvoice-api-sandbox.sepay.vn"
-        ):
-            raise ValueError("artifact URLs must use HTTPS and cannot target a SePay Live host")
-        headers = {"Accept": "application/pdf, application/xml"}
-        if host == "einvoice-api-sandbox.sepay.vn":
-            headers["Authorization"] = f"Bearer {self._get_token()}"
-        request = self._http.build_request(
-            method,
-            path,
-            params=params,
-            headers=headers,
-        )
-        self._pace()
-        response = self._http.send(request)
-        self._last_request_at = time.monotonic()
-        return (
-            response.status_code,
-            response.content,
-            {
-                "content-type": response.headers.get("content-type"),
-                "content-length": response.headers.get("content-length"),
-            },
-        )
-
     def _get_token(self) -> str:
         if self._token and time.monotonic() < self._token_expires_at - 30:
             return self._token
