@@ -1,0 +1,1 @@
+"""Frozen SQLAlchemy migrations."""
