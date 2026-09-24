@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date
+from datetime import datetime
 from pathlib import Path
 
 from .client import ProbeClient
@@ -21,6 +21,14 @@ from .scenarios import (
 )
 
 
+def _issued_date(value: str) -> str:
+    try:
+        datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("expected YYYY-MM-DD HH:mm:ss") from error
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="python -m tools.einvoice_probe")
     parser.add_argument(
@@ -30,9 +38,12 @@ def main() -> int:
     parser.add_argument("--out", default=".evidence/p0", help="directory for redacted JSON output")
     parser.add_argument("--tax-rate", help="required for invoice scenarios; supplied by the user")
     parser.add_argument(
-        "--issued-date", type=date.fromisoformat, help="required YYYY-MM-DD; supplied by the user"
+        "--issued-date",
+        type=_issued_date,
+        help="required YYYY-MM-DD HH:mm:ss; supplied by the user",
     )
     parser.add_argument("--template-code", help="select a template when the account offers several")
+    parser.add_argument("--invoice-series", help="select a series when the account offers several")
     args = parser.parse_args()
     env = load_env_file(args.env)
     for line in preflight(env):
@@ -59,13 +70,14 @@ def main() -> int:
     output_dir = Path(args.out)
     with ProbeClient(env) as client:
         if args.command == "accounts":
-            result = accounts(client)
+            result = accounts(client, output_dir)
         elif args.command == "s1":
             result = s1_create_poll(
                 client,
                 tax_rate=args.tax_rate,
                 issued_date=args.issued_date,
                 template_code=args.template_code,
+                invoice_series=args.invoice_series,
             )
         elif args.command == "s2":
             result = s2_duplicate_reference(
@@ -73,6 +85,7 @@ def main() -> int:
                 tax_rate=args.tax_rate,
                 issued_date=args.issued_date,
                 template_code=args.template_code,
+                invoice_series=args.invoice_series,
             )
         elif args.command == "s3":
             result = s3_failed_then_retry(
@@ -80,6 +93,7 @@ def main() -> int:
                 tax_rate=args.tax_rate,
                 issued_date=args.issued_date,
                 template_code=args.template_code,
+                invoice_series=args.invoice_series,
             )
         elif args.command == "s4":
             result = s4_download(
@@ -87,6 +101,7 @@ def main() -> int:
                 tax_rate=args.tax_rate,
                 issued_date=args.issued_date,
                 template_code=args.template_code,
+                invoice_series=args.invoice_series,
             )
         elif args.command == "s6":
             result = s6_quota(client)
@@ -96,6 +111,7 @@ def main() -> int:
                 tax_rate=args.tax_rate,
                 issued_date=args.issued_date,
                 template_code=args.template_code,
+                invoice_series=args.invoice_series,
             )
         target = write_json(output_dir, args.command, result)
         print(f"wrote {target}")

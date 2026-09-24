@@ -1,4 +1,4 @@
-"""HTTP client locked to the SePay eInvoice sandbox."""
+"""Sandbox API client with controlled HTTPS artifact fetching."""
 
 from __future__ import annotations
 
@@ -22,10 +22,12 @@ class ProbeClient:
         if env.get("SEPAY_EINVOICE_ENVIRONMENT") != "test":
             raise ValueError("SEPAY_EINVOICE_ENVIRONMENT must be test")
         self._env = dict(env)
+        self._pace_enabled = transport is None
         self._http = httpx.Client(base_url=SANDBOX_BASE_URL, transport=transport, timeout=30.0)
         self._token: str | None = None
         self._token_expires_at = 0.0
         self._last_request_at: float | None = None
+        self.token_response: dict[str, Any] | None = None
 
     def close(self) -> None:
         self._http.close()
@@ -75,14 +77,21 @@ class ProbeClient:
     def request_binary(
         self, method: str, path: str, *, params: Mapping[str, str] | None = None
     ) -> tuple[int, bytes, dict[str, str | None]]:
+        initial = self._http.build_request(method, path, params=params)
+        host = initial.url.host or ""
+        if initial.url.scheme != "https" or (
+            host.endswith("sepay.vn") and host != "einvoice-api-sandbox.sepay.vn"
+        ):
+            raise ValueError("artifact URLs must use HTTPS and cannot target a SePay Live host")
+        headers = {"Accept": "application/pdf, application/xml"}
+        if host == "einvoice-api-sandbox.sepay.vn":
+            headers["Authorization"] = f"Bearer {self._get_token()}"
         request = self._http.build_request(
             method,
             path,
             params=params,
-            headers={"Authorization": f"Bearer {self._get_token()}", "Accept": "application/pdf"},
+            headers=headers,
         )
-        if request.url.scheme != "https" or request.url.host != "einvoice-api-sandbox.sepay.vn":
-            raise ValueError("requests must target the SePay eInvoice sandbox")
         self._pace()
         response = self._http.send(request)
         self._last_request_at = time.monotonic()
@@ -110,6 +119,7 @@ class ProbeClient:
             body = response.json()
         except ValueError as error:
             raise RuntimeError(f"token request failed with HTTP {response.status_code}") from error
+        self.token_response = {"status": response.status_code, "body": body}
         if response.status_code >= 400 or not isinstance(body, Mapping):
             raise RuntimeError(f"token request failed with HTTP {response.status_code}")
         data = body.get("data", body)
@@ -124,6 +134,8 @@ class ProbeClient:
         return token
 
     def _pace(self) -> None:
+        if not self._pace_enabled:
+            return
         if self._last_request_at is not None:
             remaining = 0.5 - (time.monotonic() - self._last_request_at)
             if remaining > 0:

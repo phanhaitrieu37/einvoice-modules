@@ -8,13 +8,15 @@ from collections.abc import Mapping
 SECRET_KEYS = {"access_token", "token", "client_id", "client_secret", "authorization"}
 PII_KEYS = {"name", "legal_name", "address", "email", "phone", "national_id"}
 JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+TAX_ID_TEXT_RE = re.compile(r"(?<!\d)(?:\d{10}|\d{13})(?!\d)")
+URL_QUERY_RE = re.compile(r"(?i)(https?://[^\s\"'<>?#]+)\?[^\s\"'<>#]*")
 
 
 def redact(obj: object) -> object:
     return _redact(obj, in_party=False)
 
 
-def _redact(obj: object, *, in_party: bool) -> object:
+def _redact(obj: object, *, in_party: bool, field_name: str | None = None) -> object:
     if isinstance(obj, Mapping):
         redacted: dict[object, object] = {}
         for key, value in obj.items():
@@ -27,11 +29,16 @@ def _redact(obj: object, *, in_party: bool) -> object:
                 redacted[key] = "00000000-0000-0000-0000-000000000000"
             else:
                 redacted[key] = _redact(
-                    value, in_party=in_party or normalized in {"buyer", "seller"}
+                    value,
+                    in_party=in_party or normalized in {"buyer", "seller"},
+                    field_name=normalized,
                 )
         return redacted
     if isinstance(obj, list):
         return [_redact(value, in_party=in_party) for value in obj]
     if isinstance(obj, str):
-        return JWT_RE.sub("REDACTED_JWT", obj)
+        cleaned = JWT_RE.sub("REDACTED_JWT", obj)
+        if field_name in {"message", "description", "error", "details", "note", "remark"}:
+            cleaned = TAX_ID_TEXT_RE.sub("0000000000", cleaned)
+        return URL_QUERY_RE.sub(r"\1?REDACTED", cleaned)
     return obj

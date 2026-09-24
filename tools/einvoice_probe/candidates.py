@@ -10,6 +10,12 @@ CANDIDATES: dict[str, dict[str, str | bool | None]] = {
         "source": "quickstart",
         "verified": False,
     },
+    "provider_account_detail": {
+        "method": "GET",
+        "path": "/v1/provider-accounts/{id}",
+        "source": "quickstart linked account-detail docs",
+        "verified": False,
+    },
     "create": {
         "method": "POST",
         "path": "/v1/invoices/create",
@@ -36,8 +42,9 @@ CANDIDATES: dict[str, dict[str, str | bool | None]] = {
     },
     "download": {
         "method": "GET",
-        "path": "/v1/invoices/download",
+        "path": "/v1/invoices/{tracking_code}/download",
         "source": "invoice docs",
+        "parameter_guess": "guess: format=pdf|xml when the response has no file URL",
         "verified": False,
     },
     "quota": {"method": "GET", "path": "/v1/quota", "source": "invoice docs", "verified": False},
