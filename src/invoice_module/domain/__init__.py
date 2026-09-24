@@ -1,0 +1,1 @@
+"""Core invoice domain types."""
