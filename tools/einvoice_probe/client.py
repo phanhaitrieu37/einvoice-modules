@@ -42,12 +42,15 @@ class ProbeClient:
         path: str,
         *,
         payload: Mapping[str, Any] | None = None,
+        params: Mapping[str, str] | None = None,
         authenticated: bool = True,
     ) -> tuple[int, Any, dict[str, str | None]]:
         headers: dict[str, str] = {}
         if authenticated:
             headers["Authorization"] = f"Bearer {self._get_token()}"
-        request = self._http.build_request(method, path, json=payload, headers=headers)
+        request = self._http.build_request(
+            method, path, json=payload, params=params, headers=headers
+        )
         if request.url.scheme != "https" or request.url.host != "einvoice-api-sandbox.sepay.vn":
             raise ValueError("requests must target the SePay eInvoice sandbox")
         self._pace()
@@ -60,30 +63,63 @@ class ProbeClient:
                 "content_type": response.headers.get("content-type"),
                 "size": len(response.content),
             }
-        return response.status_code, body, {"content-type": response.headers.get("content-type")}
+        return (
+            response.status_code,
+            body,
+            {
+                "content-type": response.headers.get("content-type"),
+                "content-length": response.headers.get("content-length"),
+            },
+        )
+
+    def request_binary(
+        self, method: str, path: str, *, params: Mapping[str, str] | None = None
+    ) -> tuple[int, bytes, dict[str, str | None]]:
+        request = self._http.build_request(
+            method,
+            path,
+            params=params,
+            headers={"Authorization": f"Bearer {self._get_token()}", "Accept": "application/pdf"},
+        )
+        if request.url.scheme != "https" or request.url.host != "einvoice-api-sandbox.sepay.vn":
+            raise ValueError("requests must target the SePay eInvoice sandbox")
+        self._pace()
+        response = self._http.send(request)
+        self._last_request_at = time.monotonic()
+        return (
+            response.status_code,
+            response.content,
+            {
+                "content-type": response.headers.get("content-type"),
+                "content-length": response.headers.get("content-length"),
+            },
+        )
 
     def _get_token(self) -> str:
         if self._token and time.monotonic() < self._token_expires_at - 30:
             return self._token
-        status, body, _ = self.request_json(
-            str(CANDIDATES["token"]["method"]),
+        client_id = self._env.get("SEPAY_EINVOICE_SANDBOX_CLIENT_ID", "")
+        client_secret = self._env.get("SEPAY_EINVOICE_SANDBOX_CLIENT_SECRET", "")
+        self._pace()
+        response = self._http.post(
             str(CANDIDATES["token"]["path"]),
-            payload={
-                "grant_type": "client_credentials",
-                "client_id": self._env.get("SEPAY_EINVOICE_SANDBOX_CLIENT_ID", ""),
-                "client_secret": self._env.get("SEPAY_EINVOICE_SANDBOX_CLIENT_SECRET", ""),
-            },
-            authenticated=False,
+            auth=httpx.BasicAuth(client_id, client_secret),
         )
-        if status >= 400 or not isinstance(body, Mapping):
-            raise RuntimeError(f"token request failed with HTTP {status}")
-        token = body.get("access_token") or body.get("token")
+        self._last_request_at = time.monotonic()
+        try:
+            body = response.json()
+        except ValueError as error:
+            raise RuntimeError(f"token request failed with HTTP {response.status_code}") from error
+        if response.status_code >= 400 or not isinstance(body, Mapping):
+            raise RuntimeError(f"token request failed with HTTP {response.status_code}")
+        data = body.get("data", body)
+        token = data.get("access_token") if isinstance(data, Mapping) else None
         if not isinstance(token, str) or not token:
             raise RuntimeError("token response did not contain an access token")
-        expires_in = body.get("expires_in", 3600)
+        expires_in = data.get("expires_in", 86400)
         self._token = token
         self._token_expires_at = time.monotonic() + (
-            expires_in if isinstance(expires_in, int) else 3600
+            expires_in if isinstance(expires_in, int) else 86400
         )
         return token
 

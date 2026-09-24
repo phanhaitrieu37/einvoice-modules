@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import shlex
 from collections.abc import Mapping
 from pathlib import Path
@@ -34,7 +35,7 @@ def load_env_file(path: str | Path) -> dict[str, str]:
                 parsed = []
             value = parsed[0] if parsed else ""
         else:
-            value = value.split("#", 1)[0].strip()
+            value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
         result[key] = value
     return result
 

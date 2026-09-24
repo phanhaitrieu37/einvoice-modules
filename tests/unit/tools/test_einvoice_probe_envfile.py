@@ -11,12 +11,17 @@ def test_load_env_file_ignores_comments_and_quotes(tmp_path: Path) -> None:
         "SEPAY_EINVOICE_SANDBOX_CLIENT_SECRET=secret\n",
         encoding="utf-8",
     )
-
     assert load_env_file(path) == {
         "SEPAY_EINVOICE_ENVIRONMENT": "test",
         "SEPAY_EINVOICE_SANDBOX_CLIENT_ID": "client value",
         "SEPAY_EINVOICE_SANDBOX_CLIENT_SECRET": "secret",
     }
+
+
+def test_unquoted_hash_inside_value_is_preserved(tmp_path: Path) -> None:
+    path = tmp_path / "probe.env"
+    path.write_text("SECRET=ab#cd\nWITH_COMMENT=value # note\n", encoding="utf-8")
+    assert load_env_file(path) == {"SECRET": "ab#cd", "WITH_COMMENT": "value"}
 
 
 def test_preflight_prints_presence_only() -> None:
@@ -25,9 +30,7 @@ def test_preflight_prints_presence_only() -> None:
         "SEPAY_EINVOICE_SANDBOX_CLIENT_ID": "private-client-id",
         "SEPAY_EINVOICE_SANDBOX_CLIENT_SECRET": "private-client-secret",
     }
-
     output = "\n".join(preflight(env))
-
     assert output == (
         "SEPAY_EINVOICE_ENVIRONMENT: present\n"
         "SEPAY_EINVOICE_SANDBOX_CLIENT_ID: present\n"

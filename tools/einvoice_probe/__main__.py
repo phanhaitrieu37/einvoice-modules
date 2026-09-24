@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import date
 from pathlib import Path
 
 from .client import ProbeClient
@@ -27,9 +28,11 @@ def main() -> int:
     )
     parser.add_argument("--env", required=True, help="sandbox environment file")
     parser.add_argument("--out", default=".evidence/p0", help="directory for redacted JSON output")
+    parser.add_argument("--tax-rate", help="required for invoice scenarios; supplied by the user")
     parser.add_argument(
-        "--tax-rate", type=int, help="required for invoice scenarios; provided at sandbox run time"
+        "--issued-date", type=date.fromisoformat, help="required YYYY-MM-DD; supplied by the user"
     )
+    parser.add_argument("--template-code", help="select a template when the account offers several")
     args = parser.parse_args()
     env = load_env_file(args.env)
     for line in preflight(env):
@@ -51,22 +54,49 @@ def main() -> int:
     needed_tax = args.command in {"s1", "s2", "s3", "s4", "evidence"}
     if needed_tax and args.tax_rate is None:
         parser.error("--tax-rate is required for invoice scenarios")
+    if needed_tax and args.issued_date is None:
+        parser.error("--issued-date is required for invoice scenarios")
     output_dir = Path(args.out)
     with ProbeClient(env) as client:
         if args.command == "accounts":
             result = accounts(client)
         elif args.command == "s1":
-            result = s1_create_poll(client, tax_rate=args.tax_rate)
+            result = s1_create_poll(
+                client,
+                tax_rate=args.tax_rate,
+                issued_date=args.issued_date,
+                template_code=args.template_code,
+            )
         elif args.command == "s2":
-            result = s2_duplicate_reference(client, tax_rate=args.tax_rate)
+            result = s2_duplicate_reference(
+                client,
+                tax_rate=args.tax_rate,
+                issued_date=args.issued_date,
+                template_code=args.template_code,
+            )
         elif args.command == "s3":
-            result = s3_failed_then_retry(client, tax_rate=args.tax_rate)
+            result = s3_failed_then_retry(
+                client,
+                tax_rate=args.tax_rate,
+                issued_date=args.issued_date,
+                template_code=args.template_code,
+            )
         elif args.command == "s4":
-            result = s4_download(client, tax_rate=args.tax_rate)
+            result = s4_download(
+                client,
+                tax_rate=args.tax_rate,
+                issued_date=args.issued_date,
+                template_code=args.template_code,
+            )
         elif args.command == "s6":
             result = s6_quota(client)
         else:
-            result = evidence(client, tax_rate=args.tax_rate)
+            result = evidence(
+                client,
+                tax_rate=args.tax_rate,
+                issued_date=args.issued_date,
+                template_code=args.template_code,
+            )
         target = write_json(output_dir, args.command, result)
         print(f"wrote {target}")
     return 0

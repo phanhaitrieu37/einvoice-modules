@@ -18,7 +18,7 @@ def _redact(obj: object, *, in_party: bool) -> object:
     if isinstance(obj, Mapping):
         redacted: dict[object, object] = {}
         for key, value in obj.items():
-            normalized = str(key).lower()
+            normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", str(key)).lower()
             if normalized in SECRET_KEYS or (normalized in PII_KEYS and in_party):
                 redacted[key] = "REDACTED"
             elif normalized == "tax_code":
