@@ -21,6 +21,13 @@ def round_half_up(value: Decimal) -> int:
 
 @dataclass(frozen=True)
 class LineInput:
+    """One validated invoice line.
+
+    The source position is unavailable while this value is constructed, so the
+    application boundary that builds a collection of lines must reindex any
+    construction-time :class:`InvalidLine` with that source position.
+    """
+
     name: str
     unit: str
     quantity: Decimal

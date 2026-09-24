@@ -27,6 +27,14 @@ class InvalidTaxCode(InvoiceError):
 
 
 class InvalidLine(InvoiceError):
+    """Invalid line data that should be reindexed by the draft ingestion boundary.
+
+    A value rejected while ``LineInput`` is constructed has no collection
+    position yet, so its constructor reports index zero. Draft ingestion must
+    ``SubmitDraft`` must catch and reindex this error while enumerating source
+    lines.
+    """
+
     def __init__(self, line_index: int, field: str) -> None:
         self.line_index = line_index
         self.field = field
