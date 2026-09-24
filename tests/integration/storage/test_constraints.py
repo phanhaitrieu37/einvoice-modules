@@ -534,6 +534,93 @@ async def test_adjustment_under_replace_mode_rejected(rows: Rows) -> None:
     )
 
 
+async def test_replacement_with_adjust_parent_mode_rejected(rows: Rows) -> None:
+    parent = await original(rows, correction_mode="adjust")
+    await rows.expect_violation(
+        "documents_kind_shape_ck",
+        rows.tables.documents,
+        **rows.document_row(
+            tenant_id=parent["tenant_id"],
+            merchant_id=parent["merchant_id"],
+            environment=parent["environment"],
+            issuer_account_id=parent["issuer_account_id"],
+            kind="replacement",
+            original_document_id=parent["id"],
+            parent_correction_mode="adjust",
+        ),
+    )
+
+
+async def test_adjustment_with_replace_parent_mode_rejected(rows: Rows) -> None:
+    parent = await original(rows, correction_mode="replace")
+    await rows.expect_violation(
+        "documents_kind_shape_ck",
+        rows.tables.documents,
+        **rows.document_row(
+            tenant_id=parent["tenant_id"],
+            merchant_id=parent["merchant_id"],
+            environment=parent["environment"],
+            issuer_account_id=parent["issuer_account_id"],
+            kind="adjustment",
+            original_document_id=parent["id"],
+            parent_correction_mode="replace",
+            adjustment_type="increase",
+        ),
+    )
+
+
+async def test_adjustment_requires_adjustment_type(rows: Rows) -> None:
+    parent = await original(rows, correction_mode="adjust")
+    await rows.expect_violation(
+        "documents_kind_shape_ck",
+        rows.tables.documents,
+        **rows.document_row(
+            tenant_id=parent["tenant_id"],
+            merchant_id=parent["merchant_id"],
+            environment=parent["environment"],
+            issuer_account_id=parent["issuer_account_id"],
+            kind="adjustment",
+            original_document_id=parent["id"],
+            parent_correction_mode="adjust",
+            adjustment_type=None,
+        ),
+    )
+
+
+async def test_replacement_rejects_adjustment_type(rows: Rows) -> None:
+    parent = await original(rows, correction_mode="replace")
+    await rows.expect_violation(
+        "documents_kind_shape_ck",
+        rows.tables.documents,
+        **rows.document_row(
+            tenant_id=parent["tenant_id"],
+            merchant_id=parent["merchant_id"],
+            environment=parent["environment"],
+            issuer_account_id=parent["issuer_account_id"],
+            kind="replacement",
+            original_document_id=parent["id"],
+            parent_correction_mode="replace",
+            adjustment_type="increase",
+        ),
+    )
+
+
+async def test_original_requires_settled_amount(rows: Rows) -> None:
+    acc = await account(rows)
+    await rows.expect_violation(
+        "documents_kind_shape_ck",
+        rows.tables.documents,
+        **rows.document_row(
+            tenant_id=acc["tenant_id"],
+            merchant_id=acc["merchant_id"],
+            environment=acc["environment"],
+            issuer_account_id=acc["id"],
+            kind="original",
+            settled_amount_vnd=None,
+        ),
+    )
+
+
 async def test_child_under_unlocked_parent_rejected(rows: Rows) -> None:
     parent = await original(rows, correction_mode=None)
     await rows.expect_violation(

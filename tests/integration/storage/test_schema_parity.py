@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -9,15 +8,12 @@ import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy.ext.asyncio import AsyncEngine
+from tests.conftest import unique_prefix
 
 from invoice_module.adapters.sqlalchemy.migrations import schema_v1
 from invoice_module.adapters.sqlalchemy.tables import TABLE_COUNT, define_tables
 
 pytestmark = [pytest.mark.integration, pytest.mark.postgres]
-
-
-def unique_prefix() -> str:
-    return f"t{uuid.uuid4().hex[:8]}_"
 
 
 def _strip(value: Any, prefix: str) -> Any:

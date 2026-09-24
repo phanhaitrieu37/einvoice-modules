@@ -71,7 +71,8 @@ async def test_joined_uow_host_rollback_discards(
     async with AsyncSession(engine) as host:
         await host.begin()
         async with SqlAlchemyInvoiceUnitOfWork.joined(host, inv_tables) as uow:
-            await uow.session.execute(inv_tables.invoice_drafts.insert().values(**row))
+            connection = await uow.session.connection()
+            await connection.execute(inv_tables.invoice_drafts.insert().values(**row))
             await uow.commit()
         await host.rollback()
     assert not await _present(engine, inv_tables.invoice_drafts, row["id"])  # type: ignore[arg-type]
@@ -152,3 +153,34 @@ async def test_joined_rollback_keeps_lock_until_host_commit(
 
     await asyncio.wait_for(asyncio.gather(host_session(), contender()), timeout=5)
     assert acquired_b.is_set()
+
+
+async def test_joined_write_then_lock_fails_without_losing_row(
+    engine: AsyncEngine, inv_tables: InvoiceTables
+) -> None:
+    row = draft_row(inv_tables)
+    async with AsyncSession(engine) as host:
+        await host.begin()
+        async with SqlAlchemyInvoiceUnitOfWork.joined(host, inv_tables) as uow:
+            connection = await uow.session.connection()
+            await connection.execute(inv_tables.invoice_drafts.insert().values(**row))
+            with pytest.raises(RuntimeError, match="lock_host_ref must precede joined work"):
+                await uow.lock_host_ref("tenant-test", "order", "written-first")
+            await uow.commit()
+        await host.commit()
+    assert await _present(engine, inv_tables.invoice_drafts, row["id"])  # type: ignore[arg-type]
+
+
+async def test_joined_lock_write_lock_again_keeps_row(
+    engine: AsyncEngine, inv_tables: InvoiceTables
+) -> None:
+    row = draft_row(inv_tables)
+    async with AsyncSession(engine) as host:
+        await host.begin()
+        async with SqlAlchemyInvoiceUnitOfWork.joined(host, inv_tables) as uow:
+            await uow.lock_host_ref("tenant-test", "order", "repeat")
+            await uow.session.execute(inv_tables.invoice_drafts.insert().values(**row))
+            await uow.lock_host_ref("tenant-test", "order", "repeat")
+            await uow.commit()
+        await host.commit()
+    assert await _present(engine, inv_tables.invoice_drafts, row["id"])  # type: ignore[arg-type]
