@@ -77,6 +77,19 @@ async def test_joined_uow_host_rollback_discards(
     assert not await _present(engine, inv_tables.invoice_drafts, row["id"])  # type: ignore[arg-type]
 
 
+async def test_joined_uow_rollback_discards_before_host_commit(
+    engine: AsyncEngine, inv_tables: InvoiceTables
+) -> None:
+    row = draft_row(inv_tables)
+    async with AsyncSession(engine) as host:
+        await host.begin()
+        async with SqlAlchemyInvoiceUnitOfWork.joined(host, inv_tables) as uow:
+            await uow.session.execute(inv_tables.invoice_drafts.insert().values(**row))
+            await uow.rollback()
+        await host.commit()
+    assert not await _present(engine, inv_tables.invoice_drafts, row["id"])  # type: ignore[arg-type]
+
+
 async def test_lock_host_ref_serializes_two_sessions(
     sessions: async_sessionmaker[AsyncSession], inv_tables: InvoiceTables
 ) -> None:

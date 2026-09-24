@@ -64,9 +64,10 @@ def test_tax_amount_off_by_two_rejected() -> None:
 
 
 def test_negative_tax_amount_rejected_with_line_index() -> None:
-    with pytest.raises(InvalidLine) as error:
-        compute_line(line(tax_amount_vnd=-1), line_index=3)
-    assert error.value.line_index == 3
+    for rate in (-2, -1, 0, 5):
+        with pytest.raises(InvalidLine) as error:
+            compute_line(line(tax_rate=rate, tax_amount_vnd=-1), line_index=3)
+        assert error.value.line_index == 3
 
 
 def test_invalid_line_reports_actual_line_index() -> None:
@@ -79,6 +80,17 @@ def test_special_rate_only_accepts_zero_tax_amount() -> None:
     for rate in (-2, -1, 0):
         with pytest.raises(InvalidLine):
             compute_line(line(tax_rate=rate, tax_amount_vnd=1))
+
+
+def test_zero_tax_amount_allowed_for_special_rates() -> None:
+    for rate in (-2, -1, 0):
+        assert compute_line(line(tax_rate=rate, tax_amount_vnd=0)).tax_vnd == 0
+
+
+def test_positive_rate_zero_tax_amount_follows_rounding_tolerance() -> None:
+    assert compute_line(line(unit_price_vnd=1, tax_rate=5, tax_amount_vnd=0)).tax_vnd == 0
+    with pytest.raises(TaxAmountOutOfTolerance):
+        compute_line(line(tax_rate=5, tax_amount_vnd=0))
 
 
 def test_tax_amount_out_of_tolerance_carries_line_index() -> None:

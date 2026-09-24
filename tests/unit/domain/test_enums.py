@@ -70,10 +70,13 @@ def test_review_checks_match_domain_constants() -> None:
         for check in tables.review_cases.constraints
         if isinstance(check, sa.CheckConstraint)
     }
-    for value in ACKNOWLEDGEABLE_REASONS:
-        assert value.value in checks["inv_review_cases_acknowledge_ck"]
-    for value in NOTE_REQUIRED_RESOLUTIONS:
-        assert value.value in checks["inv_review_cases_note_ck"]
+    for name, values in (
+        ("inv_review_cases_acknowledge_ck", ACKNOWLEDGEABLE_REASONS),
+        ("inv_review_cases_note_ck", NOTE_REQUIRED_RESOLUTIONS),
+    ):
+        in_clause = checks[name].split(" IN (")[-1].split(")", maxsplit=1)[0]
+        actual = set(re.findall(r"'([^']+)'", in_clause))
+        assert actual == {value.value for value in values}
     for name in ("inv_review_cases_acknowledge_ck", "inv_review_cases_note_ck"):
         in_clause = checks[name].split(" IN (")[-1].split(")", maxsplit=1)[0]
         values = re.findall(r"'([^']+)'", in_clause)
