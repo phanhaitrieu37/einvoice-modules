@@ -72,9 +72,13 @@ class SqlAlchemyInvoiceUnitOfWork:
         try:
             await self.rollback()
         finally:
-            if not self.is_joined and self._session is not None:
-                await self._session.close()
-            self._session = None
+            try:
+                if not self.is_joined and self._session is not None:
+                    await self._session.close()
+            finally:
+                if not self.is_joined:
+                    self._locked_host_refs.clear()
+                self._session = None
 
     async def commit(self) -> None:
         if self.is_joined:
@@ -87,6 +91,7 @@ class SqlAlchemyInvoiceUnitOfWork:
             self._savepoint = None
         else:
             await self.session.commit()
+            self._locked_host_refs.clear()
 
     async def rollback(self) -> None:
         if self._session is None:
@@ -99,6 +104,7 @@ class SqlAlchemyInvoiceUnitOfWork:
             self._savepoint_touched = False
         else:
             await self.session.rollback()
+            self._locked_host_refs.clear()
 
     async def lock_host_ref(self, tenant_id: str, host_ref_type: str, host_ref_id: str) -> None:
         key = f"{tenant_id}:{host_ref_type}:{host_ref_id}"
@@ -115,8 +121,6 @@ class SqlAlchemyInvoiceUnitOfWork:
                 self._stop_tracking_savepoint_work()
                 await self._savepoint.commit()
                 self._savepoint = None
-        if self.is_joined and self._savepoint_touched:
-            raise RuntimeError("lock_host_ref must precede joined work")
         await self.session.execute(
             text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key}
         )
