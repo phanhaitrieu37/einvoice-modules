@@ -46,7 +46,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --all-extras --group dev --locked
       - name: integration
-        run: uv run pytest -q -m "integration and not acceptance and not sandbox" || test $? -eq 5
+        run: uv run pytest -q -m "integration and not acceptance and not sandbox"
       - name: acceptance
         run: uv run pytest -q -m "acceptance and not sandbox" || test $? -eq 5
 
