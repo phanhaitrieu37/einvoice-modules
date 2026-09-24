@@ -31,12 +31,25 @@ class LineInput:
     item_code: str | None = None
 
     def __post_init__(self) -> None:
-        if isinstance(self.quantity, float) or isinstance(self.unit_price_vnd, float):
-            raise TypeError("float is not supported for money or quantity")
-        if isinstance(self.discount_vnd, float) or isinstance(self.tax_amount_vnd, float):
+        if any(
+            isinstance(value, float)
+            for value in (
+                self.quantity,
+                self.unit_price_vnd,
+                self.tax_rate,
+                self.discount_vnd,
+                self.tax_amount_vnd,
+            )
+        ):
             raise TypeError("float is not supported for money or quantity")
         if not isinstance(self.quantity, Decimal):
             raise TypeError("quantity must be Decimal")
+        if not self.quantity.is_finite():
+            raise InvalidQuantity("quantity must be finite")
+        if not isinstance(self.name, str):
+            raise InvalidLine(0, "name")
+        if not isinstance(self.unit, str):
+            raise InvalidLine(0, "unit")
         name, unit = self.name.strip(), self.unit.strip()
         if not name or len(name) > 500:
             raise InvalidLine(0, "name")
@@ -82,6 +95,10 @@ def compute_line(line: LineInput, line_index: int = 0) -> LineAmounts:
         0 if line.tax_rate in {-2, -1, 0} else round_half_up(Decimal(taxable * line.tax_rate) / 100)
     )
     if line.tax_amount_vnd is not None:
+        if line.tax_amount_vnd < 0:
+            raise InvalidLine(line_index, "tax_amount_vnd")
+        if line.tax_rate in {-2, -1, 0} and line.tax_amount_vnd != 0:
+            raise InvalidLine(line_index, "tax_amount_vnd")
         if abs(line.tax_amount_vnd - tax) > TAX_TOLERANCE_VND:
             raise TaxAmountOutOfTolerance(line_index)
         tax = line.tax_amount_vnd

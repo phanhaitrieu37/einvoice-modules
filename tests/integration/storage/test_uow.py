@@ -80,26 +80,62 @@ async def test_joined_uow_host_rollback_discards(
 async def test_lock_host_ref_serializes_two_sessions(
     sessions: async_sessionmaker[AsyncSession], inv_tables: InvoiceTables
 ) -> None:
-    acquired_a, attempted_b = asyncio.Event(), asyncio.Event()
+    acquired_a, attempted_b, acquired_b = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    order: list[str] = []
 
     async def session_a() -> None:
-        async with (
-            sessions() as session,
-            session.begin(),
-            SqlAlchemyInvoiceUnitOfWork.joined(session, inv_tables) as uow,
-        ):
-            await uow.lock_host_ref("tenant-test", "order", "same")
-            acquired_a.set()
-            await attempted_b.wait()
+        async with sessions() as session:
+            await session.begin()
+            async with SqlAlchemyInvoiceUnitOfWork.joined(session, inv_tables) as uow:
+                await uow.lock_host_ref("tenant-test", "order", "same")
+                acquired_a.set()
+                await attempted_b.wait()
+                await asyncio.sleep(0.1)
+                assert not acquired_b.is_set()
+            await session.commit()
+            order.append("a_commit")
 
     async def session_b() -> None:
         await acquired_a.wait()
-        async with (
-            sessions() as session,
-            session.begin(),
-            SqlAlchemyInvoiceUnitOfWork.joined(session, inv_tables) as uow,
-        ):
-            attempted_b.set()
-            await uow.lock_host_ref("tenant-test", "order", "same")
+        async with sessions() as session:
+            await session.begin()
+            async with SqlAlchemyInvoiceUnitOfWork.joined(session, inv_tables) as uow:
+                attempted_b.set()
+                await uow.lock_host_ref("tenant-test", "order", "same")
+            await session.commit()
+            order.append("b_acquired")
+            acquired_b.set()
 
     await asyncio.wait_for(asyncio.gather(session_a(), session_b()), timeout=5)
+    assert order == ["a_commit", "b_acquired"]
+
+
+async def test_joined_rollback_keeps_lock_until_host_commit(
+    sessions: async_sessionmaker[AsyncSession], inv_tables: InvoiceTables
+) -> None:
+    locked, attempted_b, acquired_b = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def host_session() -> None:
+        async with sessions() as host:
+            await host.begin()
+            async with SqlAlchemyInvoiceUnitOfWork.joined(host, inv_tables) as uow:
+                await uow.lock_host_ref("tenant-test", "order", "rollback")
+                await uow.rollback()
+                locked.set()
+                await attempted_b.wait()
+                await asyncio.sleep(0.1)
+                assert not acquired_b.is_set()
+            await host.commit()
+
+    async def contender() -> None:
+        await locked.wait()
+        async with sessions() as session:
+            await session.begin()
+            async with SqlAlchemyInvoiceUnitOfWork.joined(session, inv_tables) as uow:
+                attempted_b.set()
+                await uow.lock_host_ref("tenant-test", "order", "rollback")
+            await session.commit()
+            acquired_b.set()
+
+    await asyncio.wait_for(asyncio.gather(host_session(), contender()), timeout=5)
+    assert acquired_b.is_set()

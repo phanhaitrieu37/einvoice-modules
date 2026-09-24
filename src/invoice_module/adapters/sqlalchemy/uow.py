@@ -88,9 +88,14 @@ class SqlAlchemyInvoiceUnitOfWork:
 
     async def lock_host_ref(self, tenant_id: str, host_ref_type: str, host_ref_id: str) -> None:
         key = f"{tenant_id}:{host_ref_type}:{host_ref_id}"
+        if self.is_joined and self._savepoint is not None and self._savepoint.is_active:
+            await self._savepoint.rollback()
+            self._savepoint = None
         await self.session.execute(
             text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": key}
         )
+        if self.is_joined:
+            self._savepoint = await self.session.begin_nested()
 
 
 class SqlAlchemyInvoiceUnitOfWorkFactory:

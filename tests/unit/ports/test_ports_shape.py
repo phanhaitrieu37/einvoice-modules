@@ -1,11 +1,18 @@
 import ast
+import inspect
 from pathlib import Path
+from typing import get_type_hints
 
+import invoice_module
+from invoice_module.builder import build_invoice_module
+from invoice_module.domain.document import _IssuerAccountView
 from invoice_module.ports.provider import (
     ClientCredentials,
     EInvoiceProvider,
     IssuerAccountView,
     ProviderInvoice,
+    ProviderRejected,
+    ProviderTransient,
 )
 
 
@@ -44,10 +51,28 @@ def test_credentials_repr_hides_secret() -> None:
     assert "sensitive" not in repr(ClientCredentials("id", "sensitive"))
 
 
+def test_provider_errors_preserve_messages() -> None:
+    assert str(ProviderRejected("bad_request")) == "bad_request"
+    assert str(ProviderTransient()) == "transient provider error"
+
+
+def test_builder_requires_clock() -> None:
+    assert (
+        inspect.signature(build_invoice_module).parameters["clock"].default
+        is inspect.Parameter.empty
+    )
+
+
+def test_document_account_view_accepts_mapping() -> None:
+    assert "Mapping" in str(get_type_hints(_IssuerAccountView)["buyer_fallback_extra"])
+
+
 def test_core_has_no_optional_imports() -> None:
-    root = Path("src/invoice_module")
+    root = Path(invoice_module.__file__).resolve().parent
+    scanned = 0
     for area in ("domain", "ports"):
-        for path in (root / area).glob("*.py"):
+        for path in (root / area).rglob("*.py"):
+            scanned += 1
             tree = ast.parse(path.read_text())
             imports = [
                 node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
@@ -61,3 +86,4 @@ def test_core_has_no_optional_imports() -> None:
             assert not any(
                 name.startswith(("payment_module", "sqlalchemy", "httpx")) for name in imports
             )
+    assert scanned > 0

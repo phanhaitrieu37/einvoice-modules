@@ -1,5 +1,6 @@
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Protocol
@@ -48,7 +49,7 @@ class DraftData:
 class _IssuerAccountView(Protocol):
     buyer_fallback_name: str
     buyer_fallback_address: str
-    buyer_fallback_extra: dict[str, str] | None
+    buyer_fallback_extra: Mapping[str, str] | None
 
 
 @dataclass(frozen=True)

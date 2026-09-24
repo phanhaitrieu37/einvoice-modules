@@ -132,11 +132,13 @@ class ProviderError(Exception):
 class ProviderTransient(ProviderError):
     def __init__(self, retry_after: timedelta | None = None) -> None:
         self.retry_after = retry_after
+        super().__init__("transient provider error")
 
 
 class ProviderRejected(ProviderError):
     def __init__(self, code: str) -> None:
         self.code = code
+        super().__init__(code)
 
 
 class QuotaExhausted(ProviderError):

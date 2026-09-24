@@ -63,6 +63,30 @@ def test_tax_amount_off_by_two_rejected() -> None:
         compute_line(line(tax_amount_vnd=12))
 
 
+def test_negative_tax_amount_rejected_with_line_index() -> None:
+    with pytest.raises(InvalidLine) as error:
+        compute_line(line(tax_amount_vnd=-1), line_index=3)
+    assert error.value.line_index == 3
+
+
+def test_invalid_line_reports_actual_line_index() -> None:
+    with pytest.raises(InvalidLine) as error:
+        compute_line(line(discount_vnd=101), line_index=7)
+    assert error.value.line_index == 7
+
+
+def test_special_rate_only_accepts_zero_tax_amount() -> None:
+    for rate in (-2, -1, 0):
+        with pytest.raises(InvalidLine):
+            compute_line(line(tax_rate=rate, tax_amount_vnd=1))
+
+
+def test_tax_amount_out_of_tolerance_carries_line_index() -> None:
+    with pytest.raises(TaxAmountOutOfTolerance) as error:
+        compute_line(line(tax_amount_vnd=12), line_index=4)
+    assert error.value.line_index == 4
+
+
 def test_declared_total_mismatch_reports_computed() -> None:
     with pytest.raises(TotalMismatch) as error:
         check_declared_total(100, [line()])
@@ -72,6 +96,22 @@ def test_declared_total_mismatch_reports_computed() -> None:
 def test_float_rejected() -> None:
     with pytest.raises(TypeError):
         LineInput("x", "unit", 1.0, 100, 10)  # type: ignore[arg-type]
+
+
+def test_float_tax_rate_rejected() -> None:
+    with pytest.raises(TypeError):
+        line(tax_rate=10.0)
+
+
+@pytest.mark.parametrize("quantity", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")])
+def test_non_finite_quantity_rejected(quantity: Decimal) -> None:
+    with pytest.raises(InvalidQuantity):
+        line(quantity=quantity)
+
+
+def test_none_line_name_rejected() -> None:
+    with pytest.raises(InvalidLine):
+        line(name=None)
 
 
 def test_quantity_three_decimals_rejected() -> None:
