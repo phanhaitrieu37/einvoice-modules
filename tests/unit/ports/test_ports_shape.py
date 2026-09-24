@@ -77,6 +77,11 @@ def test_core_has_no_optional_imports() -> None:
             imports = [
                 node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
             ]
+            relative_imports = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom) and node.level > 0
+            ]
             imports.extend(
                 alias.name
                 for node in ast.walk(tree)
@@ -86,4 +91,5 @@ def test_core_has_no_optional_imports() -> None:
             assert not any(
                 name.startswith(("payment_module", "sqlalchemy", "httpx")) for name in imports
             )
+            assert not relative_imports
     assert scanned > 0

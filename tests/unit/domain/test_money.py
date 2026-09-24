@@ -131,6 +131,47 @@ def test_quantity_three_decimals_rejected() -> None:
         line(quantity=Decimal("0.001"))
 
 
+@pytest.mark.parametrize("quantity", [Decimal("0"), Decimal("-1")])
+def test_non_positive_quantity_rejected(quantity: Decimal) -> None:
+    with pytest.raises(InvalidQuantity):
+        line(quantity=quantity)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("unit_price_vnd", -1),
+        ("unit_price_vnd", True),
+        ("discount_vnd", -1),
+        ("discount_vnd", True),
+    ],
+)
+def test_invalid_nonnegative_money_field_has_field_name(field: str, value: int | bool) -> None:
+    with pytest.raises(InvalidLine) as error:
+        line(**{field: value})
+    assert error.value.field == field
+
+
+@pytest.mark.parametrize("field", ["unit_price_vnd", "discount_vnd", "tax_amount_vnd"])
+def test_float_money_field_rejected_as_type_error(field: str) -> None:
+    with pytest.raises(TypeError):
+        line(**{field: 1.0})
+
+
+def test_name_length_limit_is_500() -> None:
+    assert len(line(name="n" * 500).name) == 500
+    with pytest.raises(InvalidLine) as error:
+        line(name="n" * 501)
+    assert error.value.field == "name"
+
+
+def test_unit_length_limit_is_50() -> None:
+    assert len(line(unit="u" * 50).unit) == 50
+    with pytest.raises(InvalidLine) as error:
+        line(unit="u" * 51)
+    assert error.value.field == "unit"
+
+
 def test_unknown_tax_rate_rejected() -> None:
     with pytest.raises(InvalidTaxRate):
         line(tax_rate=7)
