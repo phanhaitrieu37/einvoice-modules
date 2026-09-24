@@ -1,6 +1,10 @@
+import ast
+import re
+from pathlib import Path
+
 import sqlalchemy as sa
 
-from invoice_module.adapters.sqlalchemy.tables import define_tables
+from invoice_module.adapters.sqlalchemy.tables import _in, define_tables
 from invoice_module.domain.enums import (
     ACKNOWLEDGEABLE_REASONS,
     NOTE_REQUIRED_RESOLUTIONS,
@@ -70,3 +74,35 @@ def test_review_checks_match_domain_constants() -> None:
         assert value.value in checks["inv_review_cases_acknowledge_ck"]
     for value in NOTE_REQUIRED_RESOLUTIONS:
         assert value.value in checks["inv_review_cases_note_ck"]
+    for name in ("inv_review_cases_acknowledge_ck", "inv_review_cases_note_ck"):
+        in_clause = checks[name].split(" IN (")[-1].split(")", maxsplit=1)[0]
+        values = re.findall(r"'([^']+)'", in_clause)
+        assert values == sorted(values)
+
+
+def test_enum_check_values_are_sorted() -> None:
+    check = _in("status", ReviewReason)
+    assert (
+        check
+        == "status IN ("
+        + ", ".join(
+            repr(value.value) for value in sorted(ReviewReason, key=lambda value: value.value)
+        )
+        + ")"
+    )
+
+
+def test_schema_v1_has_no_invoice_module_imports() -> None:
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "src/invoice_module/adapters/sqlalchemy/migrations/schema_v1.py"
+    )
+    tree = ast.parse(path.read_text())
+    imported = [node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
+    imported.extend(
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    )
+    assert not any(name.startswith("invoice_module") for name in imported)

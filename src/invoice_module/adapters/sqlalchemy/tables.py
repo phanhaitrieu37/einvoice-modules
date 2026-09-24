@@ -29,7 +29,7 @@ def json_type() -> sa.types.TypeEngine[Any]:
 
 
 def _values(enum: Any) -> tuple[str, ...]:
-    return tuple(member.value for member in enum)
+    return tuple(sorted(member.value for member in enum))
 
 
 def _in(column: str, enum: Any) -> str:
@@ -423,13 +423,19 @@ def define_tables(metadata: sa.MetaData, prefix: str = "inv_") -> InvoiceTables:
         ),
         sa.CheckConstraint(
             "resolution IS NULL OR resolution NOT IN ("
-            + ", ".join(repr(v.value) for v in NOTE_REQUIRED_RESOLUTIONS)
+            + ", ".join(
+                repr(v.value)
+                for v in sorted(NOTE_REQUIRED_RESOLUTIONS, key=lambda value: value.value)
+            )
             + ") OR (resolution_note IS NOT NULL AND length(btrim(resolution_note)) > 0)",
             name=n("review_cases_note_ck"),
         ),
         sa.CheckConstraint(
             "resolution IS NULL OR resolution <> 'acknowledge' OR reason IN ("
-            + ", ".join(repr(v.value) for v in ACKNOWLEDGEABLE_REASONS)
+            + ", ".join(
+                repr(v.value)
+                for v in sorted(ACKNOWLEDGEABLE_REASONS, key=lambda value: value.value)
+            )
             + ")",
             name=n("review_cases_acknowledge_ck"),
         ),
