@@ -2007,3 +2007,244 @@ def test_cli_requires_issued_date(tmp_path: Path, monkeypatch, capsys) -> None:
         cli.main()
     assert exit_info.value.code == 2
     assert "--issued-date is required" in capsys.readouterr().err
+
+
+# Each value lax-decodes to bytes once non-base64 characters are dropped; lengths cover mod 4.
+MISPLACED_CONTENT = [
+    "https://files.example.test/invoice.pdf?v=1",
+    "https://files.example.test/invoice-.pdf?v=1",
+    "https://files.example.test/invoice--.pdf?v=1",
+    "https://files.example.test/invoice---.pdf?v=1",
+    "<invoice>x</invoice>",
+    "<invoice>x-</invoice>",
+    "<invoice>x--</invoice>",
+    "<invoice>x---</invoice>",
+]
+
+
+def test_misplaced_content_covers_every_length_mod_four() -> None:
+    urls = [value for value in MISPLACED_CONTENT if value.startswith("https://")]
+    xmls = [value for value in MISPLACED_CONTENT if value.startswith("<invoice>")]
+    assert sorted(len(value) % 4 for value in urls) == [0, 1, 2, 3]
+    assert sorted(len(value) % 4 for value in xmls) == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize("content", MISPLACED_CONTENT)
+def test_s4_url_or_raw_xml_content_is_fail(content: str) -> None:
+    assert base64.b64decode(content), "lax decoding must yield bytes for this case to matter"
+
+    def download(request: httpx.Request) -> httpx.Response:
+        if request.url.params["type"] == "xml":
+            return with_content(request, content)
+        return download_response(request)
+
+    handler, _ = s4_handler(download)
+    with client_with(handler) as probe:
+        result = s4_download(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    assert result["issue"]["scenario"] == "PASS"
+    assert result["downloads"]["pdf"]["size"] > 0
+    assert result["downloads"]["xml"]["status"] == 200
+    assert result["downloads"]["xml"]["size"] == 0
+    assert result["downloads"]["xml"]["sha256"] is None
+    assert result["scenario"] == "FAIL"
+
+
+def test_s4_strips_only_crlf_before_strict_decoding() -> None:
+    xml = b"<invoice>" + b"sandbox-line " * 20 + b"</invoice>"
+    crlf = base64.encodebytes(xml).decode().replace("\n", "\r\n")
+    spaced = base64.encodebytes(xml).decode().replace("\n", " ")
+
+    def run(content: str) -> dict:
+        handler, _ = s4_handler(
+            lambda request: (
+                with_content(request, content)
+                if request.url.params["type"] == "xml"
+                else download_response(request)
+            )
+        )
+        with client_with(handler) as probe:
+            return s4_download(
+                probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+            )
+
+    wrapped = run(crlf)
+    assert wrapped["downloads"]["xml"]["sha256"] == hashlib.sha256(xml).hexdigest()
+    assert wrapped["scenario"] == "PASS"
+    unwrapped = run(spaced)
+    assert unwrapped["downloads"]["xml"]["size"] == 0
+    assert unwrapped["scenario"] == "FAIL"
+
+
+def test_s1_without_polls_is_inconclusive() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            return httpx.Response(200, json={"success": True, "data": {}})
+        raise AssertionError(request.url.path)
+
+    with client_with(handler) as probe:
+        result = s1_create_poll(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    assert result["create"]["status"] == 200
+    assert result["tracking_code"] is None
+    assert result["polls"] == []
+    assert result["scenario"] == "INCONCLUSIVE"
+
+
+def test_s3_check_404_on_invalid_create_is_not_triggerable() -> None:
+    accepted = httpx.Response(200, json={"success": True, "data": {"tracking_code": "invalid"}})
+    base = s3_handler(accepted)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/create/check/invalid"):
+            return httpx.Response(
+                404, json={"success": False, "error": {"code": "NOT_FOUND", "message": "No"}}
+            )
+        return base(request)
+
+    with client_with(handler) as probe:
+        result = s3_failed_then_retry(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    assert [poll["status"] for poll in result["polls"]] == [404]
+    assert result["poll_exhausted"] is False
+    assert result["variant"] == "not_triggerable"
+    assert result["reason"] == "failed_create_or_poll_missing_tracking"
+    assert result["retry"] is None
+    assert result["scenario"] == "INCONCLUSIVE"
+
+
+@pytest.mark.parametrize("file_name", [None, ""])
+def test_s4_missing_file_name_is_fail(file_name) -> None:
+    def download(request: httpx.Request) -> httpx.Response:
+        body = download_response(request).json()
+        if request.url.params["type"] == "pdf":
+            body["data"]["file_name"] = file_name
+        return httpx.Response(200, json=body)
+
+    handler, _ = s4_handler(download)
+    with client_with(handler) as probe:
+        result = s4_download(
+            probe, tax_rate=10, issued_date=ISSUED, sleep=FakeClock().sleep, clock=FakeClock()
+        )
+    pdf = result["downloads"]["pdf"]
+    assert result["issue"]["scenario"] == "PASS"
+    assert (pdf["status"], pdf["file_type"]) == (200, "pdf")
+    assert pdf["size"] > 0
+    assert pdf["file_name"] == file_name
+    assert result["scenario"] == "FAIL"
+
+
+def test_non_json_response_body_keeps_only_type_and_size() -> None:
+    raw = b"%PDF-1.4 sandbox bytes"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/token":
+            return token(request)
+        return httpx.Response(200, content=raw, headers={"content-type": "application/pdf"})
+
+    with client_with(handler) as probe:
+        status, body, headers = probe.request_json("GET", "/v1/invoices/track/download")
+    assert status == 200
+    assert body == {"content_type": "application/pdf", "size": len(raw)}
+    assert headers["content-type"] == "application/pdf"
+
+
+def cli_env(tmp_path: Path, environment: str = "test") -> Path:
+    env_file = tmp_path / "probe.env"
+    env_file.write_text(
+        f"SEPAY_EINVOICE_ENVIRONMENT={environment}\n"
+        "SEPAY_EINVOICE_SANDBOX_CLIENT_ID=offline-id\n"
+        "SEPAY_EINVOICE_SANDBOX_CLIENT_SECRET=offline-secret\n",
+        encoding="utf-8",
+    )
+    return env_file
+
+
+class OfflineClient:
+    """Stands in for ProbeClient so CLI tests never build an HTTP client."""
+
+    def __init__(self, env) -> None:
+        self.env = env
+
+    def __enter__(self) -> "OfflineClient":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+
+def no_network(*_args, **_kwargs):
+    raise AssertionError("the CLI built a client")
+
+
+def run_cli(monkeypatch, tmp_path: Path, *args: str, env_file: Path | None = None) -> int:
+    import tools.einvoice_probe.__main__ as cli
+
+    env_file = env_file or cli_env(tmp_path)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["einvoice_probe", args[0], "--env", str(env_file), "--out", str(tmp_path), *args[1:]],
+    )
+    return cli.main()
+
+
+@pytest.mark.parametrize("command", ["s1", "s4"])
+def test_cli_invoice_scenarios_require_tax_rate(
+    command: str, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr("tools.einvoice_probe.__main__.ProbeClient", no_network)
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, tmp_path, command, "--issued-date", ISSUED)
+    assert exit_info.value.code == 2
+    assert "--tax-rate is required" in capsys.readouterr().err
+
+
+def test_cli_quota_runs_without_tax_rate_or_issued_date(tmp_path: Path, monkeypatch) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr("tools.einvoice_probe.__main__.ProbeClient", OfflineClient)
+    monkeypatch.setattr(
+        "tools.einvoice_probe.__main__.s6_quota",
+        lambda client: calls.append(client) or {"scenario": "PASS"},
+    )
+    assert run_cli(monkeypatch, tmp_path, "s6") == 0
+    assert len(calls) == 1
+    assert json.loads((tmp_path / "s6.json").read_text(encoding="utf-8")) == {"scenario": "PASS"}
+
+
+def test_cli_passes_integer_tax_rate_and_issued_date(tmp_path: Path, monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_s1(client, **kwargs):
+        seen.update(kwargs)
+        return {"scenario": "PASS"}
+
+    monkeypatch.setattr("tools.einvoice_probe.__main__.ProbeClient", OfflineClient)
+    monkeypatch.setattr("tools.einvoice_probe.__main__.s1_create_poll", fake_s1)
+    code = run_cli(monkeypatch, tmp_path, "s1", "--tax-rate", "10", "--issued-date", ISSUED)
+    assert code == 0
+    assert type(seen["tax_rate"]) is int
+    assert seen["tax_rate"] == 10
+    assert seen["issued_date"] == ISSUED
+
+
+def test_cli_malformed_issued_date_exits_2(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr("tools.einvoice_probe.__main__.ProbeClient", no_network)
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, tmp_path, "s1", "--tax-rate", "10", "--issued-date", "2026-09-24")
+    assert exit_info.value.code == 2
+    assert "YYYY-MM-DD HH:mm:ss" in capsys.readouterr().err
+
+
+def test_cli_preflight_rejects_non_test_environment(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr("tools.einvoice_probe.__main__.ProbeClient", no_network)
+    env_file = cli_env(tmp_path, environment="production")
+    assert run_cli(monkeypatch, tmp_path, "preflight", env_file=env_file) == 2
+    output = capsys.readouterr().out
+    assert "environment: production" in output
+    assert "offline-secret" not in output

@@ -637,8 +637,9 @@ def _download_artifact(client: ProbeClient, identifier: str, kind: str) -> dict[
     decoded = b""
     if isinstance(encoded, str):
         try:
-            # Non-strict decoding drops MIME line breaks; garbage still decodes to nothing.
-            decoded = base64.b64decode(encoded)
+            # Only MIME line breaks are tolerated; any other non-base64 character rejects
+            # the content, so a URL or raw XML cannot decode to a fake artifact.
+            decoded = base64.b64decode(encoded.replace("\r", "").replace("\n", ""), validate=True)
         except (ValueError, TypeError):
             decoded = b""
     return {
