@@ -1,0 +1,32 @@
+{
+  "pdf": {
+    "attempts": [
+      {
+        "identifier": "tracking_code",
+        "status": 200
+      }
+    ],
+    "content_type": "application/json; charset=UTF-8",
+    "file_name": "invoice_9ce6cf5d-a807-48b2-b9a4-83537dcdd53b.pdf",
+    "file_type": "pdf",
+    "identifier": "tracking_code",
+    "sha256": "9b1f0b767f1a50a47b0e11c8bbbf8659605122b522d12bb7b1e28cf2388b4a41",
+    "size": 375726,
+    "status": 200
+  },
+  "xml": {
+    "attempts": [
+      {
+        "identifier": "tracking_code",
+        "status": 200
+      }
+    ],
+    "content_type": "application/json; charset=UTF-8",
+    "file_name": "invoice_9ce6cf5d-a807-48b2-b9a4-83537dcdd53b.xml",
+    "file_type": "xml",
+    "identifier": "tracking_code",
+    "sha256": "0f665e432639b3f481747e34311d02760dd529abc9ad6439fcffb3903a923a6e",
+    "size": 5162,
+    "status": 200
+  }
+}

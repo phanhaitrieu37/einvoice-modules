@@ -1,0 +1,16 @@
+{
+  "conflict_body_has_ids": false,
+  "create_issues_without_publish": true,
+  "download_returns": "bytes",
+  "failed_consumes_reference": "unknown",
+  "issued_date_rule": "POST accepted issued_date='YYYY-MM-DD HH:mm:ss'; response invoice.issued_date normalized to YYYY-MM-DD (observed 2026-09-25).",
+  "lookup_by_reference": true,
+  "lookup_returns_total": true,
+  "probed_at": "2026-09-25T09:38:47+07:00",
+  "quota_endpoint": true,
+  "quota_error_code": null,
+  "reference_code_accepts_uuid36": true,
+  "reference_code_max_length_observed": 36,
+  "s3_variant": "not_triggerable",
+  "token_ttl_seconds": 86400
+}

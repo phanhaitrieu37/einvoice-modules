@@ -21,6 +21,16 @@ POLL_INTERVAL_SECONDS = 2.5
 POLL_TIMEOUT_SECONDS = 150.0
 POLL_LIMIT = 61
 INVALID_NONEXISTENT_TAX_CODE = "9999999997"
+# Synthetic item code required by SePay for line_type 1|2; sandbox probe data only.
+PROBE_ITEM_CODE = "PROBE-ITEM-001"
+PROBE_TAX_MATRIX = (
+    (-2, "PROBE-KCT", "Probe item KCT"),
+    (-1, "PROBE-KKKNT", "Probe item KKKNT"),
+    (0, "PROBE-VAT0", "Probe item VAT0"),
+    (5, "PROBE-VAT5", "Probe item VAT5"),
+    (8, "PROBE-VAT8", "Probe item VAT8"),
+    (10, "PROBE-VAT10", "Probe item VAT10"),
+)
 MAX_PER_PAGE = "100"
 AMBIGUOUS_TEMPLATE_MESSAGE = (
     "Multiple invoice templates or series are available; supply "
@@ -362,6 +372,75 @@ def s6_quota(client: ProbeClient) -> dict[str, Any]:
     return result
 
 
+def tax_matrix(
+    client: ProbeClient,
+    *,
+    issued_date: str,
+    account: dict[str, str] | None = None,
+    template_code: str | None = None,
+    invoice_series: str | None = None,
+    sleep: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> dict[str, Any]:
+    account = account or select_provider_account(
+        accounts(client), client, template_code=template_code, invoice_series=invoice_series
+    )
+    results = []
+    for rate, item_code, item_name in PROBE_TAX_MATRIX:
+        reference = str(uuid4())
+        payload = _invoice_payload(
+            reference,
+            rate,
+            issued_date,
+            account,
+            item_code=item_code,
+            item_name=item_name,
+        )
+        created = _call(client, "create", payload=payload)
+        tracking = _value(_data(created), "tracking_code")
+        polls, exhausted = (
+            _poll(client, str(tracking), sleep=sleep, clock=clock)
+            if 200 <= created["status"] < 300 and tracking
+            else ([], False)
+        )
+        final = _data(polls[-1]) if polls else {}
+        invoice = _value(final, "invoice") or {}
+        results.append(
+            {
+                "tax_rate": rate,
+                "item_code": item_code,
+                "item_name": item_name,
+                "reference_code": reference,
+                "create": created,
+                "tracking_code": str(tracking) if tracking else None,
+                "polls": polls,
+                "poll_exhausted": exhausted,
+                "final_status": _state(polls[-1]) if polls else None,
+                "tax_amount": _value(invoice, "tax_amount"),
+                "total_amount": _value(invoice, "total_amount"),
+                "error_code": _error_code(created) if created["status"] >= 300 else None,
+                "error_message": _value(_value(created.get("body", {}), "error") or {}, "message")
+                if created["status"] >= 300
+                else None,
+            }
+        )
+    return {"issued_date": issued_date, "results": results}
+
+
+def error_401(client: ProbeClient) -> dict[str, Any]:
+    status, body, headers = client.request_json(
+        "GET", str(CANDIDATES["provider_accounts"]["path"]), bearer_token="fake-probe-token"
+    )
+    return {"status": status, "body": body, "headers": headers}
+
+
+def error_422(client: ProbeClient) -> dict[str, Any]:
+    status, body, headers = client.request_json(
+        "POST", str(CANDIDATES["create"]["path"]), payload={}
+    )
+    return {"status": status, "body": body, "headers": headers}
+
+
 def evidence(
     client: ProbeClient,
     *,
@@ -495,6 +574,8 @@ def _invoice_payload(
     account: dict[str, str],
     *,
     tax_code: str | None = None,
+    item_code: str = PROBE_ITEM_CODE,
+    item_name: str = "Probe item",
 ) -> dict[str, Any]:
     rate = _as_decimal(tax_rate, "tax_rate")
     buyer: dict[str, str] = {"name": "Probe Buyer", "email": "probe@example.com"}
@@ -515,7 +596,8 @@ def _invoice_payload(
             {
                 "line_number": 1,
                 "line_type": 1,
-                "item_name": "Probe item",
+                "item_code": item_code,
+                "item_name": item_name,
                 "unit": "lần",
                 "quantity": 1,
                 "unit_price": int(unit_price),

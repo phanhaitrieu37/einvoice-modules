@@ -1,0 +1,14 @@
+{
+  "body": {
+    "error": {
+      "code": "INVALID_IS_DRAFT_TYPE",
+      "message": "Ki\u1ec3u d\u1eef li\u1ec7u c\u1ee7a is_draft ph\u1ea3i l\u00e0 true ho\u1eb7c false"
+    },
+    "success": false
+  },
+  "headers": {
+    "content-length": null,
+    "content-type": "application/json; charset=UTF-8"
+  },
+  "status": 400
+}

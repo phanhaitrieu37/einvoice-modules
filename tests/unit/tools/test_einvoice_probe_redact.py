@@ -20,6 +20,17 @@ def test_redact_tokens() -> None:
     }
 
 
+def test_redact_preserves_endpoint_descriptor_named_token() -> None:
+    descriptor = {"method": "POST", "path": "/v1/token", "verified": True}
+    assert redact({"token": descriptor}) == {"token": descriptor}
+
+
+def test_redact_secret_descriptor_with_extra_field() -> None:
+    assert redact({"token": {"method": "x", "path": "/", "verified": True, "extra": "s"}}) == {
+        "token": "REDACTED"
+    }
+
+
 def test_redact_buyer_and_seller_pii() -> None:
     result = redact(
         {
@@ -67,6 +78,20 @@ def test_redact_nested_lists() -> None:
             {"buyer": {"phone": "REDACTED"}},
             {"provider_account_id": "00000000-0000-0000-0000-000000000000"},
         ]
+    }
+
+
+def test_redact_provider_account_ids() -> None:
+    zero_uuid = "00000000-0000-0000-0000-000000000000"
+    result = redact(
+        {
+            "items": [{"id": "provider-list-id", "provider": "matbao"}],
+            "data": {"id": "provider-detail-id", "provider": "matbao"},
+        }
+    )
+    assert result == {
+        "items": [{"id": zero_uuid, "provider": "matbao"}],
+        "data": {"id": zero_uuid, "provider": "matbao"},
     }
 
 

@@ -21,11 +21,14 @@ def _redact(obj: object, *, in_party: bool, field_name: str | None = None) -> ob
         redacted: dict[object, object] = {}
         for key, value in obj.items():
             normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", str(key)).lower()
-            if normalized in SECRET_KEYS or (normalized in PII_KEYS and in_party):
+            if (
+                normalized in SECRET_KEYS
+                and not (normalized == "token" and _is_endpoint_descriptor(value))
+            ) or (normalized in PII_KEYS and in_party):
                 redacted[key] = "REDACTED"
             elif normalized == "tax_code":
                 redacted[key] = "0000000000"
-            elif normalized == "provider_account_id":
+            elif normalized == "provider_account_id" or (normalized == "id" and "provider" in obj):
                 redacted[key] = "00000000-0000-0000-0000-000000000000"
             else:
                 redacted[key] = _redact(
@@ -42,3 +45,12 @@ def _redact(obj: object, *, in_party: bool, field_name: str | None = None) -> ob
             cleaned = TAX_ID_TEXT_RE.sub("0000000000", cleaned)
         return URL_QUERY_RE.sub(r"\1?REDACTED", cleaned)
     return obj
+
+
+def _is_endpoint_descriptor(value: object) -> bool:
+    return (
+        isinstance(value, Mapping)
+        and set(value) == {"method", "path", "verified"}
+        and isinstance(value.get("method"), str)
+        and isinstance(value.get("verified"), bool)
+    )

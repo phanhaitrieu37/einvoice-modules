@@ -1,0 +1,461 @@
+{
+  "issued_date": "2026-09-25 09:36:46",
+  "results": [
+    {
+      "create": {
+        "body": {
+          "data": {
+            "message": "\u0110\u00e3 t\u1ea1o y\u00eau c\u1ea7u xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed",
+            "tracking_code": "280494b9-0d7b-46e4-8b7e-22c978d9be7c",
+            "tracking_url": "https://einvoice-api-sandbox.sepay.vn/v1/invoices/create/check/280494b9-0d7b-46e4-8b7e-22c978d9be7c"
+          },
+          "success": true
+        },
+        "headers": {
+          "content-length": null,
+          "content-type": "application/json; charset=UTF-8"
+        },
+        "status": 202
+      },
+      "error_code": null,
+      "error_message": null,
+      "final_status": "Success",
+      "item_code": "PROBE-KCT",
+      "item_name": "Probe item KCT",
+      "poll_exhausted": false,
+      "polls": [
+        {
+          "body": {
+            "data": {
+              "invoice": {
+                "buyer": {
+                  "address": "REDACTED",
+                  "buyer_code": null,
+                  "email": "REDACTED",
+                  "legal_name": "REDACTED",
+                  "name": "REDACTED",
+                  "national_id": "REDACTED",
+                  "phone": "REDACTED",
+                  "tax_code": "0000000000",
+                  "type": "personal"
+                },
+                "document_type": 2,
+                "invoice_number": "307619",
+                "invoice_series": "C26TSE",
+                "issued_date": "2026-09-25",
+                "notes": "",
+                "payment_method": "TM/CK",
+                "pdf_url": "https://beta-portalv2.mifi.vn/DownloadPDFCA.aspx?REDACTED",
+                "provider_status": null,
+                "reference_code": "280494b9-0d7b-46e4-8b7e-22c978d9be7c",
+                "seller_store": null,
+                "source": "api",
+                "status": "issued",
+                "tax_amount": 0,
+                "tax_authority_code": null,
+                "total_amount": 1000,
+                "total_before_tax": 1000,
+                "xml_url": "https://beta-portalv2.mifi.vn/DownloadXml.aspx?REDACTED"
+              },
+              "message": "Xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed th\u00e0nh c\u00f4ng",
+              "reference_code": "280494b9-0d7b-46e4-8b7e-22c978d9be7c",
+              "status": "Success"
+            },
+            "success": true
+          },
+          "headers": {
+            "content-length": null,
+            "content-type": "application/json; charset=UTF-8"
+          },
+          "retry_next_at": null,
+          "status": 200
+        }
+      ],
+      "reference_code": "280494b9-0d7b-46e4-8b7e-22c978d9be7c",
+      "tax_amount": 0,
+      "tax_rate": -2,
+      "total_amount": 1000,
+      "tracking_code": "280494b9-0d7b-46e4-8b7e-22c978d9be7c"
+    },
+    {
+      "create": {
+        "body": {
+          "data": {
+            "message": "\u0110\u00e3 t\u1ea1o y\u00eau c\u1ea7u xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed",
+            "tracking_code": "b557c9e4-844d-4b66-9b5e-a480ed7d6bc2",
+            "tracking_url": "https://einvoice-api-sandbox.sepay.vn/v1/invoices/create/check/b557c9e4-844d-4b66-9b5e-a480ed7d6bc2"
+          },
+          "success": true
+        },
+        "headers": {
+          "content-length": null,
+          "content-type": "application/json; charset=UTF-8"
+        },
+        "status": 202
+      },
+      "error_code": null,
+      "error_message": null,
+      "final_status": "Success",
+      "item_code": "PROBE-KKKNT",
+      "item_name": "Probe item KKKNT",
+      "poll_exhausted": false,
+      "polls": [
+        {
+          "body": {
+            "data": {
+              "invoice": {
+                "buyer": {
+                  "address": "REDACTED",
+                  "buyer_code": null,
+                  "email": "REDACTED",
+                  "legal_name": "REDACTED",
+                  "name": "REDACTED",
+                  "national_id": "REDACTED",
+                  "phone": "REDACTED",
+                  "tax_code": "0000000000",
+                  "type": "personal"
+                },
+                "document_type": 2,
+                "invoice_number": "307620",
+                "invoice_series": "C26TSE",
+                "issued_date": "2026-09-25",
+                "notes": "",
+                "payment_method": "TM/CK",
+                "pdf_url": "https://beta-portalv2.mifi.vn/DownloadPDFCA.aspx?REDACTED",
+                "provider_status": null,
+                "reference_code": "b557c9e4-844d-4b66-9b5e-a480ed7d6bc2",
+                "seller_store": null,
+                "source": "api",
+                "status": "issued",
+                "tax_amount": 0,
+                "tax_authority_code": null,
+                "total_amount": 1000,
+                "total_before_tax": 1000,
+                "xml_url": "https://beta-portalv2.mifi.vn/DownloadXml.aspx?REDACTED"
+              },
+              "message": "Xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed th\u00e0nh c\u00f4ng",
+              "reference_code": "b557c9e4-844d-4b66-9b5e-a480ed7d6bc2",
+              "status": "Success"
+            },
+            "success": true
+          },
+          "headers": {
+            "content-length": null,
+            "content-type": "application/json; charset=UTF-8"
+          },
+          "retry_next_at": null,
+          "status": 200
+        }
+      ],
+      "reference_code": "b557c9e4-844d-4b66-9b5e-a480ed7d6bc2",
+      "tax_amount": 0,
+      "tax_rate": -1,
+      "total_amount": 1000,
+      "tracking_code": "b557c9e4-844d-4b66-9b5e-a480ed7d6bc2"
+    },
+    {
+      "create": {
+        "body": {
+          "data": {
+            "message": "\u0110\u00e3 t\u1ea1o y\u00eau c\u1ea7u xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed",
+            "tracking_code": "5e7a1b1a-0100-452e-914d-f3cd3f25ac60",
+            "tracking_url": "https://einvoice-api-sandbox.sepay.vn/v1/invoices/create/check/5e7a1b1a-0100-452e-914d-f3cd3f25ac60"
+          },
+          "success": true
+        },
+        "headers": {
+          "content-length": null,
+          "content-type": "application/json; charset=UTF-8"
+        },
+        "status": 202
+      },
+      "error_code": null,
+      "error_message": null,
+      "final_status": "Success",
+      "item_code": "PROBE-VAT0",
+      "item_name": "Probe item VAT0",
+      "poll_exhausted": false,
+      "polls": [
+        {
+          "body": {
+            "data": {
+              "invoice": {
+                "buyer": {
+                  "address": "REDACTED",
+                  "buyer_code": null,
+                  "email": "REDACTED",
+                  "legal_name": "REDACTED",
+                  "name": "REDACTED",
+                  "national_id": "REDACTED",
+                  "phone": "REDACTED",
+                  "tax_code": "0000000000",
+                  "type": "personal"
+                },
+                "document_type": 2,
+                "invoice_number": "307621",
+                "invoice_series": "C26TSE",
+                "issued_date": "2026-09-25",
+                "notes": "",
+                "payment_method": "TM/CK",
+                "pdf_url": "https://beta-portalv2.mifi.vn/DownloadPDFCA.aspx?REDACTED",
+                "provider_status": null,
+                "reference_code": "5e7a1b1a-0100-452e-914d-f3cd3f25ac60",
+                "seller_store": null,
+                "source": "api",
+                "status": "issued",
+                "tax_amount": 0,
+                "tax_authority_code": null,
+                "total_amount": 1000,
+                "total_before_tax": 1000,
+                "xml_url": "https://beta-portalv2.mifi.vn/DownloadXml.aspx?REDACTED"
+              },
+              "message": "Xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed th\u00e0nh c\u00f4ng",
+              "reference_code": "5e7a1b1a-0100-452e-914d-f3cd3f25ac60",
+              "status": "Success"
+            },
+            "success": true
+          },
+          "headers": {
+            "content-length": null,
+            "content-type": "application/json; charset=UTF-8"
+          },
+          "retry_next_at": null,
+          "status": 200
+        }
+      ],
+      "reference_code": "5e7a1b1a-0100-452e-914d-f3cd3f25ac60",
+      "tax_amount": 0,
+      "tax_rate": 0,
+      "total_amount": 1000,
+      "tracking_code": "5e7a1b1a-0100-452e-914d-f3cd3f25ac60"
+    },
+    {
+      "create": {
+        "body": {
+          "data": {
+            "message": "\u0110\u00e3 t\u1ea1o y\u00eau c\u1ea7u xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed",
+            "tracking_code": "d517b7e1-7dd9-4017-878a-e768cff58a1e",
+            "tracking_url": "https://einvoice-api-sandbox.sepay.vn/v1/invoices/create/check/d517b7e1-7dd9-4017-878a-e768cff58a1e"
+          },
+          "success": true
+        },
+        "headers": {
+          "content-length": null,
+          "content-type": "application/json; charset=UTF-8"
+        },
+        "status": 202
+      },
+      "error_code": null,
+      "error_message": null,
+      "final_status": "Success",
+      "item_code": "PROBE-VAT5",
+      "item_name": "Probe item VAT5",
+      "poll_exhausted": false,
+      "polls": [
+        {
+          "body": {
+            "data": {
+              "invoice": {
+                "buyer": {
+                  "address": "REDACTED",
+                  "buyer_code": null,
+                  "email": "REDACTED",
+                  "legal_name": "REDACTED",
+                  "name": "REDACTED",
+                  "national_id": "REDACTED",
+                  "phone": "REDACTED",
+                  "tax_code": "0000000000",
+                  "type": "personal"
+                },
+                "document_type": 2,
+                "invoice_number": "307622",
+                "invoice_series": "C26TSE",
+                "issued_date": "2026-09-25",
+                "notes": "",
+                "payment_method": "TM/CK",
+                "pdf_url": "https://beta-portalv2.mifi.vn/DownloadPDFCA.aspx?REDACTED",
+                "provider_status": null,
+                "reference_code": "d517b7e1-7dd9-4017-878a-e768cff58a1e",
+                "seller_store": null,
+                "source": "api",
+                "status": "issued",
+                "tax_amount": 50,
+                "tax_authority_code": null,
+                "total_amount": 1050,
+                "total_before_tax": 1000,
+                "xml_url": "https://beta-portalv2.mifi.vn/DownloadXml.aspx?REDACTED"
+              },
+              "message": "Xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed th\u00e0nh c\u00f4ng",
+              "reference_code": "d517b7e1-7dd9-4017-878a-e768cff58a1e",
+              "status": "Success"
+            },
+            "success": true
+          },
+          "headers": {
+            "content-length": null,
+            "content-type": "application/json; charset=UTF-8"
+          },
+          "retry_next_at": null,
+          "status": 200
+        }
+      ],
+      "reference_code": "d517b7e1-7dd9-4017-878a-e768cff58a1e",
+      "tax_amount": 50,
+      "tax_rate": 5,
+      "total_amount": 1050,
+      "tracking_code": "d517b7e1-7dd9-4017-878a-e768cff58a1e"
+    },
+    {
+      "create": {
+        "body": {
+          "data": {
+            "message": "\u0110\u00e3 t\u1ea1o y\u00eau c\u1ea7u xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed",
+            "tracking_code": "26f03dc9-4d51-4603-825b-0682438ed65c",
+            "tracking_url": "https://einvoice-api-sandbox.sepay.vn/v1/invoices/create/check/26f03dc9-4d51-4603-825b-0682438ed65c"
+          },
+          "success": true
+        },
+        "headers": {
+          "content-length": null,
+          "content-type": "application/json; charset=UTF-8"
+        },
+        "status": 202
+      },
+      "error_code": null,
+      "error_message": null,
+      "final_status": "Success",
+      "item_code": "PROBE-VAT8",
+      "item_name": "Probe item VAT8",
+      "poll_exhausted": false,
+      "polls": [
+        {
+          "body": {
+            "data": {
+              "invoice": {
+                "buyer": {
+                  "address": "REDACTED",
+                  "buyer_code": null,
+                  "email": "REDACTED",
+                  "legal_name": "REDACTED",
+                  "name": "REDACTED",
+                  "national_id": "REDACTED",
+                  "phone": "REDACTED",
+                  "tax_code": "0000000000",
+                  "type": "personal"
+                },
+                "document_type": 2,
+                "invoice_number": "307623",
+                "invoice_series": "C26TSE",
+                "issued_date": "2026-09-25",
+                "notes": "",
+                "payment_method": "TM/CK",
+                "pdf_url": "https://beta-portalv2.mifi.vn/DownloadPDFCA.aspx?REDACTED",
+                "provider_status": null,
+                "reference_code": "26f03dc9-4d51-4603-825b-0682438ed65c",
+                "seller_store": null,
+                "source": "api",
+                "status": "issued",
+                "tax_amount": 80,
+                "tax_authority_code": null,
+                "total_amount": 1080,
+                "total_before_tax": 1000,
+                "xml_url": "https://beta-portalv2.mifi.vn/DownloadXml.aspx?REDACTED"
+              },
+              "message": "Xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed th\u00e0nh c\u00f4ng",
+              "reference_code": "26f03dc9-4d51-4603-825b-0682438ed65c",
+              "status": "Success"
+            },
+            "success": true
+          },
+          "headers": {
+            "content-length": null,
+            "content-type": "application/json; charset=UTF-8"
+          },
+          "retry_next_at": null,
+          "status": 200
+        }
+      ],
+      "reference_code": "26f03dc9-4d51-4603-825b-0682438ed65c",
+      "tax_amount": 80,
+      "tax_rate": 8,
+      "total_amount": 1080,
+      "tracking_code": "26f03dc9-4d51-4603-825b-0682438ed65c"
+    },
+    {
+      "create": {
+        "body": {
+          "data": {
+            "message": "\u0110\u00e3 t\u1ea1o y\u00eau c\u1ea7u xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed",
+            "tracking_code": "8fb6ed07-fbcc-441a-bc37-e17423ee43db",
+            "tracking_url": "https://einvoice-api-sandbox.sepay.vn/v1/invoices/create/check/8fb6ed07-fbcc-441a-bc37-e17423ee43db"
+          },
+          "success": true
+        },
+        "headers": {
+          "content-length": null,
+          "content-type": "application/json; charset=UTF-8"
+        },
+        "status": 202
+      },
+      "error_code": null,
+      "error_message": null,
+      "final_status": "Success",
+      "item_code": "PROBE-VAT10",
+      "item_name": "Probe item VAT10",
+      "poll_exhausted": false,
+      "polls": [
+        {
+          "body": {
+            "data": {
+              "invoice": {
+                "buyer": {
+                  "address": "REDACTED",
+                  "buyer_code": null,
+                  "email": "REDACTED",
+                  "legal_name": "REDACTED",
+                  "name": "REDACTED",
+                  "national_id": "REDACTED",
+                  "phone": "REDACTED",
+                  "tax_code": "0000000000",
+                  "type": "personal"
+                },
+                "document_type": 2,
+                "invoice_number": "307624",
+                "invoice_series": "C26TSE",
+                "issued_date": "2026-09-25",
+                "notes": "",
+                "payment_method": "TM/CK",
+                "pdf_url": "https://beta-portalv2.mifi.vn/DownloadPDFCA.aspx?REDACTED",
+                "provider_status": null,
+                "reference_code": "8fb6ed07-fbcc-441a-bc37-e17423ee43db",
+                "seller_store": null,
+                "source": "api",
+                "status": "issued",
+                "tax_amount": 100,
+                "tax_authority_code": null,
+                "total_amount": 1100,
+                "total_before_tax": 1000,
+                "xml_url": "https://beta-portalv2.mifi.vn/DownloadXml.aspx?REDACTED"
+              },
+              "message": "Xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed th\u00e0nh c\u00f4ng",
+              "reference_code": "8fb6ed07-fbcc-441a-bc37-e17423ee43db",
+              "status": "Success"
+            },
+            "success": true
+          },
+          "headers": {
+            "content-length": null,
+            "content-type": "application/json; charset=UTF-8"
+          },
+          "retry_next_at": null,
+          "status": 200
+        }
+      ],
+      "reference_code": "8fb6ed07-fbcc-441a-bc37-e17423ee43db",
+      "tax_amount": 100,
+      "tax_rate": 10,
+      "total_amount": 1100,
+      "tracking_code": "8fb6ed07-fbcc-441a-bc37-e17423ee43db"
+    }
+  ]
+}

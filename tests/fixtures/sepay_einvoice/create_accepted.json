@@ -1,0 +1,15 @@
+{
+  "body": {
+    "data": {
+      "message": "\u0110\u00e3 t\u1ea1o y\u00eau c\u1ea7u xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed",
+      "tracking_code": "8f3e0182-dcd9-42b5-aed2-6dd5f194f1cb",
+      "tracking_url": "https://einvoice-api-sandbox.sepay.vn/v1/invoices/create/check/8f3e0182-dcd9-42b5-aed2-6dd5f194f1cb"
+    },
+    "success": true
+  },
+  "headers": {
+    "content-length": null,
+    "content-type": "application/json; charset=UTF-8"
+  },
+  "status": 202
+}

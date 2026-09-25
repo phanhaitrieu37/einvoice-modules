@@ -1,0 +1,14 @@
+{
+  "body": {
+    "error": {
+      "code": "UNAUTHORIZED",
+      "message": "Access token is invalid."
+    },
+    "success": false
+  },
+  "headers": {
+    "content-length": null,
+    "content-type": "application/json; charset=UTF-8"
+  },
+  "status": 401
+}

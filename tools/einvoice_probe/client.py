@@ -50,9 +50,12 @@ class ProbeClient:
         payload: Mapping[str, Any] | None = None,
         params: Mapping[str, str] | None = None,
         authenticated: bool = True,
+        bearer_token: str | None = None,
     ) -> tuple[int, Any, dict[str, str | None]]:
         headers: dict[str, str] = {}
-        if authenticated:
+        if bearer_token is not None:
+            headers["Authorization"] = f"Bearer {bearer_token}"
+        elif authenticated:
             headers["Authorization"] = f"Bearer {self._get_token()}"
         request = self._http.build_request(
             method, path, json=payload, params=params, headers=headers
