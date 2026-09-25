@@ -10,7 +10,7 @@ from invoice_module.application.attach_draft import (
     find_draft_for_document,
 )
 from invoice_module.domain.document import SettledPayment, freeze_document
-from invoice_module.domain.enums import DocumentStatus, ReviewReason
+from invoice_module.domain.enums import DocumentStatus, DraftStatus, ReviewReason
 from invoice_module.domain.money import check_declared_total
 from invoice_module.ports.clock import Clock
 from invoice_module.ports.metrics import MetricsSink, NoOpMetricsSink, increment_safely
@@ -209,12 +209,22 @@ class RecordSettledPayment:
     async def _draft_exists(self, uow: InvoiceUnitOfWork, settled: SettledPayment) -> bool:
         # Read only for review context; no-account never consumes the draft.
         drafts = uow.drafts
-        if await drafts.get_by_intent(settled.tenant_id, settled.intent_id):
+        by_intent = await drafts.get_by_intent(settled.tenant_id, settled.intent_id)
+        if (
+            by_intent is not None
+            and getattr(by_intent.status, "value", by_intent.status) == DraftStatus.OPEN.value
+            and by_intent.merchant_id == settled.merchant_id
+        ):
             return True
         draft = await drafts.get_by_host_ref(
             settled.tenant_id, settled.host_ref_type, settled.host_ref_id
         )
-        return bool(draft and (draft.intent_id is None or draft.intent_id == settled.intent_id))
+        return bool(
+            draft
+            and getattr(draft.status, "value", draft.status) == DraftStatus.OPEN.value
+            and draft.merchant_id == settled.merchant_id
+            and (draft.intent_id is None or draft.intent_id == settled.intent_id)
+        )
 
     @staticmethod
     def _document_row(

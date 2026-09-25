@@ -43,6 +43,14 @@ def draft_cmd(merchant_id, host_ref_id, intent_id, **over):
     )
 
 
+class FixedClock:
+    def __init__(self, current):
+        self.current = current
+
+    def now(self):
+        return self.current
+
+
 async def seed_account(engine, tables, merchant_id, tenant_id="tenant-test"):
     row = await seed_issuer_account(
         type("Rows", (), {"insert": lambda self, t, v: _insert(engine, t, v), "tables": tables})(),
@@ -185,6 +193,25 @@ async def test_resubmit_same_intent_increments_revision(engine, inv_tables):
 
 
 @pytest.mark.asyncio
+async def test_draft_update_timestamp_uses_injected_clock(engine, inv_tables):
+    module = build_invoice(engine, inv_tables)
+    clock = FixedClock(datetime(2026, 1, 1, tzinfo=UTC))
+    module.submit_draft._clock = clock
+    merchant, intent = uuid4(), uuid4()
+    first = await module.submit_draft.execute(draft_cmd(merchant, "clocked", intent))
+    expected = datetime(2026, 1, 2, tzinfo=UTC)
+    clock.current = expected
+    await module.submit_draft.execute(draft_cmd(merchant, "clocked", intent))
+    async with engine.connect() as conn:
+        updated_at = await conn.scalar(
+            sa.select(inv_tables.invoice_drafts.c.updated_at).where(
+                inv_tables.invoice_drafts.c.id == first.draft_id
+            )
+        )
+    assert updated_at == expected
+
+
+@pytest.mark.asyncio
 async def test_rebind_open_draft_to_new_intent_when_old_unsettled(engine, inv_tables):
     module = build_invoice(engine, inv_tables)
     merchant = uuid4()
@@ -277,6 +304,18 @@ async def test_discarded_draft_reopens(engine, inv_tables):
 
 
 @pytest.mark.asyncio
+async def test_discarded_bound_draft_cannot_be_reopened_without_intent(engine, inv_tables):
+    module = build_invoice(engine, inv_tables)
+    merchant, intent = uuid4(), uuid4()
+    await module.submit_draft.execute(draft_cmd(merchant, "discarded-no-unbind", intent))
+    await module.discard_draft.execute(
+        "tenant-test", "order", "discarded-no-unbind", "test-operator"
+    )
+    with pytest.raises(DraftBoundToOtherIntent):
+        await module.submit_draft.execute(draft_cmd(merchant, "discarded-no-unbind", None))
+
+
+@pytest.mark.asyncio
 async def test_late_draft_moves_needs_draft_to_queued_and_clears_review(engine, inv_tables):
     module = build_invoice(engine, inv_tables)
     merchant = uuid4()
@@ -305,12 +344,20 @@ async def test_late_draft_moves_needs_draft_to_queued_and_clears_review(engine, 
         )
         assert (
             await conn.scalar(
-                sa.select(inv_tables.review_cases.c.status).where(
-                    inv_tables.review_cases.c.document_id == doc["id"]
-                )
+                sa.select(
+                    inv_tables.review_cases.c.status, inv_tables.review_cases.c.details
+                ).where(inv_tables.review_cases.c.document_id == doc["id"])
             )
             == "resolved"
         )
+        reasons = (
+            await conn.execute(
+                sa.select(inv_tables.review_cases.c.details).where(
+                    inv_tables.review_cases.c.document_id == doc["id"]
+                )
+            )
+        ).scalar_one()["reasons"]
+        assert all(reason["status"] == "cleared" for reason in reasons)
     assert result.attached[0].status == "queued"
 
 
@@ -345,6 +392,51 @@ async def test_late_draft_without_active_account_opens_issuer_review(engine, inv
     assert row.status == "needs_draft"
     assert row.reason == "ISSUER_ACCOUNT_UNAVAILABLE"
     assert row.details["reasons"][0]["details"]["draft_found"] is True
+
+
+@pytest.mark.asyncio
+async def test_late_draft_clears_issuer_unavailable_after_account_activation(engine, inv_tables):
+    module = build_invoice(engine, inv_tables)
+    merchant = uuid4()
+    account = await seed_account(engine, inv_tables, merchant)
+    doc = await seed_waiting_document(engine, inv_tables, merchant, "activate-after-missing")
+    async with engine.begin() as conn:
+        await conn.execute(
+            inv_tables.issuer_accounts.update()
+            .where(inv_tables.issuer_accounts.c.id == account["id"])
+            .values(status="disabled")
+        )
+    first = await module.submit_draft.execute(
+        draft_cmd(merchant, "activate-after-missing", doc["intent_id"])
+    )
+    assert first.attached == ()
+    async with engine.begin() as conn:
+        await conn.execute(
+            inv_tables.issuer_accounts.update()
+            .where(inv_tables.issuer_accounts.c.id == account["id"])
+            .values(status="active")
+        )
+    second = await module.submit_draft.execute(
+        draft_cmd(merchant, "activate-after-missing", doc["intent_id"])
+    )
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                sa.select(
+                    inv_tables.documents.c.status,
+                    inv_tables.review_cases.c.status,
+                    inv_tables.review_cases.c.details,
+                )
+                .join(
+                    inv_tables.review_cases,
+                    inv_tables.review_cases.c.document_id == inv_tables.documents.c.id,
+                )
+                .where(inv_tables.documents.c.id == doc["id"])
+            )
+        ).one()
+    assert second.attached[0].status == "queued"
+    assert tuple(row[:2]) == ("queued", "resolved")
+    assert all(item["status"] == "cleared" for item in row.details["reasons"])
 
 
 @pytest.mark.asyncio
@@ -408,6 +500,8 @@ async def test_late_draft_amount_mismatch_blocks_and_switches_reason(engine, inv
         statement = (
             sa.select(
                 inv_tables.documents.c.status,
+                inv_tables.documents.c.queued_at,
+                inv_tables.documents.c.next_attempt_at,
                 inv_tables.review_cases.c.reason,
                 inv_tables.review_cases.c.status,
                 inv_tables.review_cases.c.details,
@@ -419,7 +513,7 @@ async def test_late_draft_amount_mismatch_blocks_and_switches_reason(engine, inv
             .where(inv_tables.documents.c.id == doc["id"])
         )
         row = (await conn.execute(statement)).one()
-    assert tuple(row[:3]) == ("blocked", "AMOUNT_MISMATCH", "open")
+    assert tuple(row[:5]) == ("blocked", None, None, "AMOUNT_MISMATCH", "open")
     assert row.details["reasons"][0]["status"] == "cleared"
     assert row.details["reasons"][1]["reason"] == "AMOUNT_MISMATCH"
 

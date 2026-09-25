@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 from tests.support.invoice_world import build_invoice, sample_lines, seed_issuer_account
 
 from invoice_module.application.submit_draft import SubmitDraftCommand
@@ -324,6 +325,80 @@ async def test_missing_draft_creates_needs_draft(engine, inv_tables):
 
 
 @pytest.mark.asyncio
+async def test_cross_merchant_draft_fk_failure_rolls_back_settlement(engine, inv_tables):
+    merchant_with_draft, settlement_merchant = uuid4(), uuid4()
+    payment = settled(merchant_id=settlement_merchant)
+    await add_account(engine, inv_tables, settlement_merchant)
+    module = build_invoice(engine, inv_tables)
+    await module.submit_draft.execute(
+        SubmitDraftCommand(
+            payment.tenant_id,
+            merchant_with_draft,
+            payment.host_ref_type,
+            payment.host_ref_id,
+            payment.intent_id,
+            sample_lines(),
+            payment.amount_vnd,
+        )
+    )
+    with pytest.raises(IntegrityError):
+        await record(module, payment)
+    assert await counts(engine, inv_tables, payment.settlement_id) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_cross_merchant_draft_fk_failure_without_account_does_not_assign_draft(
+    engine, inv_tables
+):
+    merchant_with_draft, settlement_merchant = uuid4(), uuid4()
+    payment = settled(merchant_id=settlement_merchant)
+    module = build_invoice(engine, inv_tables)
+    await module.submit_draft.execute(
+        SubmitDraftCommand(
+            payment.tenant_id,
+            merchant_with_draft,
+            payment.host_ref_type,
+            payment.host_ref_id,
+            payment.intent_id,
+            sample_lines(),
+            payment.amount_vnd,
+        )
+    )
+    result = await record(module, payment)
+    async with engine.connect() as conn:
+        row = await conn.execute(
+            sa.select(inv_tables.documents.c.draft_id).where(
+                inv_tables.documents.c.id == result.document_id
+            )
+        )
+    assert row.scalar_one() is None
+    assert await counts(engine, inv_tables, payment.settlement_id) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_no_account_integrity_error_without_winner_is_reraised(
+    engine, inv_tables, monkeypatch
+):
+    existing_payment = settled()
+    await add_account(engine, inv_tables, existing_payment.merchant_id)
+    module = build_invoice(engine, inv_tables)
+    existing = await record(module, existing_payment)
+    async with engine.begin() as conn:
+        await conn.execute(
+            inv_tables.issuer_accounts.update()
+            .where(inv_tables.issuer_accounts.c.merchant_id == existing_payment.merchant_id)
+            .values(status="disabled")
+        )
+    payment = settled(host_ref_id="different-order")
+    monkeypatch.setattr(
+        "invoice_module.application.record_settled_payment.uuid4", lambda: existing.document_id
+    )
+    with pytest.raises(IntegrityError):
+        await record(module, payment)
+    assert await counts(engine, inv_tables, payment.settlement_id) == (0, 0)
+
+
+@pytest.mark.asyncio
 async def test_amount_mismatch_blocks_with_review_and_no_snapshot(engine, inv_tables):
     payment = settled()
     await add_account(engine, inv_tables, payment.merchant_id)
@@ -346,6 +421,8 @@ async def test_amount_mismatch_blocks_with_review_and_no_snapshot(engine, inv_ta
                 sa.select(
                     inv_tables.documents.c.status,
                     inv_tables.documents.c.document,
+                    inv_tables.documents.c.queued_at,
+                    inv_tables.documents.c.next_attempt_at,
                     inv_tables.review_cases.c.reason,
                 )
                 .join(
@@ -355,12 +432,13 @@ async def test_amount_mismatch_blocks_with_review_and_no_snapshot(engine, inv_ta
                 .where(inv_tables.documents.c.id == result.document_id)
             )
         ).one()
-    assert tuple(row) == ("blocked", None, "AMOUNT_MISMATCH")
+    assert tuple(row) == ("blocked", None, None, None, "AMOUNT_MISMATCH")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "draft_kind,found", [("missing", False), ("matching", True), ("mismatching", True)]
+    "draft_kind,found",
+    [("missing", False), ("matching", True), ("mismatching", True), ("other_intent", False)],
 )
 async def test_missing_issuer_account_blocks_with_receipt_matrix(
     engine, inv_tables, draft_kind, found
@@ -369,13 +447,14 @@ async def test_missing_issuer_account_blocks_with_receipt_matrix(
     module = build_invoice(engine, inv_tables)
     if draft_kind != "missing":
         amount = 100 if draft_kind == "matching" else 200
+        draft_intent = uuid4() if draft_kind == "other_intent" else payment.intent_id
         await module.submit_draft.execute(
             SubmitDraftCommand(
                 "tenant-test",
                 payment.merchant_id,
                 payment.host_ref_type,
                 payment.host_ref_id,
-                payment.intent_id,
+                draft_intent,
                 (LineInput("Service", "each", Decimal("1"), amount, 0),),
                 amount,
             )
@@ -442,6 +521,47 @@ async def test_missing_account_duplicate_settlement_opens_both_reasons(engine, i
         "ISSUER_ACCOUNT_UNAVAILABLE",
         "DUPLICATE_SETTLEMENT",
     }
+
+
+@pytest.mark.asyncio
+async def test_late_account_does_not_attach_to_no_account_settlement(engine, inv_tables):
+    payment = settled()
+    module = build_invoice(engine, inv_tables)
+    recorded = await record(module, payment)
+    await add_account(engine, inv_tables, payment.merchant_id)
+    attached = await module.submit_draft.execute(
+        SubmitDraftCommand(
+            payment.tenant_id,
+            payment.merchant_id,
+            payment.host_ref_type,
+            payment.host_ref_id,
+            payment.intent_id,
+            sample_lines(),
+            payment.amount_vnd,
+        )
+    )
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                sa.select(
+                    inv_tables.documents.c.status,
+                    inv_tables.documents.c.issuer_account_id,
+                    inv_tables.review_cases.c.details,
+                )
+                .join(
+                    inv_tables.review_cases,
+                    inv_tables.review_cases.c.document_id == inv_tables.documents.c.id,
+                )
+                .where(inv_tables.documents.c.id == recorded.document_id)
+            )
+        ).one()
+    assert row.status == "blocked"
+    assert row.issuer_account_id is None
+    assert any(
+        item["reason"] == "ISSUER_ACCOUNT_UNAVAILABLE" and item["status"] == "open"
+        for item in row.details["reasons"]
+    )
+    assert attached.attached == ()
 
 
 @pytest.mark.asyncio
@@ -760,7 +880,14 @@ async def test_concurrent_duplicate_settlements_without_draft_two_originals_one_
             sa.text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"), {"key": key}
         )
         blocked = await conn.scalar(
-            sa.text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")
+            sa.text(
+                """SELECT count(*) FROM pg_locks
+                   WHERE locktype = 'advisory' AND NOT granted
+                     AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                     AND classid = ((hashtext(:key)::bigint >> 32) & 4294967295)::oid
+                     AND objid = (hashtext(:key)::bigint & 4294967295)::oid"""
+            ),
+            {"key": key},
         )
     factory.release.set()
     one, two = await asyncio.gather(one_task, two_task)
@@ -856,7 +983,14 @@ async def test_submit_draft_blocks_behind_record_settled_payment(engine, inv_tab
     await asyncio.sleep(0.05)
     async with engine.begin() as conn:
         blocked = await conn.scalar(
-            sa.text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")
+            sa.text(
+                """SELECT count(*) FROM pg_locks
+                   WHERE locktype = 'advisory' AND NOT granted
+                     AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                     AND classid = ((hashtext(:key)::bigint >> 32) & 4294967295)::oid
+                     AND objid = (hashtext(:key)::bigint & 4294967295)::oid"""
+            ),
+            {"key": f"{payment.tenant_id}:{payment.host_ref_type}:{payment.host_ref_id}"},
         )
         can_acquire = await conn.scalar(
             sa.text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"),

@@ -91,9 +91,9 @@ class SubmitDraft:
             if existing is not None:
                 draft_id = existing.id
                 revision = existing.revision + 1
+                if existing.intent_id is not None and cmd.intent_id is None:
+                    raise DraftBoundToOtherIntent("draft cannot be unbound from its intent")
                 if existing.status == DraftStatus.OPEN:
-                    if existing.intent_id is not None and cmd.intent_id is None:
-                        raise DraftBoundToOtherIntent("draft cannot be unbound from its intent")
                     if existing.intent_id not in (
                         None,
                         cmd.intent_id,
@@ -101,9 +101,10 @@ class SubmitDraft:
                         cmd.tenant_id, existing.intent_id
                     ):
                         raise DraftBoundToOtherIntent("draft is bound to a settled intent")
-                elif existing.status == DraftStatus.CONSUMED:
-                    if cmd.intent_id is None or cmd.intent_id == existing.intent_id:
-                        raise DraftAlreadyConsumed("draft is already consumed by this intent")
+                elif existing.status == DraftStatus.CONSUMED and (
+                    cmd.intent_id is None or cmd.intent_id == existing.intent_id
+                ):
+                    raise DraftAlreadyConsumed("draft is already consumed by this intent")
                 if (
                     existing.status == DraftStatus.CONSUMED and cmd.intent_id is not None
                 ) or existing.status == DraftStatus.DISCARDED:
