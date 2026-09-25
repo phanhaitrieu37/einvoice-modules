@@ -67,20 +67,32 @@ async def _insert(engine, table, values):
 
 
 async def seed_waiting_document(
-    engine, tables, merchant_id, host_ref_id, intent_id=None, total=100
+    engine,
+    tables,
+    merchant_id,
+    host_ref_id,
+    intent_id=None,
+    total=100,
+    tenant_id="tenant-test",
+    host_ref_type="order",
 ):
     async with engine.connect() as conn:
-        account_id = await conn.scalar(sa.select(tables.issuer_accounts.c.id).limit(1))
+        account_id = await conn.scalar(
+            sa.select(tables.issuer_accounts.c.id).where(
+                tables.issuer_accounts.c.tenant_id == tenant_id,
+                tables.issuer_accounts.c.merchant_id == merchant_id,
+            )
+        )
     values = {
         "id": uuid4(),
-        "tenant_id": "tenant-test",
+        "tenant_id": tenant_id,
         "merchant_id": merchant_id,
         "environment": "test",
         "issuer_account_id": account_id,
         "kind": "original",
         "settlement_id": uuid4(),
         "intent_id": intent_id or uuid4(),
-        "host_ref_type": "order",
+        "host_ref_type": host_ref_type,
         "host_ref_id": host_ref_id,
         "reference_code": str(uuid4()),
         "settled_amount_vnd": total,
@@ -313,6 +325,71 @@ async def test_discarded_bound_draft_cannot_be_reopened_without_intent(engine, i
     )
     with pytest.raises(DraftBoundToOtherIntent):
         await module.submit_draft.execute(draft_cmd(merchant, "discarded-no-unbind", None))
+
+
+@pytest.mark.asyncio
+async def test_consumed_bound_draft_cannot_be_unbound_with_null_intent(engine, inv_tables):
+    module = build_invoice(engine, inv_tables)
+    merchant, intent = uuid4(), uuid4()
+    await seed_account(engine, inv_tables, merchant)
+    doc = await seed_waiting_document(engine, inv_tables, merchant, "consumed-no-unbind", intent)
+    first = await module.submit_draft.execute(draft_cmd(merchant, "consumed-no-unbind", intent))
+    assert [(item.document_id, item.status) for item in first.attached] == [(doc["id"], "queued")]
+    with pytest.raises(DraftBoundToOtherIntent):
+        await module.submit_draft.execute(draft_cmd(merchant, "consumed-no-unbind", None))
+    async with engine.connect() as conn:
+        draft = (
+            await conn.execute(
+                sa.select(
+                    inv_tables.invoice_drafts.c.status,
+                    inv_tables.invoice_drafts.c.intent_id,
+                    inv_tables.invoice_drafts.c.revision,
+                    inv_tables.invoice_drafts.c.consumed_by_document_id,
+                ).where(inv_tables.invoice_drafts.c.id == first.draft_id)
+            )
+        ).one()
+    assert tuple(draft) == ("consumed", intent, 1, doc["id"])
+
+
+@pytest.mark.asyncio
+async def test_unbound_draft_ignores_waiting_documents_outside_its_scope(engine, inv_tables):
+    module = build_invoice(engine, inv_tables)
+    merchant = uuid4()
+    host_ref = f"scope-{uuid4()}"
+    await seed_account(engine, inv_tables, merchant)
+    await seed_account(engine, inv_tables, merchant, tenant_id="tenant-other")
+    outside = [
+        await seed_waiting_document(engine, inv_tables, merchant, f"other-{uuid4()}"),
+        await seed_waiting_document(
+            engine, inv_tables, merchant, host_ref, host_ref_type="booking"
+        ),
+        await seed_waiting_document(
+            engine, inv_tables, merchant, host_ref, tenant_id="tenant-other"
+        ),
+    ]
+    ids = [doc["id"] for doc in outside]
+
+    async def snapshot():
+        async with engine.connect() as conn:
+            documents = (
+                await conn.execute(
+                    sa.select(inv_tables.documents)
+                    .where(inv_tables.documents.c.id.in_(ids))
+                    .order_by(inv_tables.documents.c.id)
+                )
+            ).all()
+            cases = await conn.scalar(
+                sa.select(sa.func.count())
+                .select_from(inv_tables.review_cases)
+                .where(inv_tables.review_cases.c.document_id.in_(ids))
+            )
+        return documents, cases
+
+    before = await snapshot()
+    assert [row.status for row in before[0]] == ["needs_draft"] * 3 and before[1] == 0
+    result = await module.submit_draft.execute(draft_cmd(merchant, host_ref, None))
+    assert result.attached == ()
+    assert await snapshot() == before
 
 
 @pytest.mark.asyncio

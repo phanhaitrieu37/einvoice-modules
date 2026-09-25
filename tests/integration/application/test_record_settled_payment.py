@@ -78,6 +78,44 @@ async def counts(engine, tables, settlement_id):
         return documents, receipts
 
 
+async def document_and_case(engine, tables, document_id):
+    async with engine.connect() as conn:
+        document = (
+            await conn.execute(
+                sa.select(tables.documents).where(tables.documents.c.id == document_id)
+            )
+        ).one()
+        case = (
+            await conn.execute(
+                sa.select(tables.review_cases).where(
+                    tables.review_cases.c.document_id == document_id
+                )
+            )
+        ).one_or_none()
+    return document, case
+
+
+def open_reasons(case):
+    return {
+        item["reason"]: item["details"]
+        for item in case.details["reasons"]
+        if item["status"] == "open"
+    }
+
+
+async def draft_state(engine, tables, draft_id):
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                sa.select(
+                    tables.invoice_drafts.c.status,
+                    tables.invoice_drafts.c.consumed_by_document_id,
+                ).where(tables.invoice_drafts.c.id == draft_id)
+            )
+        ).one()
+    return tuple(row)
+
+
 @pytest.mark.asyncio
 async def test_same_event_three_times_one_document(engine, inv_tables):
     payment = settled()
@@ -347,9 +385,7 @@ async def test_cross_merchant_draft_fk_failure_rolls_back_settlement(engine, inv
 
 
 @pytest.mark.asyncio
-async def test_cross_merchant_draft_fk_failure_without_account_does_not_assign_draft(
-    engine, inv_tables
-):
+async def test_cross_merchant_draft_without_account_is_not_reported_found(engine, inv_tables):
     merchant_with_draft, settlement_merchant = uuid4(), uuid4()
     payment = settled(merchant_id=settlement_merchant)
     module = build_invoice(engine, inv_tables)
@@ -365,14 +401,155 @@ async def test_cross_merchant_draft_fk_failure_without_account_does_not_assign_d
         )
     )
     result = await record(module, payment)
-    async with engine.connect() as conn:
-        row = await conn.execute(
-            sa.select(inv_tables.documents.c.draft_id).where(
-                inv_tables.documents.c.id == result.document_id
-            )
-        )
-    assert row.scalar_one() is None
+    document, case = await document_and_case(engine, inv_tables, result.document_id)
+    assert (document.status, document.draft_id) == ("blocked", None)
+    assert open_reasons(case) == {"ISSUER_ACCOUNT_UNAVAILABLE": {"draft_found": False}}
     assert await counts(engine, inv_tables, payment.settlement_id) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_consumed_draft_without_account_is_not_reported_found(engine, inv_tables):
+    first = settled()
+    await add_account(engine, inv_tables, first.merchant_id)
+    module = build_invoice(engine, inv_tables)
+    await module.submit_draft.execute(
+        SubmitDraftCommand(
+            first.tenant_id,
+            first.merchant_id,
+            first.host_ref_type,
+            first.host_ref_id,
+            first.intent_id,
+            sample_lines(),
+            first.amount_vnd,
+        )
+    )
+    one = await record(module, first)
+    async with engine.begin() as conn:
+        await conn.execute(
+            inv_tables.issuer_accounts.update()
+            .where(inv_tables.issuer_accounts.c.merchant_id == first.merchant_id)
+            .values(status="disabled")
+        )
+    second = SettledPayment(
+        **(
+            first.__dict__
+            | {"event_id": uuid4(), "settlement_id": uuid4(), "transaction_id": uuid4()}
+        )
+    )
+    two = await record(module, second)
+    document, case = await document_and_case(engine, inv_tables, two.document_id)
+    assert (document.status, document.draft_id) == ("blocked", None)
+    assert open_reasons(case) == {
+        "ISSUER_ACCOUNT_UNAVAILABLE": {"draft_found": False},
+        "DUPLICATE_SETTLEMENT": {"other_settlement_ids": [str(first.settlement_id)]},
+    }
+    first_document, _ = await document_and_case(engine, inv_tables, one.document_id)
+    assert first_document.status == "queued"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound", [True, False], ids=["bound", "unbound"])
+async def test_discarded_draft_is_not_used_by_settlement(engine, inv_tables, bound):
+    payment = settled()
+    await add_account(engine, inv_tables, payment.merchant_id)
+    module = build_invoice(engine, inv_tables)
+    submitted = await module.submit_draft.execute(
+        SubmitDraftCommand(
+            payment.tenant_id,
+            payment.merchant_id,
+            payment.host_ref_type,
+            payment.host_ref_id,
+            payment.intent_id if bound else None,
+            sample_lines(),
+            payment.amount_vnd,
+        )
+    )
+    await module.discard_draft.execute(
+        payment.tenant_id, payment.host_ref_type, payment.host_ref_id, "test-operator"
+    )
+    result = await record(module, payment)
+    document, case = await document_and_case(engine, inv_tables, result.document_id)
+    assert (document.status, document.draft_id, document.document) == ("needs_draft", None, None)
+    assert case is None
+    assert await draft_state(engine, inv_tables, submitted.draft_id) == ("discarded", None)
+
+
+@pytest.mark.asyncio
+async def test_second_settlement_on_intent_with_consumed_draft_needs_draft(engine, inv_tables):
+    first = settled()
+    await add_account(engine, inv_tables, first.merchant_id)
+    module = build_invoice(engine, inv_tables)
+    submitted = await module.submit_draft.execute(
+        SubmitDraftCommand(
+            first.tenant_id,
+            first.merchant_id,
+            first.host_ref_type,
+            first.host_ref_id,
+            first.intent_id,
+            sample_lines(),
+            first.amount_vnd,
+        )
+    )
+    one = await record(module, first)
+    second = SettledPayment(
+        **(
+            first.__dict__
+            | {"event_id": uuid4(), "settlement_id": uuid4(), "transaction_id": uuid4()}
+        )
+    )
+    two = await record(module, second)
+    first_document, first_case = await document_and_case(engine, inv_tables, one.document_id)
+    document, case = await document_and_case(engine, inv_tables, two.document_id)
+    assert (first_document.status, first_case) == ("queued", None)
+    assert (document.status, document.draft_id, document.document) == ("needs_draft", None, None)
+    assert case.reason == "DUPLICATE_SETTLEMENT"
+    assert open_reasons(case) == {
+        "DUPLICATE_SETTLEMENT": {"other_settlement_ids": [str(first.settlement_id)]}
+    }
+    assert await draft_state(engine, inv_tables, submitted.draft_id) == (
+        "consumed",
+        one.document_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_corrected_draft_resolves_case_opened_only_for_amount_mismatch(engine, inv_tables):
+    payment = settled()
+    await add_account(engine, inv_tables, payment.merchant_id)
+    module = build_invoice(engine, inv_tables)
+
+    def draft(amount):
+        return SubmitDraftCommand(
+            payment.tenant_id,
+            payment.merchant_id,
+            payment.host_ref_type,
+            payment.host_ref_id,
+            payment.intent_id,
+            (LineInput("Service", "each", Decimal("1"), amount, 0),),
+            amount,
+        )
+
+    await module.submit_draft.execute(draft(200))
+    result = await record(module, payment)
+    document, case = await document_and_case(engine, inv_tables, result.document_id)
+    assert document.status == "blocked"
+    assert open_reasons(case) == {
+        "AMOUNT_MISMATCH": {"declared_total_vnd": 200, "settled_amount_vnd": 100}
+    }
+    corrected = await module.submit_draft.execute(draft(100))
+    assert [(item.document_id, item.status) for item in corrected.attached] == [
+        (result.document_id, "queued")
+    ]
+    document, case = await document_and_case(engine, inv_tables, result.document_id)
+    assert (document.status, document.draft_id) == ("queued", corrected.draft_id)
+    assert (case.status, case.resolution, case.resolved_by) == (
+        "resolved",
+        "attach_draft",
+        "system:attach_draft",
+    )
+    assert [(item["reason"], item["status"]) for item in case.details["reasons"]] == [
+        ("AMOUNT_MISMATCH", "cleared")
+    ]
 
 
 @pytest.mark.asyncio
