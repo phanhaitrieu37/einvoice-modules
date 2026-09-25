@@ -10,7 +10,6 @@ JWT = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.")
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 TAX_ID = re.compile(r"(?<!\d)(?:\d{10}|\d{13})(?!\d)")
 UUID = re.compile(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-PHONE_VN = re.compile(r"(?<!\d)\+84[ .-]?(?:\d[ .-]?){8,10}(?!\d)")
 URL_QUERY = re.compile(r"https?://[^\s\"'<>?#]+\?([^\s\"'<>#]+)", re.IGNORECASE)
 SECRET_KEYS = {"access_token", "token", "client_id", "client_secret", "authorization"}
 TIME_KEYS = {"time", "timestamp", "created_at", "updated_at", "issued_date", "date"}
@@ -21,7 +20,6 @@ def test_fixtures_have_no_secret_or_pii() -> None:
         raw = path.read_text(encoding="utf-8")
         assert JWT.search(raw) is None, path
         assert all(match.group(1) == "REDACTED" for match in URL_QUERY.finditer(raw)), path
-        assert PHONE_VN.search(raw) is None, path
         assert all(email.endswith("@example.com") for email in EMAIL.findall(raw)), path
         payload = json.loads(raw)
         for key, value in _walk(payload):
@@ -44,12 +42,20 @@ def test_fixtures_have_no_secret_or_pii() -> None:
             if normalized == "tax_code":
                 assert value == "0000000000", path
         for account in _provider_accounts(payload):
-            for key in ("id", "provider_account_id"):
-                value = account.get(key)
-                if isinstance(value, str) and UUID.fullmatch(value):
-                    assert value == "00000000-0000-0000-0000-000000000000", path
+            value = account.get("id")
+            if isinstance(value, str) and UUID.fullmatch(value):
+                assert value == "00000000-0000-0000-0000-000000000000", path
         for key, value, in_party in _walk_context(payload):
-            if in_party and key.lower() in {"name", "legal_name", "address"}:
+            if key.lower() == "provider_account_id":
+                assert value == "00000000-0000-0000-0000-000000000000", path
+            if in_party and key.lower() in {
+                "name",
+                "legal_name",
+                "address",
+                "national_id",
+                "phone",
+                "email",
+            }:
                 assert value == "REDACTED", path
 
 
@@ -98,14 +104,37 @@ def test_fixture_scan_rejects_non_string_secret_outside_endpoints_shape(
         test_fixtures_have_no_secret_or_pii()
 
 
-def test_fixture_scan_rejects_party_pii_phone_and_url_query(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"buyer":{"name":"Jane"}}',
+        '{"seller":{"legal_name":"Seller Inc"}}',
+        '{"buyer":{"address":"Private Street"}}',
+        '{"seller_store":{"name":"Private Counter"}}',
+        '{"buyer":{"phone":"+84901234567"}}',
+        '{"buyer":{"email":"buyer@example.com"}}',
+        '{"url":"https://example.test/invoice?token=private"}',
+        '{"provider":"sepay","provider_account_id":"12345678-1234-1234-1234-123456789abc"}',
+        '{"metadata":{"provider_account_id":"private-account-id"}}',
+        '{"buyer":{"national_id":"001099012345"}}',
+    ],
+    ids=(
+        "buyer-name",
+        "legal-name",
+        "address",
+        "seller-store-name",
+        "phone",
+        "email",
+        "url-query",
+        "provider-account-id-in-provider",
+        "provider-account-id-anywhere",
+        "national-id",
+    ),
+)
+def test_fixture_scan_rejects_each_single_pii_violation(payload, tmp_path, monkeypatch) -> None:
     fixture_dir = tmp_path / "fixtures"
     fixture_dir.mkdir()
-    (fixture_dir / "pii.json").write_text(
-        '{"buyer":{"name":"Jane","address":"Street","phone":"+84901234567"},'
-        '"url":"https://example.test/invoice?token=private"}\n',
-        encoding="utf-8",
-    )
+    (fixture_dir / "violation.json").write_text(payload + "\n", encoding="utf-8")
     monkeypatch.setattr(sys.modules[__name__], "FIXTURE_DIR", fixture_dir)
     with pytest.raises(AssertionError):
         test_fixtures_have_no_secret_or_pii()

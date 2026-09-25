@@ -2432,6 +2432,32 @@ def test_tax_matrix_records_non_2xx_error_without_polling() -> None:
     assert result["results"][0]["polls"] == []
 
 
+def test_tax_matrix_marks_pending_poll_deadline_as_exhausted(monkeypatch) -> None:
+    clock = FakeClock()
+    polls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal polls
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            payload = json.loads(request.content)
+            return httpx.Response(
+                202,
+                json={"success": True, "data": {"tracking_code": payload["reference_code"]}},
+            )
+        polls += 1
+        return check_response("Pending")
+
+    monkeypatch.setattr("tools.einvoice_probe.scenarios.POLL_TIMEOUT_SECONDS", 5.0)
+    with client_with(handler) as probe:
+        result = tax_matrix(probe, issued_date=ISSUED, sleep=clock.sleep, clock=clock)
+    assert polls == 18
+    assert result["results"][0]["poll_exhausted"] is True
+    assert all(row["poll_exhausted"] is True for row in result["results"])
+
+
 def test_cli_dispatches_error_scenarios_without_invoice_arguments(
     tmp_path: Path, monkeypatch
 ) -> None:

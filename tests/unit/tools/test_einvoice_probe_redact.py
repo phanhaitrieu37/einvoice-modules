@@ -25,6 +25,12 @@ def test_redact_preserves_endpoint_descriptor_named_token() -> None:
     assert redact({"token": descriptor}) == {"token": descriptor}
 
 
+def test_redact_secret_descriptor_with_extra_field() -> None:
+    assert redact({"token": {"method": "x", "path": "/", "verified": True, "extra": "s"}}) == {
+        "token": "REDACTED"
+    }
+
+
 def test_redact_buyer_and_seller_pii() -> None:
     result = redact(
         {
