@@ -10,6 +10,7 @@ JWT = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.")
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 TAX_ID = re.compile(r"(?<!\d)(?:\d{10}|\d{13})(?!\d)")
 UUID = re.compile(r"(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+PHONE_VN = re.compile(r"(?<!\d)\+84[ .-]?(?:\d[ .-]?){8,10}(?!\d)")
 URL_QUERY = re.compile(r"https?://[^\s\"'<>?#]+\?([^\s\"'<>#]+)", re.IGNORECASE)
 SECRET_KEYS = {"access_token", "token", "client_id", "client_secret", "authorization"}
 TIME_KEYS = {"time", "timestamp", "created_at", "updated_at", "issued_date", "date"}
@@ -20,6 +21,7 @@ def test_fixtures_have_no_secret_or_pii() -> None:
         raw = path.read_text(encoding="utf-8")
         assert JWT.search(raw) is None, path
         assert all(match.group(1) == "REDACTED" for match in URL_QUERY.finditer(raw)), path
+        assert PHONE_VN.search(raw) is None, path
         assert all(email.endswith("@example.com") for email in EMAIL.findall(raw)), path
         payload = json.loads(raw)
         for key, value in _walk(payload):
@@ -111,7 +113,9 @@ def test_fixture_scan_rejects_non_string_secret_outside_endpoints_shape(
         '{"seller":{"legal_name":"Seller Inc"}}',
         '{"buyer":{"address":"Private Street"}}',
         '{"seller_store":{"name":"Private Counter"}}',
-        '{"buyer":{"phone":"+84901234567"}}',
+        '{"buyer":{"phone":"090 123 4567"}}',
+        '{"error":{"code":"INVALID","message":"Call +84901234567 for support"}}',
+        '{"provider":"sepay","phone":"+84901234567"}',
         '{"buyer":{"email":"buyer@example.com"}}',
         '{"url":"https://example.test/invoice?token=private"}',
         '{"provider":"sepay","provider_account_id":"12345678-1234-1234-1234-123456789abc"}',
@@ -123,7 +127,9 @@ def test_fixture_scan_rejects_non_string_secret_outside_endpoints_shape(
         "legal-name",
         "address",
         "seller-store-name",
-        "phone",
+        "party-phone",
+        "phone-in-error-message",
+        "phone-on-provider-account",
         "email",
         "url-query",
         "provider-account-id-in-provider",

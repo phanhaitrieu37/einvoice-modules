@@ -31,6 +31,7 @@ ENV = {
     "SEPAY_EINVOICE_SANDBOX_CLIENT_SECRET": "probe-secret",
 }
 ISSUED = "2026-09-24 00:00:00"
+FIXTURE_DIR = Path(__file__).parents[2] / "fixtures" / "sepay_einvoice"
 LIST_ITEMS = [{"id": "account-1", "active": True, "provider": "matbao"}]
 PAGING = {"per_page": 200, "total": 1, "has_more": False, "current_page": 1, "page_count": 1}
 LIST_BODY = {"success": True, "data": {"items": LIST_ITEMS, "paging": PAGING}}
@@ -2263,33 +2264,43 @@ def test_cli_preflight_rejects_non_test_environment(tmp_path: Path, monkeypatch,
     assert "offline-secret" not in output
 
 
+def recorded(name: str) -> dict:
+    return json.loads((FIXTURE_DIR / f"{name}.json").read_text(encoding="utf-8"))
+
+
 def test_error_401_uses_fake_bearer_without_create() -> None:
     seen: list[httpx.Request] = []
+    sandbox = recorded("error_401")
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
         assert request.url.path == "/v1/provider-accounts"
-        return httpx.Response(
-            401,
-            json={"success": False, "error": {"code": "UNAUTHORIZED", "message": "Unauthorized"}},
-        )
+        return httpx.Response(sandbox["status"], json=sandbox["body"])
 
     with client_with(handler) as probe:
         result = error_401(probe)
-    assert result["status"] == 401
+    assert result["status"] == sandbox["status"] == 401
     assert seen[0].method == "GET"
-    assert result["body"] == {
-        "success": False,
-        "error": {"code": "UNAUTHORIZED", "message": "Unauthorized"},
-    }
+    assert result["body"] == sandbox["body"]
     assert result["body"]["error"]["code"] == "UNAUTHORIZED"
-    assert result["body"]["error"]["message"] == "Unauthorized"
+    assert result["body"]["error"]["message"] == "Access token is invalid."
     assert seen[0].headers["Authorization"] == "Bearer fake-probe-token"
     assert len(seen) == 1
 
 
+def test_error_401_reports_the_status_the_server_returned() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"success": False, "error": {"code": "FORBIDDEN"}})
+
+    with client_with(handler) as probe:
+        result = error_401(probe)
+    assert result["status"] == 403
+    assert result["body"]["error"]["code"] == "FORBIDDEN"
+
+
 def test_error_422_posts_create_with_missing_required_fields() -> None:
     seen: list[httpx.Request] = []
+    sandbox = recorded("error_422")
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
@@ -2297,24 +2308,16 @@ def test_error_422_posts_create_with_missing_required_fields() -> None:
             return token(request)
         assert request.url.path == "/v1/invoices/create"
         assert json.loads(request.content) == {}
-        return httpx.Response(
-            422,
-            json={
-                "success": False,
-                "error": {"code": "VALIDATION", "message": "Required field missing"},
-            },
-        )
+        return httpx.Response(sandbox["status"], json=sandbox["body"])
 
     with client_with(handler) as probe:
         result = error_422(probe)
-    assert result["status"] == 422
-    assert result["body"] == {
-        "success": False,
-        "error": {"code": "VALIDATION", "message": "Required field missing"},
-    }
-    assert result["body"]["error"]["code"] == "VALIDATION"
-    assert result["body"]["error"]["message"] == "Required field missing"
+    # The sandbox answered the empty create with 400, not 422.
+    assert result["status"] == sandbox["status"] == 400
+    assert result["body"] == sandbox["body"]
+    assert result["body"]["error"]["code"] == "INVALID_IS_DRAFT_TYPE"
     assert [request.url.path for request in seen] == ["/v1/token", "/v1/invoices/create"]
+    assert seen[1].method == "POST"
 
 
 def test_tax_matrix_runs_six_distinct_rates_and_checks_immediately() -> None:
@@ -2339,7 +2342,9 @@ def test_tax_matrix_runs_six_distinct_rates_and_checks_immediately() -> None:
         tracking = request.url.path.rsplit("/", 1)[-1]
         check_times.append(clock.current)
         polls[tracking] = polls.get(tracking, 0) + 1
-        status = "Pending" if polls[tracking] == 1 else "Success"
+        if polls[tracking] == 1:
+            # Recorded Pending checks never carried invoice amounts.
+            return check_response("Pending", reference_code=tracking)
         amount_by_rate = {
             -2: (0, 1000),
             -1: (0, 1001),
@@ -2352,7 +2357,9 @@ def test_tax_matrix_runs_six_distinct_rates_and_checks_immediately() -> None:
         rate = payload["items"][0]["tax_rate"]
         tax_amount, total_amount = amount_by_rate[rate]
         return check_response(
-            status, invoice={"tax_amount": tax_amount, "total_amount": total_amount}
+            "Success",
+            reference_code=tracking,
+            invoice={"tax_amount": tax_amount, "total_amount": total_amount},
         )
 
     with client_with(handler) as probe:
@@ -2403,6 +2410,33 @@ def test_tax_matrix_runs_six_distinct_rates_and_checks_immediately() -> None:
     assert all(row["poll_exhausted"] is False for row in result["results"])
     assert [check_times[index] for index in (0, 2, 4, 6, 8, 10)] == create_times
     assert check_times[1] - check_times[0] == 2.5
+    assert [row["item_code"] for row in result["results"]] == [
+        "PROBE-KCT",
+        "PROBE-KKKNT",
+        "PROBE-VAT0",
+        "PROBE-VAT5",
+        "PROBE-VAT8",
+        "PROBE-VAT10",
+    ]
+    assert [row["item_name"] for row in result["results"]] == [
+        "Probe item KCT",
+        "Probe item KKKNT",
+        "Probe item VAT0",
+        "Probe item VAT5",
+        "Probe item VAT8",
+        "Probe item VAT10",
+    ]
+    for row in result["results"]:
+        assert row["create"]["status"] == 202
+        assert row["create"]["body"]["data"]["tracking_code"] == row["reference_code"]
+        assert [poll["status"] for poll in row["polls"]] == [200, 200]
+        assert [poll["body"]["data"]["status"] for poll in row["polls"]] == [
+            "Pending",
+            "Success",
+        ]
+        assert all(
+            poll["body"]["data"]["reference_code"] == row["reference_code"] for poll in row["polls"]
+        )
 
 
 def test_tax_matrix_records_non_2xx_error_without_polling() -> None:
@@ -2430,6 +2464,8 @@ def test_tax_matrix_records_non_2xx_error_without_polling() -> None:
     assert result["results"][0]["error_code"] == "BAD_REQUEST"
     assert result["results"][0]["error_message"] == "Invalid create"
     assert result["results"][0]["polls"] == []
+    assert all(row["create"]["status"] == 400 for row in result["results"])
+    assert all(row["final_status"] is None for row in result["results"])
 
 
 def test_tax_matrix_marks_pending_poll_deadline_as_exhausted(monkeypatch) -> None:
@@ -2456,6 +2492,42 @@ def test_tax_matrix_marks_pending_poll_deadline_as_exhausted(monkeypatch) -> Non
     assert polls == 18
     assert result["results"][0]["poll_exhausted"] is True
     assert all(row["poll_exhausted"] is True for row in result["results"])
+    assert all(row["final_status"] == "Pending" for row in result["results"])
+    assert all(row["tax_amount"] is None for row in result["results"])
+
+
+def test_tax_matrix_uses_requested_template_and_series_on_multi_template_account() -> None:
+    creates: list[dict] = []
+    detail = {
+        "success": True,
+        "data": {
+            "id": "account-1",
+            "provider": "matbao",
+            # Each selector alone still leaves two choices.
+            "templates": [
+                {"template_code": "1", "invoice_series": "C26TSE"},
+                {"template_code": "1", "invoice_series": "C26TMA"},
+                {"template_code": "2", "invoice_series": "C26TSE"},
+                {"template_code": "2", "invoice_series": "C26TMA"},
+            ],
+        },
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/provider-accounts/account-1":
+            return httpx.Response(200, json=detail)
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            creates.append(json.loads(request.content))
+            return httpx.Response(400, json={"success": False, "error": {"code": "STOP"}})
+        raise AssertionError("tax matrix polled after non-2xx create")
+
+    with client_with(handler) as probe:
+        tax_matrix(probe, issued_date=ISSUED, template_code="2", invoice_series="C26TMA")
+    assert len(creates) == 6
+    assert {(row["template_code"], row["invoice_series"]) for row in creates} == {("2", "C26TMA")}
 
 
 def test_cli_dispatches_error_scenarios_without_invoice_arguments(
@@ -2507,6 +2579,25 @@ def test_cli_tax_matrix_requires_issued_date_and_forwards_template(
         "issued_date": ISSUED,
         "template_code": "2",
         "invoice_series": None,
+    }
+    assert (
+        run_cli(
+            monkeypatch,
+            tmp_path,
+            "tax_matrix",
+            "--issued-date",
+            ISSUED,
+            "--template-code",
+            "2",
+            "--invoice-series",
+            "C26TMA",
+        )
+        == 0
+    )
+    assert seen == {
+        "issued_date": ISSUED,
+        "template_code": "2",
+        "invoice_series": "C26TMA",
     }
 
 
