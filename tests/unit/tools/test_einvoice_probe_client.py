@@ -13,12 +13,15 @@ from tools.einvoice_probe.candidates import CANDIDATES
 from tools.einvoice_probe.client import SANDBOX_BASE_URL, ProbeClient
 from tools.einvoice_probe.scenarios import (
     accounts,
+    error_401,
+    error_422,
     evidence,
     s1_create_poll,
     s2_duplicate_reference,
     s3_failed_then_retry,
     s4_download,
     s6_quota,
+    tax_matrix,
     write_json,
 )
 
@@ -28,13 +31,14 @@ ENV = {
     "SEPAY_EINVOICE_SANDBOX_CLIENT_SECRET": "probe-secret",
 }
 ISSUED = "2026-09-24 00:00:00"
-LIST_ITEMS = [{"id": "account-1", "active": True}]
+LIST_ITEMS = [{"id": "account-1", "active": True, "provider": "matbao"}]
 PAGING = {"per_page": 200, "total": 1, "has_more": False, "current_page": 1, "page_count": 1}
 LIST_BODY = {"success": True, "data": {"items": LIST_ITEMS, "paging": PAGING}}
 DETAIL_BODY = {
     "success": True,
     "data": {
         "id": "account-1",
+        "provider": "matbao",
         "templates": [{"template_code": "1", "invoice_series": "C26TSE"}],
     },
 }
@@ -303,6 +307,14 @@ def test_accounts_writes_redacted_token_and_account_responses(tmp_path: Path) ->
     token_body = json.loads((tmp_path / "token_response.json").read_text())
     assert token_body["body"]["data"]["access_token"] == "REDACTED"
     assert "mock.jwt.token" not in (tmp_path / "token_response.json").read_text()
+    for output in ("provider_accounts.json", "provider_account_detail_001.json"):
+        saved = json.loads((tmp_path / output).read_text(encoding="utf-8"))
+        ids = [
+            value
+            for key, value in _walk_json(saved)
+            if key == "id" and value == "00000000-0000-0000-0000-000000000000"
+        ]
+        assert ids
 
 
 def test_s1_flow_with_mock_transport(monkeypatch) -> None:
@@ -352,6 +364,7 @@ def test_s1_flow_with_mock_transport(monkeypatch) -> None:
     assert payload["is_draft"] is False
     assert payload["items"][0]["tax_rate"] == 10
     assert payload["items"][0]["item_name"] == "Probe item"
+    assert payload["items"][0]["item_code"] == "PROBE-ITEM-001"
     assert payload["total_amount"] == 1100
     assert sleeps == [2.5]
     assert create_methods == ["POST"]
@@ -2248,3 +2261,242 @@ def test_cli_preflight_rejects_non_test_environment(tmp_path: Path, monkeypatch,
     output = capsys.readouterr().out
     assert "environment: production" in output
     assert "offline-secret" not in output
+
+
+def test_error_401_uses_fake_bearer_without_create() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        assert request.url.path == "/v1/provider-accounts"
+        return httpx.Response(
+            401,
+            json={"success": False, "error": {"code": "UNAUTHORIZED", "message": "Unauthorized"}},
+        )
+
+    with client_with(handler) as probe:
+        result = error_401(probe)
+    assert result["status"] == 401
+    assert seen[0].method == "GET"
+    assert result["body"] == {
+        "success": False,
+        "error": {"code": "UNAUTHORIZED", "message": "Unauthorized"},
+    }
+    assert result["body"]["error"]["code"] == "UNAUTHORIZED"
+    assert result["body"]["error"]["message"] == "Unauthorized"
+    assert seen[0].headers["Authorization"] == "Bearer fake-probe-token"
+    assert len(seen) == 1
+
+
+def test_error_422_posts_create_with_missing_required_fields() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/v1/token":
+            return token(request)
+        assert request.url.path == "/v1/invoices/create"
+        assert json.loads(request.content) == {}
+        return httpx.Response(
+            422,
+            json={
+                "success": False,
+                "error": {"code": "VALIDATION", "message": "Required field missing"},
+            },
+        )
+
+    with client_with(handler) as probe:
+        result = error_422(probe)
+    assert result["status"] == 422
+    assert result["body"] == {
+        "success": False,
+        "error": {"code": "VALIDATION", "message": "Required field missing"},
+    }
+    assert result["body"]["error"]["code"] == "VALIDATION"
+    assert result["body"]["error"]["message"] == "Required field missing"
+    assert [request.url.path for request in seen] == ["/v1/token", "/v1/invoices/create"]
+
+
+def test_tax_matrix_runs_six_distinct_rates_and_checks_immediately() -> None:
+    clock = FakeClock()
+    creates: list[dict] = []
+    check_times: list[float] = []
+    create_times: list[float] = []
+    polls: dict[str, int] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        if request.url.path == "/v1/invoices/create":
+            body = json.loads(request.content)
+            creates.append(body)
+            create_times.append(clock.current)
+            return httpx.Response(
+                202,
+                json={"success": True, "data": {"tracking_code": body["reference_code"]}},
+            )
+        tracking = request.url.path.rsplit("/", 1)[-1]
+        check_times.append(clock.current)
+        polls[tracking] = polls.get(tracking, 0) + 1
+        status = "Pending" if polls[tracking] == 1 else "Success"
+        amount_by_rate = {
+            -2: (0, 1000),
+            -1: (0, 1001),
+            0: (0, 1002),
+            5: (50, 1053),
+            8: (80, 1084),
+            10: (100, 1105),
+        }
+        payload = next(item for item in creates if item["reference_code"] == tracking)
+        rate = payload["items"][0]["tax_rate"]
+        tax_amount, total_amount = amount_by_rate[rate]
+        return check_response(
+            status, invoice={"tax_amount": tax_amount, "total_amount": total_amount}
+        )
+
+    with client_with(handler) as probe:
+        result = tax_matrix(
+            probe,
+            issued_date=ISSUED,
+            sleep=clock.sleep,
+            clock=clock,
+        )
+    assert [row["items"][0]["tax_rate"] for row in creates] == [-2, -1, 0, 5, 8, 10]
+    assert len({row["reference_code"] for row in creates}) == 6
+    assert [row["items"][0]["item_code"] for row in creates] == [
+        "PROBE-KCT",
+        "PROBE-KKKNT",
+        "PROBE-VAT0",
+        "PROBE-VAT5",
+        "PROBE-VAT8",
+        "PROBE-VAT10",
+    ]
+    assert [row["items"][0]["item_name"] for row in creates] == [
+        "Probe item KCT",
+        "Probe item KKKNT",
+        "Probe item VAT0",
+        "Probe item VAT5",
+        "Probe item VAT8",
+        "Probe item VAT10",
+    ]
+    assert len({row["items"][0]["item_name"] for row in creates}) == 6
+    assert all(row["final_status"] == "Success" for row in result["results"])
+    assert [row["tax_rate"] for row in result["results"]] == [-2, -1, 0, 5, 8, 10]
+    assert [row["tax_amount"] for row in result["results"]] == [0, 0, 0, 50, 80, 100]
+    assert [row["total_amount"] for row in result["results"]] == [
+        1000,
+        1001,
+        1002,
+        1053,
+        1084,
+        1105,
+    ]
+    assert [row["reference_code"] for row in result["results"]] == [
+        row["reference_code"] for row in creates
+    ]
+    assert [row["tracking_code"] for row in result["results"]] == [
+        row["reference_code"] for row in creates
+    ]
+    assert [row["issued_date"] for row in creates] == [ISSUED] * 6
+    assert result["issued_date"] == ISSUED
+    assert all(row["poll_exhausted"] is False for row in result["results"])
+    assert [check_times[index] for index in (0, 2, 4, 6, 8, 10)] == create_times
+    assert check_times[1] - check_times[0] == 2.5
+
+
+def test_tax_matrix_records_non_2xx_error_without_polling() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        setup = setup_accounts(request)
+        if setup:
+            return setup
+        requests.append(request.url.path)
+        if request.url.path == "/v1/invoices/create":
+            return httpx.Response(
+                400,
+                json={
+                    "success": False,
+                    "error": {"code": "BAD_REQUEST", "message": "Invalid create"},
+                    "data": {"tracking_code": "must-not-poll"},
+                },
+            )
+        raise AssertionError("tax matrix polled after non-2xx create")
+
+    with client_with(handler) as probe:
+        result = tax_matrix(probe, issued_date=ISSUED)
+    assert requests == ["/v1/invoices/create"] * 6
+    assert result["results"][0]["error_code"] == "BAD_REQUEST"
+    assert result["results"][0]["error_message"] == "Invalid create"
+    assert result["results"][0]["polls"] == []
+
+
+def test_cli_dispatches_error_scenarios_without_invoice_arguments(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr("tools.einvoice_probe.__main__.ProbeClient", OfflineClient)
+    monkeypatch.setattr(
+        "tools.einvoice_probe.__main__.error_401",
+        lambda client: calls.append("error_401") or {"status": 401},
+    )
+    monkeypatch.setattr(
+        "tools.einvoice_probe.__main__.error_422",
+        lambda client: calls.append("error_422") or {"status": 422},
+    )
+    assert run_cli(monkeypatch, tmp_path, "error_401") == 0
+    assert run_cli(monkeypatch, tmp_path, "error_422") == 0
+    assert calls == ["error_401", "error_422"]
+
+
+def test_cli_tax_matrix_requires_issued_date_and_forwards_template(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    seen: dict[str, object] = {}
+    monkeypatch.setattr("tools.einvoice_probe.__main__.ProbeClient", OfflineClient)
+
+    def fake_tax_matrix(client, **kwargs):
+        seen.update(kwargs)
+        return {"results": []}
+
+    monkeypatch.setattr("tools.einvoice_probe.__main__.tax_matrix", fake_tax_matrix)
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, tmp_path, "tax_matrix")
+    assert exit_info.value.code == 2
+    assert "--issued-date is required for tax_matrix" in capsys.readouterr().err
+    assert (
+        run_cli(
+            monkeypatch,
+            tmp_path,
+            "tax_matrix",
+            "--issued-date",
+            ISSUED,
+            "--template-code",
+            "2",
+        )
+        == 0
+    )
+    assert seen == {
+        "issued_date": ISSUED,
+        "template_code": "2",
+        "invoice_series": None,
+    }
+
+
+def test_cli_exposes_tax_matrix_choice(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setattr("tools.einvoice_probe.__main__.ProbeClient", no_network)
+    with pytest.raises(SystemExit) as exit_info:
+        run_cli(monkeypatch, tmp_path, "unknown")
+    assert exit_info.value.code == 2
+    assert "tax_matrix" in capsys.readouterr().err
+
+
+def _walk_json(value):
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            yield key, nested
+            yield from _walk_json(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _walk_json(nested)
