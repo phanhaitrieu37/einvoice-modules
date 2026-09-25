@@ -11,12 +11,15 @@ from .client import ProbeClient
 from .envfile import load_env_file, preflight
 from .scenarios import (
     accounts,
+    error_401,
+    error_422,
     evidence,
     s1_create_poll,
     s2_duplicate_reference,
     s3_failed_then_retry,
     s4_download,
     s6_quota,
+    tax_matrix,
     write_json,
 )
 
@@ -32,7 +35,20 @@ def _issued_date(value: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(prog="python -m tools.einvoice_probe")
     parser.add_argument(
-        "command", choices=("preflight", "accounts", "s1", "s2", "s3", "s4", "s6", "evidence")
+        "command",
+        choices=(
+            "preflight",
+            "accounts",
+            "s1",
+            "s2",
+            "s3",
+            "s4",
+            "s6",
+            "evidence",
+            "error_401",
+            "error_422",
+            "tax_matrix",
+        ),
     )
     parser.add_argument("--env", required=True, help="sandbox environment file")
     parser.add_argument("--out", default=".evidence/p0", help="directory for redacted JSON output")
@@ -107,6 +123,19 @@ def main() -> int:
             )
         elif args.command == "s6":
             result = s6_quota(client)
+        elif args.command == "error_401":
+            result = error_401(client)
+        elif args.command == "error_422":
+            result = error_422(client)
+        elif args.command == "tax_matrix":
+            if args.issued_date is None:
+                parser.error("--issued-date is required for tax_matrix")
+            result = tax_matrix(
+                client,
+                issued_date=args.issued_date,
+                template_code=args.template_code,
+                invoice_series=args.invoice_series,
+            )
         else:
 
             def save_scenario(name: str, result: dict[str, object]) -> None:
