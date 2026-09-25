@@ -116,6 +116,48 @@ async def test_second_event_same_settlement_links_same_document(engine, inv_tabl
     assert await counts(engine, inv_tables, first.settlement_id) == (1, 2)
 
 
+@pytest.mark.asyncio
+async def test_mark_consumed_preserves_first_document(engine, inv_tables):
+    first = settled()
+    await add_account(engine, inv_tables, first.merchant_id)
+    module = build_invoice(engine, inv_tables)
+    draft = await module.submit_draft.execute(
+        SubmitDraftCommand(
+            first.tenant_id,
+            first.merchant_id,
+            first.host_ref_type,
+            first.host_ref_id,
+            first.intent_id,
+            sample_lines(),
+            first.amount_vnd,
+        )
+    )
+    first_result = await record(module, first)
+    second = SettledPayment(
+        **(
+            first.__dict__
+            | {
+                "event_id": uuid4(),
+                "intent_id": uuid4(),
+                "settlement_id": uuid4(),
+                "transaction_id": uuid4(),
+            }
+        )
+    )
+    second_result = await record(module, second)
+    async with module.uow_factory() as uow:
+        changed = await uow.drafts.mark_consumed(draft.draft_id, second_result.document_id)
+        await uow.commit()
+    async with engine.connect() as conn:
+        consumed_by = await conn.scalar(
+            sa.select(inv_tables.invoice_drafts.c.consumed_by_document_id).where(
+                inv_tables.invoice_drafts.c.id == draft.draft_id
+            )
+        )
+    assert changed is False
+    assert consumed_by == first_result.document_id
+
+
 class _BarrierDocuments:
     def __init__(self, wrapped, barrier, lock, count, recovery_entered, recovery_release):
         self._wrapped, self._barrier, self._lock, self._count = wrapped, barrier, lock, count
@@ -786,3 +828,40 @@ async def test_concurrent_submit_draft_and_settlement_no_lost_wakeup(engine, inv
                 )
             )
         assert status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_submit_draft_blocks_behind_record_settled_payment(engine, inv_tables):
+    payment = settled()
+    await add_account(engine, inv_tables, payment.merchant_id)
+    module = build_invoice(engine, inv_tables)
+    factory = _HeldInsertFactory(module.uow_factory)
+    module.record_settled_payment._uow_factory = factory
+    module.submit_draft._uow_factory = factory
+    settlement = asyncio.create_task(record(module, payment))
+    await asyncio.wait_for(factory.entered.wait(), 5)
+    draft = asyncio.create_task(
+        module.submit_draft.execute(
+            SubmitDraftCommand(
+                payment.tenant_id,
+                payment.merchant_id,
+                payment.host_ref_type,
+                payment.host_ref_id,
+                payment.intent_id,
+                sample_lines(),
+                payment.amount_vnd,
+            )
+        )
+    )
+    await asyncio.sleep(0.05)
+    async with engine.begin() as conn:
+        blocked = await conn.scalar(
+            sa.text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")
+        )
+        can_acquire = await conn.scalar(
+            sa.text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"),
+            {"key": f"{payment.tenant_id}:{payment.host_ref_type}:{payment.host_ref_id}"},
+        )
+    factory.release.set()
+    await asyncio.gather(settlement, draft)
+    assert blocked >= 1 and can_acquire is False

@@ -119,6 +119,25 @@ async def test_consumer_rejects_payload_event_id_mismatch(engine, inv_tables):
 
 
 @pytest.mark.asyncio
+async def test_consumer_rejects_payload_trusted_scope_mismatch(engine, inv_tables):
+    event = outbox_event()
+    payload = dict(event.payload)
+    payload["trusted_scope"] = dict(event.trusted_scope) | {"tenant_id": "wrong-tenant"}
+    bad_event = OutboxEventView(
+        event.event_id,
+        event.event_type,
+        event.schema_version,
+        event.trusted_scope,
+        payload,
+        event.occurred_at,
+    )
+    with pytest.raises(ScopeMismatch, match="trusted scope"):
+        await PaymentSettledConsumer(
+            build_invoice(engine, inv_tables).record_settled_payment
+        ).publish(bad_event)
+
+
+@pytest.mark.asyncio
 async def test_consumer_rejects_bool_amount(engine, inv_tables):
     event = outbox_event(amount_vnd=True)
     with pytest.raises(ValueError, match="amount_vnd"):
