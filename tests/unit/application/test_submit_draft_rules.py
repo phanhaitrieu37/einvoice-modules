@@ -75,3 +75,11 @@ async def test_invalid_line_is_reindexed_from_source_position():
     with pytest.raises(InvalidLine) as caught:
         await SubmitDraft(NeverOpened(), None).execute(cmd)
     assert caught.value.line_index == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [100.0, True, 0, -1])
+async def test_declared_total_requires_positive_integer_vnd_before_db(value):
+    error = TypeError if isinstance(value, (float, bool)) else ValueError
+    with pytest.raises(error):
+        await SubmitDraft(NeverOpened(), None).execute(command(declared_total_vnd=value))

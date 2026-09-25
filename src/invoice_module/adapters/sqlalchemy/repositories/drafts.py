@@ -56,7 +56,7 @@ class DraftRepository(SqlAlchemyRepository):
         result = await self.session.execute(statement)
         return self._view(result.mappings().one_or_none())
 
-    async def upsert_open(self, draft: dict[str, Any]) -> DraftRow:
+    async def upsert_open(self, draft: dict[str, Any], now: datetime) -> DraftRow:
         table = self.tables.invoice_drafts
         existing = await self.get_by_host_ref(
             draft["tenant_id"], draft["host_ref_type"], draft["host_ref_id"]
@@ -67,7 +67,7 @@ class DraftRepository(SqlAlchemyRepository):
         else:
             values = draft | {
                 "revision": draft.get("revision", existing.revision + 1),
-                "updated_at": datetime.now().astimezone(),
+                "updated_at": now,
             }
             result = await self.session.execute(
                 table.update().where(table.c.id == existing.id).values(**values).returning(table)
@@ -84,7 +84,9 @@ class DraftRepository(SqlAlchemyRepository):
         )
         return result.rowcount == 1
 
-    async def reopen(self, draft_id: UUID, intent_id: UUID, revision: int) -> DraftRow:
+    async def reopen(
+        self, draft_id: UUID, intent_id: UUID, revision: int, now: datetime
+    ) -> DraftRow:
         table = self.tables.invoice_drafts
         result = await self.session.execute(
             table.update()
@@ -94,7 +96,7 @@ class DraftRepository(SqlAlchemyRepository):
                 revision=revision,
                 status=DraftStatus.OPEN.value,
                 consumed_by_document_id=None,
-                updated_at=datetime.now().astimezone(),
+                updated_at=now,
             )
             .returning(table)
         )

@@ -4,6 +4,7 @@ from typing import Any
 from uuid import UUID
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 from invoice_module.adapters.sqlalchemy.repositories.base import SqlAlchemyRepository
 from invoice_module.domain.enums import DocumentStatus
@@ -67,7 +68,9 @@ class DocumentRepository(SqlAlchemyRepository):
             sa.select(1).where(
                 reviews.c.document_id == table.c.id,
                 reviews.c.status == "open",
-                reviews.c.reason == "AMOUNT_MISMATCH",
+                sa.cast(reviews.c.details, postgresql.JSONB).contains(
+                    {"reasons": [{"reason": "AMOUNT_MISMATCH", "status": "open"}]}
+                ),
             )
         )
         result = await self.session.execute(

@@ -78,6 +78,24 @@ async def test_consumer_rejects_unknown_schema_version(engine, inv_tables):
 
 
 @pytest.mark.asyncio
+async def test_consumer_rejects_bool_schema_version(engine, inv_tables):
+    event = outbox_event()
+    with pytest.raises(UnsupportedEventVersion):
+        await PaymentSettledConsumer(
+            build_invoice(engine, inv_tables).record_settled_payment
+        ).publish(
+            OutboxEventView(
+                event.event_id,
+                event.event_type,
+                True,
+                event.trusted_scope,
+                event.payload,
+                event.occurred_at,
+            )
+        )
+
+
+@pytest.mark.asyncio
 async def test_consumer_rejects_scope_mismatch(engine, inv_tables):
     event = outbox_event()
     scope = dict(event.trusted_scope) | {"tenant_id": "wrong"}
@@ -89,6 +107,15 @@ async def test_consumer_rejects_scope_mismatch(engine, inv_tables):
                 event.event_id, event.event_type, 1, scope, event.payload, event.occurred_at
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_consumer_rejects_payload_event_id_mismatch(engine, inv_tables):
+    event = outbox_event(event_id=str(uuid4()))
+    with pytest.raises(ScopeMismatch, match="event id"):
+        await PaymentSettledConsumer(
+            build_invoice(engine, inv_tables).record_settled_payment
+        ).publish(event)
 
 
 @pytest.mark.asyncio

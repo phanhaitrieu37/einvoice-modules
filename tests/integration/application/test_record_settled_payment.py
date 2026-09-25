@@ -228,15 +228,19 @@ class _HeldInsertUow:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_account", [False, True])
 async def test_concurrent_distinct_events_same_settlement_different_host_ref_two_receipts_one_document(  # noqa: E501
     engine,
     inv_tables,
+    with_account,
 ):
     first = settled()
     second = SettledPayment(
         **(first.__dict__ | {"event_id": uuid4(), "host_ref_id": "other-order"})
     )
     base = build_invoice(engine, inv_tables)
+    if with_account:
+        await add_account(engine, inv_tables, first.merchant_id)
     base.record_settled_payment._uow_factory = _BarrierUowFactory(base.uow_factory)
     tasks = [asyncio.create_task(record(base, first)), asyncio.create_task(record(base, second))]
     await asyncio.wait_for(base.record_settled_payment._uow_factory.recovery_entered.wait(), 5)
@@ -359,6 +363,58 @@ async def test_missing_issuer_account_blocks_with_receipt_matrix(
     assert row.status == "blocked" and row.issuer_account_id is None
     assert row.document_id == result.document_id and row.reason == "ISSUER_ACCOUNT_UNAVAILABLE"
     assert row.details["reasons"][0]["details"]["draft_found"] is found
+    if found:
+        async with engine.connect() as conn:
+            draft = (
+                await conn.execute(
+                    sa.select(
+                        inv_tables.invoice_drafts.c.status,
+                        inv_tables.invoice_drafts.c.consumed_by_document_id,
+                    ).where(inv_tables.invoice_drafts.c.host_ref_id == payment.host_ref_id)
+                )
+            ).one()
+        assert tuple(draft) == ("open", None)
+
+
+@pytest.mark.asyncio
+async def test_missing_account_duplicate_settlement_opens_both_reasons(engine, inv_tables):
+    first = settled()
+    second = SettledPayment(
+        **(
+            first.__dict__
+            | {"event_id": uuid4(), "settlement_id": uuid4(), "transaction_id": uuid4()}
+        )
+    )
+    module = build_invoice(engine, inv_tables)
+    await record(module, first)
+    duplicate = await record(module, second)
+    async with engine.connect() as conn:
+        case = (
+            await conn.execute(
+                sa.select(inv_tables.review_cases.c.details).where(
+                    inv_tables.review_cases.c.document_id == duplicate.document_id
+                )
+            )
+        ).scalar_one()
+    assert {item["reason"] for item in case["reasons"] if item["status"] == "open"} == {
+        "ISSUER_ACCOUNT_UNAVAILABLE",
+        "DUPLICATE_SETTLEMENT",
+    }
+
+
+@pytest.mark.asyncio
+async def test_open_once_does_not_duplicate_an_open_reason(engine, inv_tables):
+    payment = settled()
+    module = build_invoice(engine, inv_tables)
+    result = await record(module, payment)
+    async with module.uow_factory() as uow:
+        for _ in range(2):
+            await uow.review_cases.open_once(
+                payment.tenant_id, result.document_id, "ISSUER_ACCOUNT_UNAVAILABLE", {}
+            )
+        reasons = await uow.review_cases.open_reasons(result.document_id)
+        await uow.commit()
+    assert reasons.count("ISSUER_ACCOUNT_UNAVAILABLE") == 1
 
 
 @pytest.mark.asyncio
@@ -425,6 +481,26 @@ async def test_host_ref_fallback_ignores_draft_bound_to_other_intent(engine, inv
             )
         )
     assert status == "needs_draft"
+
+
+@pytest.mark.asyncio
+async def test_inactive_issuer_account_is_not_selected(engine, inv_tables):
+    payment = settled()
+    await add_account(engine, inv_tables, payment.merchant_id)
+    async with engine.begin() as conn:
+        await conn.execute(
+            inv_tables.issuer_accounts.update()
+            .where(inv_tables.issuer_accounts.c.merchant_id == payment.merchant_id)
+            .values(status="disabled")
+        )
+    result = await record(build_invoice(engine, inv_tables), payment)
+    async with engine.connect() as conn:
+        state = await conn.execute(
+            sa.select(
+                inv_tables.documents.c.status, inv_tables.documents.c.issuer_account_id
+            ).where(inv_tables.documents.c.id == result.document_id)
+        )
+    assert tuple(state.one()) == ("blocked", None)
 
 
 @pytest.mark.asyncio
@@ -544,7 +620,15 @@ async def test_duplicate_settlement_same_order_issues_and_opens_review(engine, i
         ).all()
     assert statuses == ["queued", "queued"]
     assert cases == [(two.document_id, "DUPLICATE_SETTLEMENT")]
-    assert first_draft.draft_id
+    async with engine.connect() as conn:
+        assert (
+            await conn.scalar(
+                sa.select(inv_tables.documents.c.draft_id).where(
+                    inv_tables.documents.c.id == one.document_id
+                )
+            )
+            == first_draft.draft_id
+        )
 
 
 @pytest.mark.asyncio
@@ -627,10 +711,14 @@ async def test_concurrent_duplicate_settlements_without_draft_two_originals_one_
     one_task = asyncio.create_task(record(module, first))
     await asyncio.wait_for(factory.entered.wait(), 5)
     two_task = asyncio.create_task(record(module, second))
+    await asyncio.sleep(0.05)
     key = f"{first.tenant_id}:{first.host_ref_type}:{first.host_ref_id}"
     async with engine.begin() as conn:
         can_lock = await conn.scalar(
             sa.text("SELECT pg_try_advisory_xact_lock(hashtext(:key))"), {"key": key}
+        )
+        blocked = await conn.scalar(
+            sa.text("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted")
         )
     factory.release.set()
     one, two = await asyncio.gather(one_task, two_task)
@@ -655,6 +743,7 @@ async def test_concurrent_duplicate_settlements_without_draft_two_originals_one_
             .where(inv_tables.settlement_receipts.c.host_ref_id == first.host_ref_id)
         )
     assert can_lock is False
+    assert blocked >= 1
     assert len(docs) == 2 and all(item.status == "needs_draft" for item in docs)
     assert "DUPLICATE_SETTLEMENT" in reasons and receipts == 2
 

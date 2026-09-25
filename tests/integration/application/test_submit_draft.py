@@ -23,7 +23,7 @@ class _PendingBase(DeclarativeBase):
 
 
 class _PendingRow(_PendingBase):
-    __tablename__ = "p2_pending_unit_of_work_state"
+    __tablename__ = "pending_unit_of_work_state"
     id: Mapped[int] = mapped_column(primary_key=True)
 
 
@@ -202,6 +202,15 @@ async def test_rebind_open_draft_to_new_intent_when_old_unsettled(engine, inv_ta
 
 
 @pytest.mark.asyncio
+async def test_open_draft_cannot_be_unbound_with_null_intent(engine, inv_tables):
+    module = build_invoice(engine, inv_tables)
+    merchant, intent = uuid4(), uuid4()
+    await module.submit_draft.execute(draft_cmd(merchant, "no-unbind", intent))
+    with pytest.raises(DraftBoundToOtherIntent):
+        await module.submit_draft.execute(draft_cmd(merchant, "no-unbind", None))
+
+
+@pytest.mark.asyncio
 async def test_rebind_refused_when_old_intent_settled(engine, inv_tables):
     module = build_invoice(engine, inv_tables)
     merchant, old_intent = uuid4(), uuid4()
@@ -306,6 +315,39 @@ async def test_late_draft_moves_needs_draft_to_queued_and_clears_review(engine, 
 
 
 @pytest.mark.asyncio
+async def test_late_draft_without_active_account_opens_issuer_review(engine, inv_tables):
+    module = build_invoice(engine, inv_tables)
+    merchant = uuid4()
+    await seed_account(engine, inv_tables, merchant)
+    doc = await seed_waiting_document(engine, inv_tables, merchant, "late-no-account")
+    async with engine.begin() as conn:
+        await conn.execute(
+            inv_tables.issuer_accounts.update()
+            .where(inv_tables.issuer_accounts.c.merchant_id == merchant)
+            .values(status="disabled")
+        )
+    await module.submit_draft.execute(draft_cmd(merchant, "late-no-account", doc["intent_id"]))
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                sa.select(
+                    inv_tables.documents.c.status,
+                    inv_tables.review_cases.c.reason,
+                    inv_tables.review_cases.c.details,
+                )
+                .join(
+                    inv_tables.review_cases,
+                    inv_tables.review_cases.c.document_id == inv_tables.documents.c.id,
+                )
+                .where(inv_tables.documents.c.id == doc["id"])
+            )
+        ).one()
+    assert row.status == "needs_draft"
+    assert row.reason == "ISSUER_ACCOUNT_UNAVAILABLE"
+    assert row.details["reasons"][0]["details"]["draft_found"] is True
+
+
+@pytest.mark.asyncio
 async def test_late_draft_attaches_all_waiting_documents(engine, inv_tables):
     module = build_invoice(engine, inv_tables)
     merchant = uuid4()
@@ -380,6 +422,67 @@ async def test_late_draft_amount_mismatch_blocks_and_switches_reason(engine, inv
     assert tuple(row[:3]) == ("blocked", "AMOUNT_MISMATCH", "open")
     assert row.details["reasons"][0]["status"] == "cleared"
     assert row.details["reasons"][1]["reason"] == "AMOUNT_MISMATCH"
+
+
+@pytest.mark.asyncio
+async def test_corrected_draft_recovers_mismatch_when_duplicate_reason_is_primary(
+    engine, inv_tables
+):
+    module = build_invoice(engine, inv_tables)
+    merchant = uuid4()
+    await seed_account(engine, inv_tables, merchant)
+    doc = await seed_waiting_document(
+        engine, inv_tables, merchant, "duplicate-correction", total=100
+    )
+    async with engine.begin() as conn:
+        await conn.execute(
+            inv_tables.documents.update()
+            .where(inv_tables.documents.c.id == doc["id"])
+            .values(status="blocked")
+        )
+        await conn.execute(
+            inv_tables.review_cases.insert().values(
+                id=uuid4(),
+                tenant_id="tenant-test",
+                document_id=doc["id"],
+                reason="DUPLICATE_SETTLEMENT",
+                details={
+                    "reasons": [
+                        {"reason": "DUPLICATE_SETTLEMENT", "details": {}, "status": "open"},
+                        {"reason": "AMOUNT_MISMATCH", "details": {}, "status": "open"},
+                    ]
+                },
+                status="open",
+            )
+        )
+    await module.submit_draft.execute(draft_cmd(merchant, "duplicate-correction", doc["intent_id"]))
+    async with engine.connect() as conn:
+        state = await conn.execute(
+            sa.select(inv_tables.documents.c.status, inv_tables.review_cases.c.reason)
+            .join(
+                inv_tables.review_cases,
+                inv_tables.review_cases.c.document_id == inv_tables.documents.c.id,
+            )
+            .where(inv_tables.documents.c.id == doc["id"])
+        )
+        assert tuple(state.one()) == ("queued", "DUPLICATE_SETTLEMENT")
+
+
+@pytest.mark.asyncio
+async def test_discard_rejects_non_open_draft(engine, inv_tables):
+    module = build_invoice(engine, inv_tables)
+    merchant, intent = uuid4(), uuid4()
+    draft = await module.submit_draft.execute(draft_cmd(merchant, "discard-consumed", intent))
+    async with engine.begin() as conn:
+        await conn.execute(
+            inv_tables.invoice_drafts.update()
+            .where(inv_tables.invoice_drafts.c.id == draft.draft_id)
+            .values(status="discarded")
+        )
+    from invoice_module.domain.errors import DraftNotOpen
+
+    with pytest.raises(DraftNotOpen):
+        await module.discard_draft.execute("tenant-test", "order", "discard-consumed", "actor")
 
 
 @pytest.mark.asyncio

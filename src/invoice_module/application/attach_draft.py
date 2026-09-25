@@ -95,8 +95,8 @@ async def attach_draft_to_documents(
                 total_vnd=None,
                 buyer_source=None,
                 status=DocumentStatus.BLOCKED.value,
-                queued_at=now,
-                next_attempt_at=now,
+                queued_at=None,
+                next_attempt_at=None,
                 draft_id=draft.id,
             )
             await uow.review_cases.open_once(
@@ -136,7 +136,11 @@ async def attach_draft_to_documents(
         await uow.drafts.mark_consumed(draft.id, document.id)
         case_id = await uow.review_cases.get_open_id(document.id)
         if case_id is not None:
-            for reason in (ReviewReason.DRAFT_MISSING.value, ReviewReason.AMOUNT_MISMATCH.value):
+            for reason in (
+                ReviewReason.DRAFT_MISSING.value,
+                ReviewReason.AMOUNT_MISMATCH.value,
+                ReviewReason.ISSUER_ACCOUNT_UNAVAILABLE.value,
+            ):
                 if reason in await uow.review_cases.open_reasons(document.id):
                     await uow.review_cases.clear_reason(
                         case_id, reason, "attach_draft", "system:attach_draft", None, now

@@ -14,7 +14,7 @@ from invoice_module.domain.enums import DocumentStatus, ReviewReason
 from invoice_module.domain.money import check_declared_total
 from invoice_module.ports.clock import Clock
 from invoice_module.ports.metrics import MetricsSink, NoOpMetricsSink, increment_safely
-from invoice_module.ports.unit_of_work import InvoiceUnitOfWorkFactory
+from invoice_module.ports.unit_of_work import InvoiceUnitOfWork, InvoiceUnitOfWorkFactory
 
 
 @dataclass(frozen=True)
@@ -93,10 +93,8 @@ class RecordSettledPayment:
                         )
                     await uow.receipts.insert_once(self._receipt(settled, document_id))
                     await uow.commit()
-                except IntegrityError as exc:
+                except IntegrityError:
                     await uow.rollback()
-                    if not _is_original_settlement_conflict(exc):
-                        raise
                     await uow.lock_host_ref(
                         settled.tenant_id, settled.host_ref_type, settled.host_ref_id
                     )
@@ -194,11 +192,9 @@ class RecordSettledPayment:
                 await uow.commit()
                 self._record_metric(status)
                 return RecordResult(document_id, True)
-            except IntegrityError as exc:
+            except IntegrityError:
                 await uow.rollback()
-                if not _is_original_settlement_conflict(exc):
-                    raise
-                # P1 clears owned lock state on rollback; re-acquire before retrying reads.
+                # Rollback clears owned lock state; re-acquire before retrying reads.
                 await uow.lock_host_ref(
                     settled.tenant_id, settled.host_ref_type, settled.host_ref_id
                 )
@@ -210,7 +206,7 @@ class RecordSettledPayment:
                 self._record_metric("duplicate")
                 return RecordResult(winner.id, False)
 
-    async def _draft_exists(self, uow: object, settled: SettledPayment) -> bool:
+    async def _draft_exists(self, uow: InvoiceUnitOfWork, settled: SettledPayment) -> bool:
         # Read only for review context; no-account never consumes the draft.
         drafts = uow.drafts
         if await drafts.get_by_intent(settled.tenant_id, settled.intent_id):
@@ -280,9 +276,3 @@ class RecordSettledPayment:
 
     def _record_metric(self, status: str) -> None:
         increment_safely(self._metrics, "invoice_settlements_recorded_total", {"status": status})
-
-
-def _is_original_settlement_conflict(error: IntegrityError) -> bool:
-    cause = error.orig.__cause__ if error.orig is not None else None
-    constraint = getattr(cause, "constraint_name", None)
-    return isinstance(constraint, str) and constraint.endswith("_documents_original_settlement_uq")

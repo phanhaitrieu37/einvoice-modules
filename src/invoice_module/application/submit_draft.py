@@ -3,9 +3,8 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID, uuid4
 
-from invoice_module.adapters.sqlalchemy.repositories.drafts import DraftRow
 from invoice_module.application.attach_draft import AttachOutcome, attach_draft_to_documents
-from invoice_module.domain.document import Buyer, DraftData, validate_buyer
+from invoice_module.domain.document import Buyer, validate_buyer
 from invoice_module.domain.enums import DraftStatus
 from invoice_module.domain.errors import (
     DraftAlreadyConsumed,
@@ -61,11 +60,13 @@ class SubmitDraft:
     async def execute(
         self, cmd: SubmitDraftCommand, uow: InvoiceUnitOfWork | None = None
     ) -> SubmitDraftResult:
+        if isinstance(cmd.declared_total_vnd, bool) or not isinstance(cmd.declared_total_vnd, int):
+            raise TypeError("declared_total_vnd must be an integer VND amount")
+        if cmd.declared_total_vnd <= 0:
+            raise ValueError("declared_total_vnd must be positive")
         buyer = validate_buyer(cmd.buyer) if cmd.buyer is not None else None
         lines = build_line_inputs(cmd.lines)
         computed_total = check_declared_total(cmd.declared_total_vnd, lines)
-        if cmd.declared_total_vnd <= 0:
-            raise ValueError("declared_total_vnd must be positive")
         line_values = [
             {
                 "name": line.name,
@@ -91,6 +92,8 @@ class SubmitDraft:
                 draft_id = existing.id
                 revision = existing.revision + 1
                 if existing.status == DraftStatus.OPEN:
+                    if existing.intent_id is not None and cmd.intent_id is None:
+                        raise DraftBoundToOtherIntent("draft cannot be unbound from its intent")
                     if existing.intent_id not in (
                         None,
                         cmd.intent_id,
@@ -101,15 +104,12 @@ class SubmitDraft:
                 elif existing.status == DraftStatus.CONSUMED:
                     if cmd.intent_id is None or cmd.intent_id == existing.intent_id:
                         raise DraftAlreadyConsumed("draft is already consumed by this intent")
-                elif existing.status == DraftStatus.DISCARDED:
-                    if cmd.intent_id is not None and cmd.intent_id != existing.intent_id:
-                        await active.drafts.reopen(existing.id, cmd.intent_id, revision)
-                    elif cmd.intent_id is None or cmd.intent_id == existing.intent_id:
-                        pass
                 if (
                     existing.status == DraftStatus.CONSUMED and cmd.intent_id is not None
                 ) or existing.status == DraftStatus.DISCARDED:
-                    await active.drafts.reopen(existing.id, cmd.intent_id, revision)
+                    await active.drafts.reopen(
+                        existing.id, cmd.intent_id, revision, self._clock.now()
+                    )
             values = {
                 "id": draft_id,
                 "tenant_id": cmd.tenant_id,
@@ -126,7 +126,7 @@ class SubmitDraft:
                 "status": status,
                 "consumed_by_document_id": None,
             }
-            draft = await active.drafts.upsert_open(values)
+            draft = await active.drafts.upsert_open(values, self._clock.now())
             attached = await attach_draft_to_documents(
                 active, draft, active.issuer_accounts.get_active, self._clock.now()
             )
@@ -157,9 +157,3 @@ class DiscardDraft:
                 raise DraftNotOpen("draft is not open")
             await active.drafts.discard(tenant_id, host_ref_type, host_ref_id)
             await active.commit()
-
-
-def draft_to_data(draft: DraftRow) -> DraftData:
-    return DraftData(
-        draft.buyer, tuple(build_line_inputs(draft.items)), draft.declared_total_vnd, draft.notes
-    )
