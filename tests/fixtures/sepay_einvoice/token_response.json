@@ -1,0 +1,11 @@
+{
+  "body": {
+    "data": {
+      "access_token": "REDACTED",
+      "expires_in": 86400,
+      "token_type": "Bearer"
+    },
+    "success": true
+  },
+  "status": 200
+}

@@ -1,0 +1,15 @@
+{
+  "body": {
+    "data": {
+      "quota_remaining": 999,
+      "tax_authority_approved_date": null
+    }
+  },
+  "headers": {
+    "content-length": null,
+    "content-type": "application/json; charset=UTF-8"
+  },
+  "quota_endpoint": true,
+  "scenario": "PASS",
+  "status": 200
+}

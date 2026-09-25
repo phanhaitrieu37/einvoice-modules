@@ -1,0 +1,42 @@
+{
+  "check_create": {
+    "method": "GET",
+    "path": "/v1/invoices/create/check/{tracking_code}",
+    "verified": true
+  },
+  "create": {
+    "method": "POST",
+    "path": "/v1/invoices/create",
+    "verified": true
+  },
+  "download": {
+    "method": "GET",
+    "path": "/v1/invoices/{tracking_code}/download?type={pdf|xml}",
+    "verified": true
+  },
+  "get_by_reference": {
+    "method": "GET",
+    "path": "/v1/invoices/{reference_code}",
+    "verified": true
+  },
+  "provider_accounts": {
+    "method": "GET",
+    "path": "/v1/provider-accounts",
+    "verified": true
+  },
+  "publish": {
+    "method": "POST",
+    "path": null,
+    "verified": false
+  },
+  "quota": {
+    "method": "GET",
+    "path": "/v1/usage",
+    "verified": true
+  },
+  "token": {
+    "method": "POST",
+    "path": "/v1/token",
+    "verified": true
+  }
+}

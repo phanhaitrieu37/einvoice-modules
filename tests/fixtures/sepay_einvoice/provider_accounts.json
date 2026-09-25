@@ -1,0 +1,54 @@
+{
+  "body": {
+    "data": {
+      "items": [
+        {
+          "active": true,
+          "id": "00000000-0000-0000-0000-000000000000",
+          "provider": "matbao"
+        }
+      ],
+      "paging": {
+        "current_page": 1,
+        "has_more": false,
+        "page_count": 1,
+        "per_page": 100,
+        "total": 1
+      }
+    }
+  },
+  "headers": {
+    "content-length": null,
+    "content-type": "application/json; charset=UTF-8"
+  },
+  "provider_account_details": [
+    {
+      "body": {
+        "data": {
+          "active": true,
+          "id": "00000000-0000-0000-0000-000000000000",
+          "provider": "matbao",
+          "templates": [
+            {
+              "invoice_label": "1 - C26TSE - H\u00f3a \u0111\u01a1n gi\u00e1 tr\u1ecb gia t\u0103ng",
+              "invoice_series": "C26TSE",
+              "template_code": "1"
+            },
+            {
+              "invoice_label": "2 - C26TSE - H\u00f3a \u0111\u01a1n b\u00e1n h\u00e0ng",
+              "invoice_series": "C26TSE",
+              "template_code": "2"
+            }
+          ]
+        },
+        "success": true
+      },
+      "headers": {
+        "content-length": null,
+        "content-type": "application/json; charset=UTF-8"
+      },
+      "status": 200
+    }
+  ],
+  "status": 200
+}
