@@ -357,24 +357,28 @@ async def test_corrected_draft_holds_only_the_duplicate_of_two_mismatched_settle
 @pytest.mark.asyncio
 async def test_draft_attaches_to_oldest_waiting_document_first(engine, inv_tables):
     module, first, one, two = await two_mismatched_settlements(engine, inv_tables)
+    three = await module.record_settled_payment.execute(next_settlement(first))
     documents = inv_tables.documents
-    # Backdate the row stored second so storage order and age disagree; only an explicit
-    # ORDER BY puts it first.
+    inserted = [one.document_id, two.document_id, three.document_id]
+    status = dict(zip(inserted, ["queued", "blocked", "blocked"], strict=True))
+    # Backdate a document that is neither stored first nor has the smallest id, so storage
+    # order, id order and newest-first order each put a different document first.
+    oldest = next(item for item in inserted[1:] if item != min(inserted))
     async with engine.begin() as conn:
-        older = sa.select(documents.c.created_at - timedelta(seconds=1)).where(
-            documents.c.id == one.document_id
+        earliest = sa.select(sa.func.min(documents.c.created_at)).where(
+            documents.c.id.in_(inserted)
         )
         await conn.execute(
             documents.update()
-            .where(documents.c.id == two.document_id)
-            .values(created_at=older.scalar_subquery())
+            .where(documents.c.id == oldest)
+            .values(created_at=earliest.scalar_subquery() - timedelta(seconds=1))
         )
+    expected = [oldest] + [item for item in inserted if item != oldest]
     result = await module.submit_draft.execute(draft(first, None))
     assert [(item.document_id, item.status) for item in result.attached] == [
-        (two.document_id, "blocked"),
-        (one.document_id, "queued"),
+        (item, status[item]) for item in expected
     ]
-    assert await draft_state(engine, inv_tables, result.draft_id) == ("consumed", two.document_id)
+    assert await draft_state(engine, inv_tables, result.draft_id) == ("consumed", oldest)
 
 
 @pytest.mark.asyncio
