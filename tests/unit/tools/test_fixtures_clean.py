@@ -14,6 +14,11 @@ PHONE_VN = re.compile(r"(?<!\d)\+84[ .-]?(?:\d[ .-]?){8,10}(?!\d)")
 URL_QUERY = re.compile(r"https?://[^\s\"'<>?#]+\?([^\s\"'<>#]+)", re.IGNORECASE)
 SECRET_KEYS = {"access_token", "token", "client_id", "client_secret", "authorization"}
 TIME_KEYS = {"time", "timestamp", "created_at", "updated_at", "issued_date", "date"}
+ANY_UUID = re.compile(r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# Draft and issue fixtures keep reference/tracking identity only as numbered placeholders.
+PLACEHOLDER_UUID = re.compile(
+    r"00000000-0000-4000-8000-\d{12}|00000000-0000-0000-0000-000000000000"
+)
 
 
 def test_fixtures_have_no_secret_or_pii() -> None:
@@ -59,6 +64,29 @@ def test_fixtures_have_no_secret_or_pii() -> None:
                 "email",
             }:
                 assert value == "REDACTED", path
+
+
+def test_draft_and_issue_fixtures_hold_no_real_identifiers() -> None:
+    for path in [*FIXTURE_DIR.glob("draft_*.json"), *FIXTURE_DIR.glob("issue_*.json")]:
+        raw = path.read_text(encoding="utf-8")
+        assert all(PLACEHOLDER_UUID.fullmatch(value) for value in ANY_UUID.findall(raw)), path
+
+
+def test_draft_fixture_scan_rejects_a_real_tracking_code(tmp_path, monkeypatch) -> None:
+    fixture_dir = tmp_path / "fixtures"
+    fixture_dir.mkdir()
+    (fixture_dir / "issue_accepted.json").write_text(
+        '{"body":{"data":{"tracking_code":"084e179d-d95a-11f0-aef4-52c7e9b4f41b"}}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys.modules[__name__], "FIXTURE_DIR", fixture_dir)
+    with pytest.raises(AssertionError):
+        test_draft_and_issue_fixtures_hold_no_real_identifiers()
+    (fixture_dir / "issue_accepted.json").write_text(
+        '{"body":{"data":{"tracking_code":"00000000-0000-4000-8000-000000000001"}}}\n',
+        encoding="utf-8",
+    )
+    test_draft_and_issue_fixtures_hold_no_real_identifiers()
 
 
 def test_ten_digit_timestamps_are_allowed_in_fixtures(tmp_path, monkeypatch) -> None:
