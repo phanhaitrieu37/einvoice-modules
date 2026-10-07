@@ -20,7 +20,6 @@ ALLOWED_TRANSITIONS: dict[DocumentStatus, frozenset[DocumentStatus]] = {
             DocumentStatus.ISSUED,
             DocumentStatus.BLOCKED,
             DocumentStatus.AWAITING_APPROVAL,
-            DocumentStatus.APPROVED,
         }
     ),
     DocumentStatus.PENDING_PROVIDER: frozenset(

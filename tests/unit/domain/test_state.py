@@ -27,7 +27,6 @@ def test_invalid_transition_raises() -> None:
 
 MANUAL_RECOVERY_EDGES = [
     (DocumentStatus.QUEUED, DocumentStatus.AWAITING_APPROVAL),
-    (DocumentStatus.QUEUED, DocumentStatus.APPROVED),
     (DocumentStatus.PENDING_PROVIDER, DocumentStatus.AWAITING_APPROVAL),
     (DocumentStatus.PENDING_PROVIDER, DocumentStatus.APPROVED),
     (DocumentStatus.AWAITING_APPROVAL, DocumentStatus.APPROVED),
@@ -74,6 +73,63 @@ def test_awaiting_approval_targets_are_exact() -> None:
         DocumentStatus.BLOCKED,
         DocumentStatus.FAILED,
     }
+
+
+def test_allowed_transitions_are_exact() -> None:
+    expected = {
+        DocumentStatus.NEEDS_DRAFT: {DocumentStatus.QUEUED, DocumentStatus.BLOCKED},
+        DocumentStatus.BLOCKED: {
+            DocumentStatus.QUEUED,
+            DocumentStatus.NEEDS_DRAFT,
+            DocumentStatus.BLOCKED,
+            DocumentStatus.AWAITING_APPROVAL,
+            DocumentStatus.FAILED,
+        },
+        DocumentStatus.QUEUED: {
+            DocumentStatus.PENDING_PROVIDER,
+            DocumentStatus.QUEUED,
+            DocumentStatus.FAILED,
+            DocumentStatus.ISSUED,
+            DocumentStatus.BLOCKED,
+            DocumentStatus.AWAITING_APPROVAL,
+        },
+        DocumentStatus.PENDING_PROVIDER: {
+            DocumentStatus.PENDING_PROVIDER,
+            DocumentStatus.ISSUED,
+            DocumentStatus.FAILED,
+            DocumentStatus.AWAITING_APPROVAL,
+            DocumentStatus.APPROVED,
+        },
+        DocumentStatus.AWAITING_APPROVAL: {
+            DocumentStatus.APPROVED,
+            DocumentStatus.BLOCKED,
+            DocumentStatus.FAILED,
+        },
+        DocumentStatus.APPROVED: {
+            DocumentStatus.APPROVED,
+            DocumentStatus.PENDING_PROVIDER,
+            DocumentStatus.ISSUED,
+            DocumentStatus.FAILED,
+            DocumentStatus.BLOCKED,
+            DocumentStatus.AWAITING_APPROVAL,
+        },
+        DocumentStatus.FAILED: {
+            DocumentStatus.QUEUED,
+            DocumentStatus.PENDING_PROVIDER,
+            DocumentStatus.ISSUED,
+            DocumentStatus.AWAITING_APPROVAL,
+            DocumentStatus.APPROVED,
+        },
+        DocumentStatus.ISSUED: {DocumentStatus.REPLACED, DocumentStatus.CANCELLED_EXTERNALLY},
+        DocumentStatus.REPLACED: set(),
+        DocumentStatus.CANCELLED_EXTERNALLY: set(),
+    }
+    assert expected == ALLOWED_TRANSITIONS
+
+
+def test_queued_cannot_skip_approval() -> None:
+    with pytest.raises(InvalidTransition):
+        ensure_transition(DocumentStatus.QUEUED, DocumentStatus.APPROVED)
 
 
 def test_approved_cannot_return_to_queued() -> None:
