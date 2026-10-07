@@ -138,7 +138,11 @@ def s1_create_poll(
         accounts(client), client, template_code=template_code, invoice_series=invoice_series
     )
     ref = str(uuid4())
-    created = _call(client, "create", payload=_invoice_payload(ref, tax_rate, issued_date, account))
+    created = _call(
+        client,
+        "create",
+        payload=_invoice_payload(ref, tax_rate, issued_date, account, is_draft=False),
+    )
     tracking = _value(_data(created), "tracking_code")
     polls, exhausted = (
         _poll(client, str(tracking), sleep=sleep, clock=clock)
@@ -171,7 +175,7 @@ def s2_duplicate_reference(
         accounts(client), client, template_code=template_code, invoice_series=invoice_series
     )
     ref = str(uuid4())
-    payload = _invoice_payload(ref, tax_rate, issued_date, account)
+    payload = _invoice_payload(ref, tax_rate, issued_date, account, is_draft=False)
     first = _call(client, "create", payload=payload)
     tracking = _value(_data(first), "tracking_code")
     polls, exhausted = (
@@ -233,12 +237,14 @@ def s3_failed_then_retry(
     if control is None:
         control_ref = str(uuid4())
         control = _call(
-            client, "create", payload=_invoice_payload(control_ref, tax_rate, issued_date, account)
+            client,
+            "create",
+            payload=_invoice_payload(control_ref, tax_rate, issued_date, account, is_draft=False),
         )
     control_accepted = 200 <= control.get("status", 500) < 300
     ref = str(uuid4())
     invalid_payload = _invoice_payload(
-        ref, tax_rate, issued_date, account, tax_code=INVALID_NONEXISTENT_TAX_CODE
+        ref, tax_rate, issued_date, account, is_draft=False, tax_code=INVALID_NONEXISTENT_TAX_CODE
     )
     created = _call(client, "create", payload=invalid_payload)
     error_code = _error_code(created)
@@ -258,7 +264,7 @@ def s3_failed_then_retry(
             polls, poll_exhausted = _poll(client, str(tracking), sleep=sleep, clock=clock)
         final_state = _state(polls[-1]) if polls else None
         if final_state == "Failed":
-            retry_payload = _invoice_payload(ref, tax_rate, issued_date, account)
+            retry_payload = _invoice_payload(ref, tax_rate, issued_date, account, is_draft=False)
             retry_create = _call(client, "create", payload=retry_payload)
             retry_tracking = _value(_data(retry_create), "tracking_code")
             retry_polls, retry_exhausted = (
@@ -393,6 +399,7 @@ def tax_matrix(
             rate,
             issued_date,
             account,
+            is_draft=False,
             item_code=item_code,
             item_name=item_name,
         )
@@ -573,6 +580,7 @@ def _invoice_payload(
     issued_on: str,
     account: dict[str, str],
     *,
+    is_draft: bool,
     tax_code: str | None = None,
     item_code: str = PROBE_ITEM_CODE,
     item_name: str = "Probe item",
@@ -585,7 +593,7 @@ def _invoice_payload(
     tax_amount = _line_tax_amount(unit_price, rate)
     return {
         "reference_code": reference_code,
-        "is_draft": False,
+        "is_draft": is_draft,
         "provider_account_id": account["provider_account_id"],
         "template_code": account["template_code"],
         "invoice_series": account["invoice_series"],
@@ -607,6 +615,32 @@ def _invoice_payload(
         ],
         "total_amount": int(unit_price + tax_amount),
     }
+
+
+def _issue_payload(reference_code: str) -> dict[str, str]:
+    """Body of POST /v1/invoices/issue (phat-hanh-hoa-don-dien-tu): the draft reference only."""
+    return {"reference_code": reference_code}
+
+
+def record_call(
+    out_dir: str | Path | None,
+    name: str,
+    response: dict[str, Any],
+    classifier_paths: dict[str, str],
+) -> dict[str, Any]:
+    """Attach the field paths used for classification and persist the redacted raw call."""
+    record = {**response, "classifier_paths": dict(classifier_paths)}
+    if out_dir is not None:
+        write_json(out_dir, name, record)
+    return record
+
+
+def _at(record: Any, path: str) -> Any:
+    """Resolve a dotted field path such as ``body.data.invoice.status`` in a recorded call."""
+    value = record
+    for key in path.split("."):
+        value = _value(value, key)
+    return value
 
 
 def _line_tax_amount(

@@ -61,6 +61,12 @@ CANDIDATES: dict[str, dict[str, str | bool | None]] = {
         "source": "kiem-tra-han-ngach",
         "verified": False,
     },
+    "check_issue": {
+        "method": "GET",
+        "path": "/v1/invoices/issue/check/{tracking_code}",
+        "source": "theo-doi-trang-thai-phat-hanh-hoa-don",
+        "verified": False,
+    },
     "publish": {
         "method": "POST",
         "path": "/v1/invoices/issue",
