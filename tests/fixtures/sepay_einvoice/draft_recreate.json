@@ -1,0 +1,19 @@
+{
+  "body": {
+    "error": {
+      "code": "EINVOICE_DOCUMENT_EXISTED",
+      "message": "H\u1ec7 th\u1ed1ng \u0111\u00e3 ghi nh\u1eadn ho\u00e1 \u0111\u01a1n cho m\u00e3 tham chi\u1ebfu n\u00e0y"
+    },
+    "success": false
+  },
+  "classifier_paths": {
+    "error_code": "body.error.code",
+    "http_status": "status",
+    "tracking_code": "body.data.tracking_code"
+  },
+  "headers": {
+    "content-length": null,
+    "content-type": "application/json; charset=UTF-8"
+  },
+  "status": 409
+}

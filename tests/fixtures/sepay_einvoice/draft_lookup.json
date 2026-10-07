@@ -1,0 +1,61 @@
+{
+  "body": {
+    "data": {
+      "buyer": {
+        "address": "REDACTED",
+        "buyer_code": null,
+        "email": "REDACTED",
+        "legal_name": "REDACTED",
+        "name": "REDACTED",
+        "national_id": "REDACTED",
+        "phone": "REDACTED",
+        "tax_code": "0000000000",
+        "type": "personal"
+      },
+      "document_type": 1,
+      "invoice_number": "0",
+      "invoice_series": "C26TSE",
+      "issued_date": "2026-10-07",
+      "items": [
+        {
+          "item_code": "PROBE-ITEM-001",
+          "item_name": "Probe item",
+          "line_number": 1,
+          "line_type": 1,
+          "quantity": "1.00",
+          "tax_amount": "80.00",
+          "tax_rate": "8",
+          "total_amount": "1080.00",
+          "unit": "l\u1ea7n",
+          "unit_price": "1000.00"
+        }
+      ],
+      "notes": "",
+      "payment_method": "TM/CK",
+      "pdf_url": "https://beta-portalv2.mifi.vn/DownloadPDFCA.aspx?REDACTED",
+      "provider_status": null,
+      "reference_code": "00000000-0000-4000-8000-000000000001",
+      "seller_store": null,
+      "source": "api",
+      "status": "draft",
+      "tax_amount": 80,
+      "tax_authority_code": null,
+      "total_amount": 1080,
+      "total_before_tax": 1000,
+      "xml_url": null
+    },
+    "success": true
+  },
+  "classifier_paths": {
+    "http_status": "status",
+    "invoice_number": "body.data.invoice_number",
+    "invoice_status": "body.data.status",
+    "issued_date": "body.data.issued_date",
+    "reference": "body.data.reference_code"
+  },
+  "headers": {
+    "content-length": null,
+    "content-type": "application/json; charset=UTF-8"
+  },
+  "status": 200
+}
