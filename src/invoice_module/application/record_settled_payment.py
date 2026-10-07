@@ -10,7 +10,7 @@ from invoice_module.application.attach_draft import (
     find_draft_for_document,
 )
 from invoice_module.domain.document import SettledPayment, freeze_document
-from invoice_module.domain.enums import DocumentStatus, DraftStatus, ReviewReason
+from invoice_module.domain.enums import DeliveryMode, DocumentStatus, DraftStatus, ReviewReason
 from invoice_module.domain.money import check_declared_total
 from invoice_module.ports.clock import Clock
 from invoice_module.ports.metrics import MetricsSink, NoOpMetricsSink, increment_safely
@@ -126,11 +126,17 @@ class RecordSettledPayment:
                 settled_at=settled.settled_at,
                 status=DocumentStatus.NEEDS_DRAFT,
                 document=None,
+                delivery_mode=None,
+                approved_at=None,
+                approved_by=None,
+                approved_snapshot_sha256=None,
+                approved_reference_code=None,
             )
             draft = await find_draft_for_document(uow, row)
             document_snapshot = None
             total_vnd = None
             buyer_source = None
+            delivery_mode = None
             draft_id = None
             queued_at = None
             next_attempt_at = None
@@ -148,6 +154,7 @@ class RecordSettledPayment:
                     document_snapshot = frozen.to_json()
                     total_vnd = frozen.total_vnd
                     buyer_source = frozen.buyer_source.value
+                    delivery_mode = draft.delivery_mode
                     draft_id = draft.id
                     queued_at = now
                     next_attempt_at = now
@@ -165,11 +172,12 @@ class RecordSettledPayment:
                         document_snapshot,
                         total_vnd=total_vnd,
                         buyer_source=buyer_source,
+                        delivery_mode=delivery_mode,
                         queued_at=queued_at,
                         next_attempt_at=next_attempt_at,
                     )
                 )
-                if draft is not None and status == DocumentStatus.QUEUED.value:
+                if draft is not None and document_snapshot is not None:
                     await uow.drafts.mark_consumed(draft.id, document_id)
                 if amount_mismatch:
                     await uow.review_cases.open_once(
@@ -238,6 +246,7 @@ class RecordSettledPayment:
         *,
         total_vnd: int | None = None,
         buyer_source: str | None = None,
+        delivery_mode: DeliveryMode | None = None,
         queued_at: datetime | None = None,
         next_attempt_at: datetime | None = None,
     ) -> dict[str, object]:
@@ -259,6 +268,7 @@ class RecordSettledPayment:
             "settled_amount_vnd": settled.amount_vnd,
             "settled_at": settled.settled_at,
             "buyer_source": buyer_source,
+            "delivery_mode": delivery_mode.value if delivery_mode is not None else None,
             "status": status,
             "queued_at": queued_at,
             "next_attempt_at": next_attempt_at,

@@ -98,6 +98,7 @@ async def attach_draft_to_documents(
                 queued_at=None,
                 next_attempt_at=None,
                 draft_id=draft.id,
+                delivery_mode=None,
             )
             await uow.review_cases.open_once(
                 document.tenant_id,
@@ -132,6 +133,7 @@ async def attach_draft_to_documents(
             now,
             now,
             draft.id,
+            draft.delivery_mode,
         )
         await uow.drafts.mark_consumed(draft.id, document.id)
         case_id = await uow.review_cases.get_open_id(document.id)

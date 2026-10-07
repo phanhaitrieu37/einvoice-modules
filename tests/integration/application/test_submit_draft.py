@@ -13,6 +13,7 @@ from tests.support.payment_world import build_payment, onboard_payment, pm_table
 
 from invoice_module.adapters.sqlalchemy.uow import SqlAlchemyInvoiceUnitOfWork
 from invoice_module.application.submit_draft import SubmitDraftCommand
+from invoice_module.domain.enums import DeliveryMode
 from invoice_module.domain.errors import DraftAlreadyConsumed, DraftBoundToOtherIntent
 
 pytestmark = pytest.mark.integration
@@ -38,6 +39,7 @@ def line_dict(name="Service", total=100):
 
 
 def draft_cmd(merchant_id, host_ref_id, intent_id, **over):
+    over.setdefault("delivery_mode", DeliveryMode.AUTO)
     return SubmitDraftCommand(
         "tenant-test", merchant_id, "order", host_ref_id, intent_id, (line_dict(),), 100, **over
     )
@@ -665,3 +667,44 @@ async def test_joined_lock_rejects_pending_orm_state_before_lock(engine, inv_tab
         session.add(_PendingRow(id=1))
         with pytest.raises(RuntimeError, match="lock_host_ref must precede joined work"):
             await uow.lock_host_ref("tenant-test", "order", "pending")
+
+
+async def draft_delivery_mode(engine, tables, draft_id):
+    async with engine.connect() as conn:
+        return await conn.scalar(
+            sa.select(tables.invoice_drafts.c.delivery_mode).where(
+                tables.invoice_drafts.c.id == draft_id
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_resubmit_can_change_delivery_mode_while_open(engine, inv_tables):
+    module = build_invoice(engine, inv_tables)
+    merchant, intent = uuid4(), uuid4()
+    first = await module.submit_draft.execute(
+        draft_cmd(merchant, "mode-change", intent, delivery_mode=DeliveryMode.AUTO)
+    )
+    assert await draft_delivery_mode(engine, inv_tables, first.draft_id) == "auto"
+    second = await module.submit_draft.execute(
+        draft_cmd(merchant, "mode-change", intent, delivery_mode=DeliveryMode.MANUAL)
+    )
+    assert (second.draft_id, second.revision) == (first.draft_id, 2)
+    assert await draft_delivery_mode(engine, inv_tables, first.draft_id) == "manual"
+
+
+@pytest.mark.asyncio
+async def test_reopen_records_delivery_mode(engine, inv_tables):
+    module = build_invoice(engine, inv_tables)
+    merchant = uuid4()
+    first = await module.submit_draft.execute(
+        draft_cmd(merchant, "reopen-mode", uuid4(), delivery_mode=DeliveryMode.AUTO)
+    )
+    await module.discard_draft.execute("tenant-test", "order", "reopen-mode", "actor")
+    async with module.uow_factory() as uow:
+        reopened = await uow.drafts.reopen(
+            first.draft_id, uuid4(), 3, datetime.now(UTC), DeliveryMode.MANUAL
+        )
+        await uow.commit()
+    assert reopened.delivery_mode is DeliveryMode.MANUAL
+    assert await draft_delivery_mode(engine, inv_tables, first.draft_id) == "manual"

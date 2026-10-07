@@ -75,6 +75,7 @@ class Rows:
             "items": [],
             "declared_total_vnd": 100,
             "computed_total_vnd": 100,
+            "delivery_mode": "auto",
             "revision": 1,
             "status": "open",
         } | over
@@ -97,6 +98,7 @@ class Rows:
             "reference_code": str(self._id()),
             "settled_amount_vnd": 100,
             "settled_at": sa.func.now(),
+            "delivery_mode": "auto",
             "status": "needs_draft",
         } | over
 

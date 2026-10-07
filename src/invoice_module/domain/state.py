@@ -4,7 +4,13 @@ from invoice_module.domain.errors import InvalidTransition
 ALLOWED_TRANSITIONS: dict[DocumentStatus, frozenset[DocumentStatus]] = {
     DocumentStatus.NEEDS_DRAFT: frozenset({DocumentStatus.QUEUED, DocumentStatus.BLOCKED}),
     DocumentStatus.BLOCKED: frozenset(
-        {DocumentStatus.QUEUED, DocumentStatus.NEEDS_DRAFT, DocumentStatus.BLOCKED}
+        {
+            DocumentStatus.QUEUED,
+            DocumentStatus.NEEDS_DRAFT,
+            DocumentStatus.BLOCKED,
+            DocumentStatus.AWAITING_APPROVAL,
+            DocumentStatus.FAILED,
+        }
     ),
     DocumentStatus.QUEUED: frozenset(
         {
@@ -13,13 +19,40 @@ ALLOWED_TRANSITIONS: dict[DocumentStatus, frozenset[DocumentStatus]] = {
             DocumentStatus.FAILED,
             DocumentStatus.ISSUED,
             DocumentStatus.BLOCKED,
+            DocumentStatus.AWAITING_APPROVAL,
+            DocumentStatus.APPROVED,
         }
     ),
     DocumentStatus.PENDING_PROVIDER: frozenset(
-        {DocumentStatus.PENDING_PROVIDER, DocumentStatus.ISSUED, DocumentStatus.FAILED}
+        {
+            DocumentStatus.PENDING_PROVIDER,
+            DocumentStatus.ISSUED,
+            DocumentStatus.FAILED,
+            DocumentStatus.AWAITING_APPROVAL,
+            DocumentStatus.APPROVED,
+        }
+    ),
+    DocumentStatus.AWAITING_APPROVAL: frozenset(
+        {DocumentStatus.APPROVED, DocumentStatus.BLOCKED, DocumentStatus.FAILED}
+    ),
+    DocumentStatus.APPROVED: frozenset(
+        {
+            DocumentStatus.APPROVED,
+            DocumentStatus.PENDING_PROVIDER,
+            DocumentStatus.ISSUED,
+            DocumentStatus.FAILED,
+            DocumentStatus.BLOCKED,
+            DocumentStatus.AWAITING_APPROVAL,
+        }
     ),
     DocumentStatus.FAILED: frozenset(
-        {DocumentStatus.QUEUED, DocumentStatus.PENDING_PROVIDER, DocumentStatus.ISSUED}
+        {
+            DocumentStatus.QUEUED,
+            DocumentStatus.PENDING_PROVIDER,
+            DocumentStatus.ISSUED,
+            DocumentStatus.AWAITING_APPROVAL,
+            DocumentStatus.APPROVED,
+        }
     ),
     DocumentStatus.ISSUED: frozenset(
         {DocumentStatus.REPLACED, DocumentStatus.CANCELLED_EXTERNALLY}

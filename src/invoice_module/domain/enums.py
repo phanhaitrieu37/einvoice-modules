@@ -17,10 +17,17 @@ class DocumentStatus(StrEnum):
     BLOCKED = "blocked"
     QUEUED = "queued"
     PENDING_PROVIDER = "pending_provider"
+    AWAITING_APPROVAL = "awaiting_approval"
+    APPROVED = "approved"
     ISSUED = "issued"
     FAILED = "failed"
     REPLACED = "replaced"
     CANCELLED_EXTERNALLY = "cancelled_externally"
+
+
+class DeliveryMode(StrEnum):
+    AUTO = "auto"
+    MANUAL = "manual"
 
 
 class DraftStatus(StrEnum):
@@ -90,6 +97,7 @@ class ReviewReason(StrEnum):
     CORRECTION_REJECTED = "CORRECTION_REJECTED"
     LOOKUP_MISMATCH = "LOOKUP_MISMATCH"
     STALE_REFERENCE_FOUND = "STALE_REFERENCE_FOUND"
+    DRAFT_HELD = "DRAFT_HELD"
 
 
 class ReviewStatus(StrEnum):

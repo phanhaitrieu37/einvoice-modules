@@ -34,6 +34,7 @@ def upgrade(op: Any, prefix: str = "inv_") -> None:
         sa.Column("buyer", _json(), nullable=True),
         sa.Column("items", _json(), nullable=False),
         sa.Column("notes", sa.Text(), nullable=True),
+        sa.Column("delivery_mode", sa.String(8), nullable=False),
         sa.Column("declared_total_vnd", sa.BigInteger(), nullable=False),
         sa.Column("computed_total_vnd", sa.BigInteger(), nullable=False),
         sa.Column("revision", sa.Integer(), nullable=False),
@@ -48,6 +49,9 @@ def upgrade(op: Any, prefix: str = "inv_") -> None:
         sa.CheckConstraint(
             "(status = 'consumed') = (consumed_by_document_id IS NOT NULL)",
             name=_name(prefix, "drafts_consumed_ck"),
+        ),
+        sa.CheckConstraint(
+            "delivery_mode IN ('auto', 'manual')", name=_name(prefix, "drafts_delivery_mode_ck")
         ),
         sa.CheckConstraint("revision >= 1", name=_name(prefix, "drafts_revision_ck")),
         sa.CheckConstraint(
@@ -168,6 +172,11 @@ def upgrade(op: Any, prefix: str = "inv_") -> None:
         sa.Column(
             "request_authorized_resend", sa.Boolean(), nullable=False, server_default=sa.false()
         ),
+        sa.Column("delivery_mode", sa.String(8), nullable=True),
+        sa.Column("approved_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("approved_by", sa.String(128), nullable=True),
+        sa.Column("approved_snapshot_sha256", sa.String(64), nullable=True),
+        sa.Column("approved_reference_code", sa.String(64), nullable=True),
         sa.Column("buyer_source", sa.String(16), nullable=True),
         sa.Column("total_vnd", sa.BigInteger(), nullable=True),
         sa.Column("settled_amount_vnd", sa.BigInteger(), nullable=True),
@@ -208,6 +217,22 @@ def upgrade(op: Any, prefix: str = "inv_") -> None:
             name=_name(prefix, "documents_adjustment_type_ck"),
         ),
         sa.CheckConstraint(
+            "(approved_at IS NULL) = (approved_by IS NULL) AND (approved_at IS NULL) = (approved_snapshot_sha256 IS NULL) AND (approved_at IS NULL) = (approved_reference_code IS NULL) AND (approved_by IS NULL OR length(btrim(approved_by)) > 0) AND (approved_at IS NULL OR (delivery_mode IS NOT DISTINCT FROM 'manual' AND kind = 'original' AND document IS NOT NULL))",  # noqa: E501
+            name=_name(prefix, "documents_approval_ck"),
+        ),
+        sa.CheckConstraint(
+            "approved_reference_code IS NULL OR approved_reference_code = reference_code",
+            name=_name(prefix, "documents_approved_reference_ck"),
+        ),
+        sa.CheckConstraint(
+            "status <> 'approved' OR approved_at IS NOT NULL",
+            name=_name(prefix, "documents_approved_status_ck"),
+        ),
+        sa.CheckConstraint(
+            "status <> 'awaiting_approval' OR approved_at IS NULL",
+            name=_name(prefix, "documents_awaiting_unapproved_ck"),
+        ),
+        sa.CheckConstraint(
             "buyer_source IS NULL OR buyer_source IN ('fallback', 'host')",
             name=_name(prefix, "documents_buyer_source_ck"),
         ),
@@ -224,6 +249,14 @@ def upgrade(op: Any, prefix: str = "inv_") -> None:
             name=_name(prefix, "documents_counters_ck"),
         ),
         sa.CheckConstraint(
+            "delivery_mode IS NULL OR delivery_mode IN ('auto', 'manual')",
+            name=_name(prefix, "documents_delivery_mode_ck"),
+        ),
+        sa.CheckConstraint(
+            "kind <> 'original' OR document IS NULL OR delivery_mode IS NOT NULL",
+            name=_name(prefix, "documents_delivery_mode_frozen_ck"),
+        ),
+        sa.CheckConstraint(
             "environment IN ('live', 'test')", name=_name(prefix, "documents_environment_ck")
         ),
         sa.CheckConstraint(
@@ -235,7 +268,7 @@ def upgrade(op: Any, prefix: str = "inv_") -> None:
             name=_name(prefix, "documents_frozen_ck"),
         ),
         sa.CheckConstraint(
-            "status <> 'issued' OR (invoice_number IS NOT NULL AND tax_authority_code IS NOT NULL)",
+            "status <> 'issued' OR (invoice_number IS NOT NULL AND (environment <> 'live' OR tax_authority_code IS NOT NULL))",  # noqa: E501
             name=_name(prefix, "documents_issued_ids_ck"),
         ),
         sa.CheckConstraint(
@@ -245,6 +278,14 @@ def upgrade(op: Any, prefix: str = "inv_") -> None:
         sa.CheckConstraint(
             "kind IN ('adjustment', 'original', 'replacement')",
             name=_name(prefix, "documents_kind_ck"),
+        ),
+        sa.CheckConstraint(
+            "delivery_mode IS DISTINCT FROM 'manual' OR status NOT IN ('issued', 'replaced', 'cancelled_externally') OR approved_at IS NOT NULL",  # noqa: E501
+            name=_name(prefix, "documents_manual_issue_ck"),
+        ),
+        sa.CheckConstraint(
+            "status NOT IN ('awaiting_approval', 'approved') OR delivery_mode IS NOT DISTINCT FROM 'manual'",  # noqa: E501
+            name=_name(prefix, "documents_manual_status_ck"),
         ),
         sa.CheckConstraint(
             "(kind = 'original' AND original_document_id IS NULL AND parent_correction_mode IS NULL AND adjustment_type IS NULL AND settled_amount_vnd IS NOT NULL AND settled_at IS NOT NULL) OR (kind = 'adjustment' AND tenant_id IS NOT NULL AND merchant_id IS NOT NULL AND environment IS NOT NULL AND issuer_account_id IS NOT NULL AND original_document_id IS NOT NULL AND parent_correction_mode IS NOT NULL AND parent_correction_mode = 'adjust' AND adjustment_type IS NOT NULL) OR (kind = 'replacement' AND tenant_id IS NOT NULL AND merchant_id IS NOT NULL AND environment IS NOT NULL AND issuer_account_id IS NOT NULL AND original_document_id IS NOT NULL AND parent_correction_mode IS NOT NULL AND parent_correction_mode = 'replace' AND adjustment_type IS NULL)",  # noqa: E501
@@ -263,12 +304,20 @@ def upgrade(op: Any, prefix: str = "inv_") -> None:
             name=_name(prefix, "documents_queued_at_ck"),
         ),
         sa.CheckConstraint(
-            "status <> 'pending_provider' OR (request IS NOT NULL AND request_frozen_at IS NOT NULL AND issued_date IS NOT NULL)",  # noqa: E501
+            "status NOT IN ('approved', 'awaiting_approval', 'pending_provider') OR (request IS NOT NULL AND request_frozen_at IS NOT NULL AND issued_date IS NOT NULL)",  # noqa: E501
             name=_name(prefix, "documents_request_ck"),
         ),
         sa.CheckConstraint(
-            "status IN ('blocked', 'cancelled_externally', 'failed', 'issued', 'needs_draft', 'pending_provider', 'queued', 'replaced')",  # noqa: E501
+            "settled_amount_vnd IS NULL OR settled_amount_vnd > 0",
+            name=_name(prefix, "documents_settled_amount_positive_ck"),
+        ),
+        sa.CheckConstraint(
+            "status IN ('approved', 'awaiting_approval', 'blocked', 'cancelled_externally', 'failed', 'issued', 'needs_draft', 'pending_provider', 'queued', 'replaced')",  # noqa: E501
             name=_name(prefix, "documents_status_ck"),
+        ),
+        sa.CheckConstraint(
+            "status NOT IN ('replaced', 'cancelled_externally') OR (invoice_number IS NOT NULL AND (environment <> 'live' OR tax_authority_code IS NOT NULL))",  # noqa: E501
+            name=_name(prefix, "documents_terminal_ids_ck"),
         ),
         sa.ForeignKeyConstraint(
             ["tenant_id", "merchant_id", "draft_id"],
@@ -361,7 +410,7 @@ def upgrade(op: Any, prefix: str = "inv_") -> None:
             name=_name(prefix, "review_cases_note_ck"),
         ),
         sa.CheckConstraint(
-            "reason IN ('AMOUNT_MISMATCH', 'AUTH_FAILED', 'CORRECTION_REJECTED', 'DOCUMENT_EXISTED_UNRESOLVED', 'DRAFT_MISSING', 'DUPLICATE_SETTLEMENT', 'ISSUER_ACCOUNT_UNAVAILABLE', 'ISSUE_DATE_CROSSED_DAY', 'LOOKUP_MISMATCH', 'MAX_ATTEMPTS_EXCEEDED', 'PROVIDER_FAILED', 'PROVIDER_REJECTED', 'PROVIDER_TIMEOUT', 'QUOTA_EXHAUSTED', 'STALE_REFERENCE_FOUND')",  # noqa: E501
+            "reason IN ('AMOUNT_MISMATCH', 'AUTH_FAILED', 'CORRECTION_REJECTED', 'DOCUMENT_EXISTED_UNRESOLVED', 'DRAFT_HELD', 'DRAFT_MISSING', 'DUPLICATE_SETTLEMENT', 'ISSUER_ACCOUNT_UNAVAILABLE', 'ISSUE_DATE_CROSSED_DAY', 'LOOKUP_MISMATCH', 'MAX_ATTEMPTS_EXCEEDED', 'PROVIDER_FAILED', 'PROVIDER_REJECTED', 'PROVIDER_TIMEOUT', 'QUOTA_EXHAUSTED', 'STALE_REFERENCE_FOUND')",  # noqa: E501
             name=_name(prefix, "review_cases_reason_ck"),
         ),
         sa.CheckConstraint(

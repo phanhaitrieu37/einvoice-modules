@@ -1,11 +1,11 @@
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID, uuid4
 
 from invoice_module.application.attach_draft import AttachOutcome, attach_draft_to_documents
 from invoice_module.domain.document import Buyer, validate_buyer
-from invoice_module.domain.enums import DraftStatus
+from invoice_module.domain.enums import DeliveryMode, DraftStatus
 from invoice_module.domain.errors import (
     DraftAlreadyConsumed,
     DraftBoundToOtherIntent,
@@ -28,6 +28,11 @@ class SubmitDraftCommand:
     declared_total_vnd: int
     buyer: Buyer | None = None
     notes: str | None = None
+    delivery_mode: DeliveryMode = field(kw_only=True)
+
+    def __post_init__(self) -> None:
+        # The host must choose the mode; an unknown value fails here, before any database work.
+        object.__setattr__(self, "delivery_mode", DeliveryMode(self.delivery_mode))
 
 
 @dataclass(frozen=True)
@@ -109,7 +114,7 @@ class SubmitDraft:
                     existing.status == DraftStatus.CONSUMED and cmd.intent_id is not None
                 ) or existing.status == DraftStatus.DISCARDED:
                     await active.drafts.reopen(
-                        existing.id, cmd.intent_id, revision, self._clock.now()
+                        existing.id, cmd.intent_id, revision, self._clock.now(), cmd.delivery_mode
                     )
             values = {
                 "id": draft_id,
@@ -121,6 +126,7 @@ class SubmitDraft:
                 "buyer": buyer.__dict__ if buyer else None,
                 "items": line_values,
                 "notes": cmd.notes,
+                "delivery_mode": cmd.delivery_mode.value,
                 "declared_total_vnd": cmd.declared_total_vnd,
                 "computed_total_vnd": computed_total,
                 "revision": revision,

@@ -7,7 +7,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 from invoice_module.adapters.sqlalchemy.repositories.base import SqlAlchemyRepository
-from invoice_module.domain.enums import DocumentStatus
+from invoice_module.domain.enums import DeliveryMode, DocumentStatus
 
 
 @dataclass(frozen=True)
@@ -26,14 +26,25 @@ class DocumentRow:
     settled_at: datetime
     status: DocumentStatus
     document: dict[str, Any] | None
+    delivery_mode: DeliveryMode | None
+    approved_at: datetime | None
+    approved_by: str | None
+    approved_snapshot_sha256: str | None
+    approved_reference_code: str | None
+
+
+def _document_row(row: Any) -> DocumentRow:
+    values = {name: row[name] for name in DocumentRow.__dataclass_fields__}
+    if values["delivery_mode"] is not None:
+        values["delivery_mode"] = DeliveryMode(values["delivery_mode"])
+    return DocumentRow(**values)
 
 
 class DocumentRepository(SqlAlchemyRepository):
     async def insert(self, row: dict[str, Any]) -> DocumentRow:
         table = self.tables.documents
         result = await self.session.execute(table.insert().values(**row).returning(table))
-        result_row = result.mappings().one()
-        return DocumentRow(**{name: result_row[name] for name in DocumentRow.__dataclass_fields__})
+        return _document_row(result.mappings().one())
 
     async def get_original(self, tenant_id: str, settlement_id: UUID) -> DocumentRow | None:
         table = self.tables.documents
@@ -45,11 +56,7 @@ class DocumentRepository(SqlAlchemyRepository):
             )
         )
         row = result.mappings().one_or_none()
-        return (
-            DocumentRow(**{name: row[name] for name in DocumentRow.__dataclass_fields__})
-            if row is not None
-            else None
-        )
+        return _document_row(row) if row is not None else None
 
     async def exists_for_intent(self, tenant_id: str, intent_id: UUID) -> bool:
         table = self.tables.documents
@@ -84,10 +91,7 @@ class DocumentRepository(SqlAlchemyRepository):
                 ),
             )
         )
-        return [
-            DocumentRow(**{name: row[name] for name in DocumentRow.__dataclass_fields__})
-            for row in result.mappings()
-        ]
+        return [_document_row(row) for row in result.mappings()]
 
     async def has_other_original_for_host_ref(
         self, tenant_id: str, host_ref_type: str, host_ref_id: str, settlement_id: UUID
@@ -111,9 +115,10 @@ class DocumentRepository(SqlAlchemyRepository):
         total_vnd: int | None,
         buyer_source: str | None,
         status: str,
-        queued_at: datetime,
-        next_attempt_at: datetime,
+        queued_at: datetime | None,
+        next_attempt_at: datetime | None,
         draft_id: UUID,
+        delivery_mode: DeliveryMode | None,
     ) -> None:
         table = self.tables.documents
         await self.session.execute(
@@ -127,5 +132,6 @@ class DocumentRepository(SqlAlchemyRepository):
                 queued_at=queued_at,
                 next_attempt_at=next_attempt_at,
                 draft_id=draft_id,
+                delivery_mode=delivery_mode.value if delivery_mode is not None else None,
             )
         )
