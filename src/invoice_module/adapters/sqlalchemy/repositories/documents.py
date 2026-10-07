@@ -81,7 +81,8 @@ class DocumentRepository(SqlAlchemyRepository):
             )
         )
         result = await self.session.execute(
-            sa.select(table).where(
+            sa.select(table)
+            .where(
                 table.c.tenant_id == tenant_id,
                 table.c.host_ref_type == host_ref_type,
                 table.c.host_ref_id == host_ref_id,
@@ -90,6 +91,7 @@ class DocumentRepository(SqlAlchemyRepository):
                     sa.and_(table.c.status == DocumentStatus.BLOCKED.value, open_mismatch),
                 ),
             )
+            .order_by(table.c.created_at, table.c.id)
         )
         return [_document_row(row) for row in result.mappings()]
 
