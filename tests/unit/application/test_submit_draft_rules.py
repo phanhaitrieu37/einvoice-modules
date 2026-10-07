@@ -5,6 +5,7 @@ import pytest
 
 from invoice_module.application.submit_draft import SubmitDraft, SubmitDraftCommand
 from invoice_module.domain.document import Buyer
+from invoice_module.domain.enums import DeliveryMode
 from invoice_module.domain.errors import InvalidLine, InvalidTaxCode, TotalMismatch
 
 
@@ -30,6 +31,7 @@ def command(**over):
             },
         ),
         "declared_total_vnd": 100,
+        "delivery_mode": DeliveryMode.AUTO,
     }
     values.update(over)
     return SubmitDraftCommand(**values)
@@ -83,3 +85,14 @@ async def test_declared_total_requires_positive_integer_vnd_before_db(value):
     error = TypeError if isinstance(value, (float, bool)) else ValueError
     with pytest.raises(error):
         await SubmitDraft(NeverOpened(), None).execute(command(declared_total_vnd=value))
+
+
+@pytest.mark.asyncio
+async def test_submit_draft_requires_delivery_mode():
+    values = command().__dict__ | {}
+    values.pop("delivery_mode")
+    with pytest.raises(TypeError, match="delivery_mode"):
+        SubmitDraftCommand(**values)
+    with pytest.raises(ValueError, match="later"):
+        await SubmitDraft(NeverOpened(), None).execute(command(delivery_mode="later"))
+    assert command(delivery_mode="manual").delivery_mode is DeliveryMode.MANUAL

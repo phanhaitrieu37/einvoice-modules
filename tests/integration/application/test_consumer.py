@@ -12,6 +12,7 @@ from tests.support.payment_world import build_payment, onboard_payment, pm_table
 
 from invoice_module.adapters.sqlalchemy.uow import SqlAlchemyInvoiceUnitOfWork
 from invoice_module.application.submit_draft import SubmitDraftCommand
+from invoice_module.domain.enums import DeliveryMode
 from invoice_module.domain.errors import ScopeMismatch, UnsupportedEventVersion
 from invoice_module.integrations.payment_module import FanOutPublisher, PaymentSettledConsumer
 
@@ -210,6 +211,7 @@ async def test_payment_outbox_to_invoice_document(engine, inv_tables):
                 created.intent.id,
                 sample_lines(),
                 100,
+                delivery_mode=DeliveryMode.AUTO,
             ),
             uow=SqlAlchemyInvoiceUnitOfWork.joined(session, inv_tables),
         )

@@ -8,6 +8,7 @@ from invoice_module.adapters.sqlalchemy.tables import _in, define_tables
 from invoice_module.domain.enums import (
     ACKNOWLEDGEABLE_REASONS,
     NOTE_REQUIRED_RESOLUTIONS,
+    DeliveryMode,
     DocumentStatus,
     IssueErrorCode,
     ReviewReason,
@@ -16,10 +17,19 @@ from invoice_module.domain.enums import (
 
 
 def test_closed_sets_have_expected_sizes() -> None:
-    assert len(DocumentStatus) == 8
-    assert len(ReviewReason) == 15
+    assert len(DocumentStatus) == 10
+    assert len(ReviewReason) == 16
     assert len(ReviewResolution) == 6
     assert len(IssueErrorCode) == 14
+
+
+def test_delivery_mode_values() -> None:
+    assert {mode.value for mode in DeliveryMode} == {"auto", "manual"}
+
+
+def test_draft_held_not_acknowledgeable() -> None:
+    assert ReviewReason.DRAFT_HELD.value == "DRAFT_HELD"
+    assert ReviewReason.DRAFT_HELD not in ACKNOWLEDGEABLE_REASONS
 
 
 def test_config_columns_have_no_default() -> None:

@@ -13,7 +13,7 @@ from tests.support.invoice_world import build_invoice, sample_lines, seed_issuer
 
 from invoice_module.application.submit_draft import SubmitDraftCommand
 from invoice_module.domain.document import SettledPayment
-from invoice_module.domain.enums import Environment
+from invoice_module.domain.enums import DeliveryMode, Environment
 from invoice_module.domain.money import LineInput
 
 pytestmark = pytest.mark.integration
@@ -169,6 +169,7 @@ async def test_mark_consumed_preserves_first_document(engine, inv_tables):
             first.intent_id,
             sample_lines(),
             first.amount_vnd,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     first_result = await record(module, first)
@@ -377,6 +378,7 @@ async def test_cross_merchant_draft_fk_failure_rolls_back_settlement(engine, inv
             payment.intent_id,
             sample_lines(),
             payment.amount_vnd,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     with pytest.raises(IntegrityError):
@@ -398,6 +400,7 @@ async def test_cross_merchant_draft_without_account_is_not_reported_found(engine
             payment.intent_id,
             sample_lines(),
             payment.amount_vnd,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     result = await record(module, payment)
@@ -421,6 +424,7 @@ async def test_consumed_draft_without_account_is_not_reported_found(engine, inv_
             first.intent_id,
             sample_lines(),
             first.amount_vnd,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     one = await record(module, first)
@@ -462,6 +466,7 @@ async def test_discarded_draft_is_not_used_by_settlement(engine, inv_tables, bou
             payment.intent_id if bound else None,
             sample_lines(),
             payment.amount_vnd,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     await module.discard_draft.execute(
@@ -475,7 +480,7 @@ async def test_discarded_draft_is_not_used_by_settlement(engine, inv_tables, bou
 
 
 @pytest.mark.asyncio
-async def test_second_settlement_on_intent_with_consumed_draft_needs_draft(engine, inv_tables):
+async def test_second_settlement_on_intent_with_consumed_draft_is_held_blocked(engine, inv_tables):
     first = settled()
     await add_account(engine, inv_tables, first.merchant_id)
     module = build_invoice(engine, inv_tables)
@@ -488,6 +493,7 @@ async def test_second_settlement_on_intent_with_consumed_draft_needs_draft(engin
             first.intent_id,
             sample_lines(),
             first.amount_vnd,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     one = await record(module, first)
@@ -501,10 +507,18 @@ async def test_second_settlement_on_intent_with_consumed_draft_needs_draft(engin
     first_document, first_case = await document_and_case(engine, inv_tables, one.document_id)
     document, case = await document_and_case(engine, inv_tables, two.document_id)
     assert (first_document.status, first_case) == ("queued", None)
-    assert (document.status, document.draft_id, document.document) == ("needs_draft", None, None)
+    assert (document.status, document.draft_id, document.document) == ("blocked", None, None)
+    assert (document.delivery_mode, document.queued_at, document.next_attempt_at) == (
+        None,
+        None,
+        None,
+    )
     assert case.reason == "DUPLICATE_SETTLEMENT"
     assert open_reasons(case) == {
-        "DUPLICATE_SETTLEMENT": {"other_settlement_ids": [str(first.settlement_id)]}
+        "DUPLICATE_SETTLEMENT": {
+            "other_settlement_ids": [str(first.settlement_id)],
+            "draft_found": False,
+        }
     }
     assert await draft_state(engine, inv_tables, submitted.draft_id) == (
         "consumed",
@@ -527,6 +541,7 @@ async def test_corrected_draft_resolves_case_opened_only_for_amount_mismatch(eng
             payment.intent_id,
             (LineInput("Service", "each", Decimal("1"), amount, 0),),
             amount,
+            delivery_mode=DeliveryMode.AUTO,
         )
 
     await module.submit_draft.execute(draft(200))
@@ -589,6 +604,7 @@ async def test_amount_mismatch_blocks_with_review_and_no_snapshot(engine, inv_ta
             payment.intent_id,
             (LineInput("Service", "each", Decimal("1"), 200, 0),),
             200,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     result = await record(module, payment)
@@ -634,6 +650,7 @@ async def test_missing_issuer_account_blocks_with_receipt_matrix(
                 draft_intent,
                 (LineInput("Service", "each", Decimal("1"), amount, 0),),
                 amount,
+                delivery_mode=DeliveryMode.AUTO,
             )
         )
     result = await record(module, payment)
@@ -715,6 +732,7 @@ async def test_late_account_does_not_attach_to_no_account_settlement(engine, inv
             payment.intent_id,
             sample_lines(),
             payment.amount_vnd,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     async with engine.connect() as conn:
@@ -771,6 +789,7 @@ async def test_matches_draft_by_intent_before_host_ref(engine, inv_tables):
             other_intent,
             (LineInput("Wrong", "each", Decimal("1"), 200, 0),),
             200,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     specific = await module.submit_draft.execute(
@@ -782,6 +801,7 @@ async def test_matches_draft_by_intent_before_host_ref(engine, inv_tables):
             payment.intent_id,
             (LineInput("Right", "each", Decimal("1"), 100, 0),),
             100,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     result = await record(module, payment)
@@ -810,6 +830,7 @@ async def test_host_ref_fallback_ignores_draft_bound_to_other_intent(engine, inv
             uuid4(),
             (LineInput("Wrong", "each", Decimal("1"), 100, 0),),
             100,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     result = await record(module, payment)
@@ -856,6 +877,7 @@ async def test_fallback_buyer_recorded_as_fallback(engine, inv_tables):
             payment.intent_id,
             sample_lines(),
             100,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     result = await record(module, payment)
@@ -901,7 +923,7 @@ def test_record_module_has_no_network_dependency():
 
 
 @pytest.mark.asyncio
-async def test_duplicate_settlement_same_order_issues_and_opens_review(engine, inv_tables):
+async def test_duplicate_settlement_same_order_is_held_blocked_with_snapshot(engine, inv_tables):
     first = settled()
     await add_account(engine, inv_tables, first.merchant_id)
     module = build_invoice(engine, inv_tables)
@@ -914,6 +936,7 @@ async def test_duplicate_settlement_same_order_issues_and_opens_review(engine, i
             first.intent_id,
             sample_lines(),
             100,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     one = await record(module, first)
@@ -928,7 +951,7 @@ async def test_duplicate_settlement_same_order_issues_and_opens_review(engine, i
             }
         )
     )
-    await module.submit_draft.execute(
+    second_draft = await module.submit_draft.execute(
         SubmitDraftCommand(
             "tenant-test",
             first.merchant_id,
@@ -937,6 +960,7 @@ async def test_duplicate_settlement_same_order_issues_and_opens_review(engine, i
             second.intent_id,
             sample_lines(),
             100,
+            delivery_mode=DeliveryMode.MANUAL,
         )
     )
     two = await record(module, second)
@@ -957,8 +981,26 @@ async def test_duplicate_settlement_same_order_issues_and_opens_review(engine, i
                 )
             )
         ).all()
-    assert statuses == ["queued", "queued"]
+    assert statuses == ["queued", "blocked"]
     assert cases == [(two.document_id, "DUPLICATE_SETTLEMENT")]
+    held, held_case = await document_and_case(engine, inv_tables, two.document_id)
+    assert held.document is not None and held.document["lines"][0]["name"] == "Test service"
+    assert (held.draft_id, held.delivery_mode, held.total_vnd) == (
+        second_draft.draft_id,
+        "manual",
+        100,
+    )
+    assert (held.queued_at, held.next_attempt_at) == (None, None)
+    assert open_reasons(held_case) == {
+        "DUPLICATE_SETTLEMENT": {
+            "other_settlement_ids": [str(first.settlement_id)],
+            "draft_found": True,
+        }
+    }
+    assert await draft_state(engine, inv_tables, second_draft.draft_id) == (
+        "consumed",
+        two.document_id,
+    )
     async with engine.connect() as conn:
         assert (
             await conn.scalar(
@@ -984,6 +1026,7 @@ async def test_duplicate_settlement_with_amount_mismatch_keeps_one_open_case(eng
             first.intent_id,
             sample_lines(),
             100,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     await record(module, first)
@@ -1007,6 +1050,7 @@ async def test_duplicate_settlement_with_amount_mismatch_keeps_one_open_case(eng
             second.intent_id,
             (LineInput("Service", "each", Decimal("1"), 200, 0),),
             200,
+            delivery_mode=DeliveryMode.AUTO,
         )
     )
     two = await record(module, second)
@@ -1025,6 +1069,13 @@ async def test_duplicate_settlement_with_amount_mismatch_keeps_one_open_case(eng
         "AMOUNT_MISMATCH",
         "DUPLICATE_SETTLEMENT",
     ]
+    duplicate = next(
+        item for item in row.details["reasons"] if item["reason"] == "DUPLICATE_SETTLEMENT"
+    )
+    assert duplicate["details"] == {
+        "other_settlement_ids": [str(first.settlement_id)],
+        "draft_found": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -1088,10 +1139,18 @@ async def test_concurrent_duplicate_settlements_without_draft_two_originals_one_
             .select_from(inv_tables.settlement_receipts)
             .where(inv_tables.settlement_receipts.c.host_ref_id == first.host_ref_id)
         )
+    statuses = {item.id: item.status for item in docs}
+    assert statuses == {one.document_id: "needs_draft", two.document_id: "blocked"}
+    assert reasons == ["DUPLICATE_SETTLEMENT"] and receipts == 2
     assert can_lock is False
     assert blocked >= 1
-    assert len(docs) == 2 and all(item.status == "needs_draft" for item in docs)
-    assert "DUPLICATE_SETTLEMENT" in reasons and receipts == 2
+    _, held_case = await document_and_case(engine, inv_tables, two.document_id)
+    assert open_reasons(held_case) == {
+        "DUPLICATE_SETTLEMENT": {
+            "other_settlement_ids": [str(first.settlement_id)],
+            "draft_found": False,
+        }
+    }
 
 
 @pytest.mark.asyncio
@@ -1109,6 +1168,7 @@ async def test_concurrent_submit_draft_and_settlement_no_lost_wakeup(engine, inv
             payment.intent_id,
             sample_lines(),
             100,
+            delivery_mode=DeliveryMode.AUTO,
         )
         gate = asyncio.Event()
 
@@ -1154,6 +1214,7 @@ async def test_submit_draft_blocks_behind_record_settled_payment(engine, inv_tab
                 payment.intent_id,
                 sample_lines(),
                 payment.amount_vnd,
+                delivery_mode=DeliveryMode.AUTO,
             )
         )
     )
@@ -1176,3 +1237,33 @@ async def test_submit_draft_blocks_behind_record_settled_payment(engine, inv_tab
     factory.release.set()
     await asyncio.gather(settlement, draft)
     assert blocked >= 1 and can_acquire is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [DeliveryMode.AUTO, DeliveryMode.MANUAL])
+@pytest.mark.parametrize("timing", ["draft_before_settlement", "draft_after_settlement"])
+async def test_frozen_document_copies_delivery_mode_from_draft(engine, inv_tables, mode, timing):
+    payment = settled()
+    await add_account(engine, inv_tables, payment.merchant_id)
+    module = build_invoice(engine, inv_tables)
+    command = SubmitDraftCommand(
+        payment.tenant_id,
+        payment.merchant_id,
+        payment.host_ref_type,
+        payment.host_ref_id,
+        payment.intent_id,
+        sample_lines(),
+        payment.amount_vnd,
+        delivery_mode=mode,
+    )
+    if timing == "draft_before_settlement":
+        await module.submit_draft.execute(command)
+        result = await record(module, payment)
+    else:
+        result = await record(module, payment)
+        waiting, _ = await document_and_case(engine, inv_tables, result.document_id)
+        assert (waiting.status, waiting.delivery_mode) == ("needs_draft", None)
+        await module.submit_draft.execute(command)
+    document, _ = await document_and_case(engine, inv_tables, result.document_id)
+    assert (document.status, document.delivery_mode) == ("queued", mode.value)
+    assert document.document is not None

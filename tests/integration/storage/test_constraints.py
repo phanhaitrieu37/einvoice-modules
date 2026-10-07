@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 from tests.support.db import Rows
@@ -355,20 +356,23 @@ async def test_pending_requires_frozen_request_and_issued_date(rows: Rows) -> No
     )
 
 
-async def test_issued_requires_invoice_number_and_tax_code(rows: Rows) -> None:
-    acc = await account(rows)
+@pytest.mark.parametrize("environment", ["test", "live"])
+async def test_issued_requires_invoice_number(rows: Rows, environment: str) -> None:
+    acc = await account(rows, environment=environment)
     await rows.expect_violation(
         "documents_issued_ids_ck",
         rows.tables.documents,
         **rows.document_row(
             tenant_id=acc["tenant_id"],
             merchant_id=acc["merchant_id"],
-            environment="test",
+            environment=environment,
             issuer_account_id=acc["id"],
             status="issued",
             document={"buyer": {}},
             buyer_source="host",
             total_vnd=100,
+            invoice_number=None,
+            tax_authority_code="TAX-CODE",
         ),
     )
 
@@ -711,7 +715,8 @@ async def test_receipt_settlement_differs_from_document_rejected(rows: Rows) -> 
 
 
 async def test_receipt_amount_must_be_positive(rows: Rows) -> None:
-    document = await original(rows, settled_amount_vnd=0)
+    # The document cannot carry 0 any more; CHECK constraints fire before the FK trigger.
+    document = await original(rows)
     await rows.expect_violation(
         "settlement_receipts_amount_ck",
         rows.tables.settlement_receipts,
@@ -1031,4 +1036,386 @@ async def test_original_requires_settled_at(rows: Rows) -> None:
             issuer_account_id=acc["id"],
             settled_at=None,
         ),
+    )
+
+
+def _frozen(acc: dict[str, object], **over: object) -> dict[str, object]:
+    return {
+        "tenant_id": acc["tenant_id"],
+        "merchant_id": acc["merchant_id"],
+        "environment": acc["environment"],
+        "issuer_account_id": acc["id"],
+        "document": {"buyer": {}},
+        "buyer_source": "host",
+        "total_vnd": 100,
+    } | over
+
+
+def _approval(reference_code: str, **over: object) -> dict[str, object]:
+    return {
+        "approved_at": _now(),
+        "approved_by": "accountant-test",
+        "approved_snapshot_sha256": "a" * 64,
+        "approved_reference_code": reference_code,
+    } | over
+
+
+def _frozen_request() -> dict[str, object]:
+    return {
+        "request": {"is_draft": True},
+        "request_frozen_at": _now(),
+        "issued_date": _now().date(),
+    }
+
+
+def _manual(acc: dict[str, object], **over: object) -> dict[str, object]:
+    return _frozen(acc, delivery_mode="manual", reference_code="ref-manual") | over
+
+
+async def _child(rows: Rows, **over: object) -> dict[str, object]:
+    parent = await original(rows, correction_mode="adjust")
+    return rows.document_row(
+        tenant_id=parent["tenant_id"],
+        merchant_id=parent["merchant_id"],
+        environment=parent["environment"],
+        issuer_account_id=parent["issuer_account_id"],
+        kind="adjustment",
+        original_document_id=parent["id"],
+        parent_correction_mode="adjust",
+        adjustment_type="increase",
+        settled_amount_vnd=None,
+        settled_at=None,
+        **over,
+    )
+
+
+async def test_draft_delivery_mode_required_and_checked(rows: Rows) -> None:
+    with pytest.raises(IntegrityError) as caught:
+        await rows.insert(rows.tables.invoice_drafts, rows.draft_row(delivery_mode=None))
+    cause = caught.value.orig.__cause__
+    assert (cause.sqlstate, cause.column_name) == ("23502", "delivery_mode")
+    await rows.expect_violation(
+        "drafts_delivery_mode_ck",
+        rows.tables.invoice_drafts,
+        **rows.draft_row(delivery_mode="later"),
+    )
+
+
+async def test_delivery_mode_has_no_default(rows: Rows) -> None:
+    draft = rows.draft_row()
+    del draft["delivery_mode"]
+    with pytest.raises(IntegrityError) as caught:
+        await rows.insert(rows.tables.invoice_drafts, draft)
+    cause = caught.value.orig.__cause__
+    assert (cause.sqlstate, cause.column_name) == ("23502", "delivery_mode")
+    document = rows.document_row(status="blocked", issuer_account_id=None)
+    del document["delivery_mode"]
+    await rows.insert(rows.tables.documents, document)
+    table = rows.tables.documents
+    stored = await rows.conn.scalar(
+        sa.select(table.c.delivery_mode).where(table.c.id == document["id"])
+    )
+    assert stored is None
+
+
+async def test_frozen_original_requires_delivery_mode(rows: Rows) -> None:
+    acc = await account(rows)
+    await rows.expect_violation(
+        "documents_delivery_mode_frozen_ck",
+        rows.tables.documents,
+        **rows.document_row(**_frozen(acc, status="blocked", delivery_mode=None)),
+    )
+
+
+async def test_document_delivery_mode_checked(rows: Rows) -> None:
+    acc = await account(rows)
+    await rows.expect_violation(
+        "documents_delivery_mode_ck",
+        rows.tables.documents,
+        **rows.document_row(**_frozen(acc, status="blocked", delivery_mode="later")),
+    )
+
+
+async def test_none_snapshot_persists_as_sql_null(rows: Rows) -> None:
+    acc = await account(rows)
+    row = await rows.document(
+        **_frozen(acc, status="needs_draft", document=None, request=None, delivery_mode=None)
+        | {"buyer_source": None, "total_vnd": None}
+    )
+    table = rows.tables.documents
+    stored = await rows.conn.execute(
+        sa.select(table.c.document.is_(None), table.c.request.is_(None)).where(
+            table.c.id == row["id"]
+        )
+    )
+    assert tuple(stored.one()) == (True, True)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["approved_at", "approved_by", "approved_snapshot_sha256", "approved_reference_code"],
+)
+async def test_approval_columns_all_or_none_and_nonblank(rows: Rows, missing: str) -> None:
+    acc = await account(rows)
+    await rows.expect_violation(
+        "documents_approval_ck",
+        rows.tables.documents,
+        **rows.document_row(
+            **_manual(acc, status="blocked") | _approval("ref-manual", **{missing: None})
+        ),
+    )
+    await rows.expect_violation(
+        "documents_approval_ck",
+        rows.tables.documents,
+        **rows.document_row(
+            **_manual(acc, status="blocked") | _approval("ref-manual", approved_by="  ")
+        ),
+    )
+
+
+async def test_approval_with_null_delivery_mode_rejected(rows: Rows) -> None:
+    acc = await account(rows)
+    await rows.expect_violation(
+        "documents_approval_ck",
+        rows.tables.documents,
+        **rows.document_row(
+            **_manual(acc, status="blocked", delivery_mode=None) | _approval("ref-manual")
+        ),
+    )
+
+
+async def test_approval_on_auto_rejected(rows: Rows) -> None:
+    acc = await account(rows)
+    await rows.expect_violation(
+        "documents_approval_ck",
+        rows.tables.documents,
+        **rows.document_row(
+            **_manual(acc, status="blocked", delivery_mode="auto") | _approval("ref-manual")
+        ),
+    )
+
+
+async def test_approval_on_correction_child_rejected(rows: Rows) -> None:
+    child = await _child(
+        rows,
+        document={"buyer": {}},
+        buyer_source="host",
+        total_vnd=100,
+        delivery_mode="manual",
+        reference_code="ref-child",
+        **_approval("ref-child"),
+    )
+    await rows.expect_violation("documents_approval_ck", rows.tables.documents, **child)
+
+
+async def test_approval_on_original_without_snapshot_rejected(rows: Rows) -> None:
+    acc = await account(rows)
+    await rows.expect_violation(
+        "documents_approval_ck",
+        rows.tables.documents,
+        **rows.document_row(
+            **_manual(acc, status="blocked", document=None, buyer_source=None, total_vnd=None)
+            | _approval("ref-manual")
+        ),
+    )
+
+
+async def test_approved_reference_must_match_reference_code(rows: Rows) -> None:
+    acc = await account(rows)
+    await rows.expect_violation(
+        "documents_approved_reference_ck",
+        rows.tables.documents,
+        **rows.document_row(**_manual(acc, status="blocked") | _approval("ref-other")),
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "approval", "expected"),
+    [
+        ("awaiting_approval", False, "documents_manual_status_ck"),
+        # An approved row must carry an approval and approvals exist only on manual rows, so
+        # documents_approval_ck is the first CHECK an auto `approved` row can violate.
+        ("approved", True, "documents_approval_ck"),
+    ],
+)
+async def test_auto_awaiting_or_approved_rejected(
+    rows: Rows, status: str, approval: bool, expected: str
+) -> None:
+    acc = await account(rows)
+    values = _manual(acc, status=status, delivery_mode="auto") | _frozen_request()
+    if approval:
+        values |= _approval("ref-manual")
+    await rows.expect_violation(expected, rows.tables.documents, **rows.document_row(**values))
+
+
+async def test_correction_child_awaiting_with_null_mode_rejected(rows: Rows) -> None:
+    child = await _child(
+        rows,
+        document={"buyer": {}},
+        buyer_source="host",
+        total_vnd=100,
+        delivery_mode=None,
+        status="awaiting_approval",
+        **_frozen_request(),
+    )
+    await rows.expect_violation("documents_manual_status_ck", rows.tables.documents, **child)
+
+
+async def test_awaiting_approval_with_audit_rejected(rows: Rows) -> None:
+    acc = await account(rows)
+    await rows.expect_violation(
+        "documents_awaiting_unapproved_ck",
+        rows.tables.documents,
+        **rows.document_row(
+            **_manual(acc, status="awaiting_approval") | _frozen_request() | _approval("ref-manual")
+        ),
+    )
+
+
+async def test_approved_status_requires_approval(rows: Rows) -> None:
+    acc = await account(rows)
+    await rows.expect_violation(
+        "documents_approved_status_ck",
+        rows.tables.documents,
+        **rows.document_row(**_manual(acc, status="approved") | _frozen_request()),
+    )
+
+
+_CANCEL_AUDIT = {"cancelled_by": "operator-test", "cancel_reason": "cancelled at portal"}
+
+
+@pytest.mark.parametrize("status", ["issued", "replaced", "cancelled_externally"])
+async def test_manual_issued_requires_approval(rows: Rows, status: str) -> None:
+    acc = await account(rows)
+    values = _manual(acc, status=status, invoice_number="0000001", tax_authority_code="TAX")
+    if status == "cancelled_externally":
+        values |= _CANCEL_AUDIT | {"cancelled_at": _now()}
+    await rows.expect_violation(
+        "documents_manual_issue_ck", rows.tables.documents, **rows.document_row(**values)
+    )
+
+
+@pytest.mark.parametrize("status", ["awaiting_approval", "approved"])
+async def test_awaiting_approval_requires_frozen_request(rows: Rows, status: str) -> None:
+    acc = await account(rows)
+    values = _manual(acc, status=status, issued_date=_now().date())
+    if status == "approved":
+        values |= _approval("ref-manual")
+    await rows.expect_violation(
+        "documents_request_ck", rows.tables.documents, **rows.document_row(**values)
+    )
+
+
+@pytest.mark.parametrize("amount", [0, -1])
+async def test_original_settled_amount_must_be_positive(rows: Rows, amount: int) -> None:
+    acc = await account(rows)
+    await rows.expect_violation(
+        "documents_settled_amount_positive_ck",
+        rows.tables.documents,
+        **rows.document_row(**_frozen(acc, status="needs_draft", settled_amount_vnd=amount))
+        | {"document": None, "buyer_source": None, "total_vnd": None},
+    )
+
+
+async def test_live_environment_issued_rejects_null_tax_authority_code(rows: Rows) -> None:
+    acc = await account(rows, environment="live")
+    await rows.expect_violation(
+        "documents_issued_ids_ck",
+        rows.tables.documents,
+        **rows.document_row(
+            **_frozen(acc, status="issued", invoice_number="0000001", tax_authority_code=None)
+        ),
+    )
+
+
+@pytest.mark.parametrize("status", ["replaced", "cancelled_externally"])
+@pytest.mark.parametrize(
+    ("environment", "invoice_number", "tax_authority_code", "accepted"),
+    [
+        ("live", "0000001", None, False),
+        ("test", "0000001", None, True),
+        ("live", None, "TAX", False),
+        ("test", None, "TAX", False),
+    ],
+    ids=["live-no-tax", "test-no-tax", "live-no-number", "test-no-number"],
+)
+async def test_replaced_and_cancelled_require_invoice_ids(
+    rows: Rows,
+    status: str,
+    environment: str,
+    invoice_number: str | None,
+    tax_authority_code: str | None,
+    accepted: bool,
+) -> None:
+    acc = await account(rows, environment=environment)
+    values = _frozen(
+        acc, status=status, invoice_number=invoice_number, tax_authority_code=tax_authority_code
+    )
+    if status == "cancelled_externally":
+        values |= _CANCEL_AUDIT | {"cancelled_at": _now()}
+    if accepted:
+        await rows.document(**values)
+    else:
+        await rows.expect_violation(
+            "documents_terminal_ids_ck", rows.tables.documents, **rows.document_row(**values)
+        )
+
+
+async def test_draft_held_reason_accepted_and_unknown_rejected(rows: Rows) -> None:
+    doc = await original(rows)
+    await rows.review(tenant_id=doc["tenant_id"], document_id=doc["id"], reason="DRAFT_HELD")
+    other = await original(rows)
+    await rows.expect_violation(
+        "review_cases_reason_ck",
+        rows.tables.review_cases,
+        **rows.review_row(tenant_id=other["tenant_id"], document_id=other["id"], reason="HELD"),
+    )
+
+
+async def test_manual_awaiting_without_audit_accepted(rows: Rows) -> None:
+    acc = await account(rows)
+    await rows.document(**_manual(acc, status="awaiting_approval") | _frozen_request())
+
+
+async def test_manual_approved_with_full_audit_accepted(rows: Rows) -> None:
+    acc = await account(rows)
+    await rows.document(
+        **_manual(acc, status="approved") | _frozen_request() | _approval("ref-manual")
+    )
+    await rows.document(
+        **_manual(
+            acc,
+            status="issued",
+            reference_code="ref-manual-issued",
+            invoice_number="0000001",
+            tax_authority_code=None,
+        )
+        | _approval("ref-manual-issued")
+    )
+
+
+async def test_correction_child_with_null_mode_unapproved_accepted(rows: Rows) -> None:
+    child = await _child(
+        rows, document={"buyer": {}}, buyer_source="host", total_vnd=100, delivery_mode=None
+    )
+    await rows.insert(rows.tables.documents, child)
+
+
+async def test_auto_issued_without_approval_allowed(rows: Rows) -> None:
+    acc = await account(rows)
+    await rows.document(
+        **_frozen(
+            acc,
+            status="issued",
+            delivery_mode="auto",
+            invoice_number="0000001",
+            tax_authority_code="TAX",
+        )
+    )
+
+
+async def test_test_environment_issued_accepts_null_tax_authority_code(rows: Rows) -> None:
+    acc = await account(rows, environment="test")
+    await rows.document(
+        **_frozen(acc, status="issued", invoice_number="0000001", tax_authority_code=None)
     )

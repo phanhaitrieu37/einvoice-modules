@@ -10,6 +10,7 @@ from invoice_module.domain.enums import (
     AdjustmentType,
     BuyerSource,
     CorrectionMode,
+    DeliveryMode,
     DocumentKind,
     DocumentStatus,
     DraftStatus,
@@ -25,7 +26,8 @@ TABLE_COUNT = 5
 
 
 def json_type() -> sa.types.TypeEngine[Any]:
-    return sa.JSON().with_variant(JSONB(), "postgresql")
+    # Python None must persist as SQL NULL: the CHECKs test `IS NULL`, which a JSON 'null' fails.
+    return sa.JSON(none_as_null=True).with_variant(JSONB(none_as_null=True), "postgresql")
 
 
 def _values(enum: Any) -> tuple[str, ...]:
@@ -127,6 +129,7 @@ def define_tables(metadata: sa.MetaData, prefix: str = "inv_") -> InvoiceTables:
         sa.Column("buyer", json_type()),
         sa.Column("items", json_type(), nullable=False),
         sa.Column("notes", sa.Text()),
+        sa.Column("delivery_mode", sa.String(8), nullable=False),
         sa.Column("declared_total_vnd", sa.BigInteger(), nullable=False),
         sa.Column("computed_total_vnd", sa.BigInteger(), nullable=False),
         sa.Column("revision", sa.Integer(), nullable=False),
@@ -144,6 +147,7 @@ def define_tables(metadata: sa.MetaData, prefix: str = "inv_") -> InvoiceTables:
             "declared_total_vnd = computed_total_vnd", name=n("drafts_total_match_ck")
         ),
         sa.CheckConstraint(_in("status", DraftStatus), name=n("drafts_status_ck")),
+        sa.CheckConstraint(_in("delivery_mode", DeliveryMode), name=n("drafts_delivery_mode_ck")),
         sa.CheckConstraint("revision >= 1", name=n("drafts_revision_ck")),
         sa.CheckConstraint(
             "(status = 'consumed') = (consumed_by_document_id IS NOT NULL)",
@@ -178,6 +182,11 @@ def define_tables(metadata: sa.MetaData, prefix: str = "inv_") -> InvoiceTables:
         sa.Column(
             "request_authorized_resend", sa.Boolean(), nullable=False, server_default=sa.false()
         ),
+        sa.Column("delivery_mode", sa.String(8)),
+        _ts("approved_at", nullable=True),
+        sa.Column("approved_by", sa.String(128)),
+        sa.Column("approved_snapshot_sha256", sa.String(64)),
+        sa.Column("approved_reference_code", sa.String(64)),
         sa.Column("buyer_source", sa.String(16)),
         sa.Column("total_vnd", sa.BigInteger()),
         sa.Column("settled_amount_vnd", sa.BigInteger()),
@@ -292,7 +301,7 @@ def define_tables(metadata: sa.MetaData, prefix: str = "inv_") -> InvoiceTables:
             name=n("documents_frozen_ck"),
         ),
         sa.CheckConstraint(
-            "status <> 'pending_provider' OR (request IS NOT NULL AND request_frozen_at IS NOT NULL AND issued_date IS NOT NULL)",  # noqa: E501
+            "status NOT IN ('approved', 'awaiting_approval', 'pending_provider') OR (request IS NOT NULL AND request_frozen_at IS NOT NULL AND issued_date IS NOT NULL)",  # noqa: E501
             name=n("documents_request_ck"),
         ),
         sa.CheckConstraint(
@@ -303,8 +312,48 @@ def define_tables(metadata: sa.MetaData, prefix: str = "inv_") -> InvoiceTables:
             name=n("documents_buyer_source_ck"),
         ),
         sa.CheckConstraint(
-            "status <> 'issued' OR (invoice_number IS NOT NULL AND tax_authority_code IS NOT NULL)",
+            "status <> 'issued' OR (invoice_number IS NOT NULL AND (environment <> 'live' OR tax_authority_code IS NOT NULL))",  # noqa: E501
             name=n("documents_issued_ids_ck"),
+        ),
+        sa.CheckConstraint(
+            "status NOT IN ('replaced', 'cancelled_externally') OR (invoice_number IS NOT NULL AND (environment <> 'live' OR tax_authority_code IS NOT NULL))",  # noqa: E501
+            name=n("documents_terminal_ids_ck"),
+        ),
+        sa.CheckConstraint(
+            "settled_amount_vnd IS NULL OR settled_amount_vnd > 0",
+            name=n("documents_settled_amount_positive_ck"),
+        ),
+        sa.CheckConstraint(
+            "delivery_mode IS NULL OR " + _in("delivery_mode", DeliveryMode),
+            name=n("documents_delivery_mode_ck"),
+        ),
+        sa.CheckConstraint(
+            "kind <> 'original' OR document IS NULL OR delivery_mode IS NOT NULL",
+            name=n("documents_delivery_mode_frozen_ck"),
+        ),
+        sa.CheckConstraint(
+            "(approved_at IS NULL) = (approved_by IS NULL) AND (approved_at IS NULL) = (approved_snapshot_sha256 IS NULL) AND (approved_at IS NULL) = (approved_reference_code IS NULL) AND (approved_by IS NULL OR length(btrim(approved_by)) > 0) AND (approved_at IS NULL OR (delivery_mode IS NOT DISTINCT FROM 'manual' AND kind = 'original' AND document IS NOT NULL))",  # noqa: E501
+            name=n("documents_approval_ck"),
+        ),
+        sa.CheckConstraint(
+            "approved_reference_code IS NULL OR approved_reference_code = reference_code",
+            name=n("documents_approved_reference_ck"),
+        ),
+        sa.CheckConstraint(
+            "status NOT IN ('awaiting_approval', 'approved') OR delivery_mode IS NOT DISTINCT FROM 'manual'",  # noqa: E501
+            name=n("documents_manual_status_ck"),
+        ),
+        sa.CheckConstraint(
+            "status <> 'awaiting_approval' OR approved_at IS NULL",
+            name=n("documents_awaiting_unapproved_ck"),
+        ),
+        sa.CheckConstraint(
+            "status <> 'approved' OR approved_at IS NOT NULL",
+            name=n("documents_approved_status_ck"),
+        ),
+        sa.CheckConstraint(
+            "delivery_mode IS DISTINCT FROM 'manual' OR status NOT IN ('issued', 'replaced', 'cancelled_externally') OR approved_at IS NOT NULL",  # noqa: E501
+            name=n("documents_manual_issue_ck"),
         ),
         sa.CheckConstraint(
             "status <> 'pending_provider' OR pending_since IS NOT NULL",

@@ -5,6 +5,8 @@ from uuid import UUID, uuid4
 import sqlalchemy as sa
 
 from invoice_module.adapters.sqlalchemy.repositories.base import SqlAlchemyRepository
+from invoice_module.domain.enums import ReviewReason, ReviewResolution
+from invoice_module.ports.unit_of_work import DuplicateDecision
 
 
 class ReviewCaseRepository(SqlAlchemyRepository):
@@ -113,3 +115,33 @@ class ReviewCaseRepository(SqlAlchemyRepository):
             for item in (row or {}).get("reasons", [])
             if item.get("status") == "open"
         ]
+
+    async def duplicate_decision(self, document_id: UUID) -> DuplicateDecision:
+        """The operator's decision on a duplicate settlement, read from every case of the document.
+
+        Only a cleared `retry` releases the hold. A `waive` is final. Any other entry, open or
+        cleared by some other resolution, still counts as undecided.
+        """
+        table = self.tables.review_cases
+        cases = await self.session.scalars(
+            sa.select(table.c.details).where(table.c.document_id == document_id)
+        )
+        decisions: set[str] = set()
+        for details in cases:
+            for item in (details or {}).get("reasons", []):
+                if item.get("reason") != ReviewReason.DUPLICATE_SETTLEMENT.value:
+                    continue
+                resolution = item.get("resolution") if item.get("status") == "cleared" else None
+                if resolution == ReviewResolution.WAIVE.value:
+                    decisions.add("waived")
+                elif resolution == ReviewResolution.RETRY.value:
+                    decisions.add("retried")
+                else:
+                    decisions.add("open")
+        if "open" in decisions:
+            return "open"
+        if "waived" in decisions:
+            return "waived"
+        if "retried" in decisions:
+            return "retried"
+        return "none"

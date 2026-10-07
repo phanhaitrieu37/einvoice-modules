@@ -1,6 +1,10 @@
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID
+
+from invoice_module.domain.enums import DeliveryMode
+
+DuplicateDecision = Literal["none", "open", "waived", "retried"]
 
 
 class Repository(Protocol):
@@ -19,7 +23,12 @@ class DraftsRepository(Repository, Protocol):
     async def mark_consumed(self, draft_id: UUID, document_id: UUID) -> bool: ...
 
     async def reopen(
-        self, draft_id: UUID, intent_id: UUID, revision: int, now: datetime
+        self,
+        draft_id: UUID,
+        intent_id: UUID,
+        revision: int,
+        now: datetime,
+        delivery_mode: DeliveryMode,
     ) -> Any: ...
 
     async def discard(self, tenant_id: str, host_ref_type: str, host_ref_id: str) -> bool: ...
@@ -53,9 +62,10 @@ class DocumentsRepository(Repository, Protocol):
         total_vnd: int | None,
         buyer_source: str | None,
         status: str,
-        queued_at: datetime,
-        next_attempt_at: datetime,
+        queued_at: datetime | None,
+        next_attempt_at: datetime | None,
         draft_id: UUID,
+        delivery_mode: DeliveryMode | None,
     ) -> None: ...
 
 
@@ -77,6 +87,8 @@ class ReviewCasesRepository(Repository, Protocol):
     ) -> bool: ...
 
     async def open_reasons(self, document_id: UUID) -> list[str]: ...
+
+    async def duplicate_decision(self, document_id: UUID) -> DuplicateDecision: ...
 
 
 class IssuerAccountsRepository(Repository, Protocol):

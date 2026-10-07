@@ -57,6 +57,11 @@ async def find_draft_for_document(uow: InvoiceUnitOfWork, document: DocumentRow)
     return None
 
 
+async def duplicate_hold_active(uow: InvoiceUnitOfWork, document_id: UUID) -> bool:
+    """A duplicate settlement stays blocked until an operator retry; a waive keeps it forever."""
+    return await uow.review_cases.duplicate_decision(document_id) in ("open", "waived")
+
+
 async def attach_draft_to_documents(
     uow: InvoiceUnitOfWork,
     draft: DraftRow,
@@ -98,6 +103,7 @@ async def attach_draft_to_documents(
                 queued_at=None,
                 next_attempt_at=None,
                 draft_id=draft.id,
+                delivery_mode=None,
             )
             await uow.review_cases.open_once(
                 document.tenant_id,
@@ -122,16 +128,20 @@ async def attach_draft_to_documents(
                 )
             outcomes.append(AttachOutcome(document.id, DocumentStatus.BLOCKED.value))
             continue
+        held = await duplicate_hold_active(uow, document.id)
+        status = DocumentStatus.BLOCKED if held else DocumentStatus.QUEUED
+        queued_at = None if held else now
         frozen = InvoiceDocument.from_json(data_to_frozen_json(data, account))
         await uow.documents.update_frozen(
             document.id,
             frozen.to_json(),
             document.settled_amount_vnd,
             frozen.buyer_source.value,
-            DocumentStatus.QUEUED.value,
-            now,
-            now,
+            status.value,
+            queued_at,
+            queued_at,
             draft.id,
+            draft.delivery_mode,
         )
         await uow.drafts.mark_consumed(draft.id, document.id)
         case_id = await uow.review_cases.get_open_id(document.id)
@@ -145,7 +155,7 @@ async def attach_draft_to_documents(
                     await uow.review_cases.clear_reason(
                         case_id, reason, "attach_draft", "system:attach_draft", None, now
                     )
-        outcomes.append(AttachOutcome(document.id, DocumentStatus.QUEUED.value))
+        outcomes.append(AttachOutcome(document.id, status.value))
     return outcomes
 
 
