@@ -598,9 +598,7 @@ async def test_late_draft_amount_mismatch_blocks_and_switches_reason(engine, inv
 
 
 @pytest.mark.asyncio
-async def test_corrected_draft_recovers_mismatch_when_duplicate_reason_is_primary(
-    engine, inv_tables
-):
+async def test_corrected_draft_clears_mismatch_but_duplicate_stays_blocked(engine, inv_tables):
     module = build_invoice(engine, inv_tables)
     merchant = uuid4()
     await seed_account(engine, inv_tables, merchant)
@@ -628,17 +626,39 @@ async def test_corrected_draft_recovers_mismatch_when_duplicate_reason_is_primar
                 status="open",
             )
         )
-    await module.submit_draft.execute(draft_cmd(merchant, "duplicate-correction", doc["intent_id"]))
-    async with engine.connect() as conn:
-        state = await conn.execute(
-            sa.select(inv_tables.documents.c.status, inv_tables.review_cases.c.reason)
-            .join(
-                inv_tables.review_cases,
-                inv_tables.review_cases.c.document_id == inv_tables.documents.c.id,
-            )
-            .where(inv_tables.documents.c.id == doc["id"])
+    result = await module.submit_draft.execute(
+        draft_cmd(
+            merchant, "duplicate-correction", doc["intent_id"], delivery_mode=DeliveryMode.MANUAL
         )
-        assert tuple(state.one()) == ("queued", "DUPLICATE_SETTLEMENT")
+    )
+    async with engine.connect() as conn:
+        state = (
+            await conn.execute(
+                sa.select(
+                    inv_tables.documents, inv_tables.review_cases.c.reason.label("case_reason")
+                )
+                .add_columns(inv_tables.review_cases.c.status.label("case_status"))
+                .add_columns(inv_tables.review_cases.c.details.label("case_details"))
+                .join(
+                    inv_tables.review_cases,
+                    inv_tables.review_cases.c.document_id == inv_tables.documents.c.id,
+                )
+                .where(inv_tables.documents.c.id == doc["id"])
+            )
+        ).one()
+    assert [(item.document_id, item.status) for item in result.attached] == [(doc["id"], "blocked")]
+    assert (state.status, state.queued_at, state.next_attempt_at) == ("blocked", None, None)
+    assert (state.draft_id, state.delivery_mode, state.total_vnd) == (
+        result.draft_id,
+        "manual",
+        100,
+    )
+    assert state.document is not None
+    assert (state.case_reason, state.case_status) == ("DUPLICATE_SETTLEMENT", "open")
+    assert [(item["reason"], item["status"]) for item in state.case_details["reasons"]] == [
+        ("DUPLICATE_SETTLEMENT", "open"),
+        ("AMOUNT_MISMATCH", "cleared"),
+    ]
 
 
 @pytest.mark.asyncio

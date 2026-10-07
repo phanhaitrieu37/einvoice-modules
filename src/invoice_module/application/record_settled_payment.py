@@ -159,6 +159,11 @@ class RecordSettledPayment:
                     queued_at = now
                     next_attempt_at = now
                     status = DocumentStatus.QUEUED.value
+            if prior:
+                # A second settlement for the same order waits for the operator to retry or waive.
+                status = DocumentStatus.BLOCKED.value
+                queued_at = None
+                next_attempt_at = None
 
             try:
                 await uow.documents.insert(
@@ -194,7 +199,10 @@ class RecordSettledPayment:
                         settled.tenant_id,
                         document_id,
                         ReviewReason.DUPLICATE_SETTLEMENT.value,
-                        {"other_settlement_ids": [str(value) for value in prior]},
+                        {
+                            "other_settlement_ids": [str(value) for value in prior],
+                            "draft_found": draft is not None,
+                        },
                     )
                 await uow.receipts.insert_once(self._receipt(settled, document_id))
                 await uow.commit()

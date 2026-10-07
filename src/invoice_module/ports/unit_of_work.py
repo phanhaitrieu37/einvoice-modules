@@ -1,8 +1,10 @@
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 from invoice_module.domain.enums import DeliveryMode
+
+DuplicateDecision = Literal["none", "open", "waived", "retried"]
 
 
 class Repository(Protocol):
@@ -85,6 +87,8 @@ class ReviewCasesRepository(Repository, Protocol):
     ) -> bool: ...
 
     async def open_reasons(self, document_id: UUID) -> list[str]: ...
+
+    async def duplicate_decision(self, document_id: UUID) -> DuplicateDecision: ...
 
 
 class IssuerAccountsRepository(Repository, Protocol):
