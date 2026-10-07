@@ -1069,6 +1069,13 @@ async def test_duplicate_settlement_with_amount_mismatch_keeps_one_open_case(eng
         "AMOUNT_MISMATCH",
         "DUPLICATE_SETTLEMENT",
     ]
+    duplicate = next(
+        item for item in row.details["reasons"] if item["reason"] == "DUPLICATE_SETTLEMENT"
+    )
+    assert duplicate["details"] == {
+        "other_settlement_ids": [str(first.settlement_id)],
+        "draft_found": True,
+    }
 
 
 @pytest.mark.asyncio

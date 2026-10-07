@@ -111,6 +111,19 @@ async def state(engine, tables, document_id):
     return document, cases
 
 
+async def draft_state(engine, tables, draft_id):
+    table = tables.invoice_drafts
+    async with engine.connect() as conn:
+        row = (
+            await conn.execute(
+                sa.select(table.c.status, table.c.consumed_by_document_id).where(
+                    table.c.id == draft_id
+                )
+            )
+        ).one()
+    return tuple(row)
+
+
 def reasons(cases):
     return [
         (item["reason"], item["status"], item.get("resolution"))
@@ -192,6 +205,10 @@ async def test_late_draft_never_queues_document_with_open_duplicate(engine, inv_
         ("AMOUNT_MISMATCH", "cleared", "attach_draft"),
         (DUPLICATE, "open", None),
     ]
+    assert await draft_state(engine, inv_tables, result.draft_id) == (
+        "consumed",
+        two.document_id,
+    )
 
 
 @pytest.mark.asyncio
@@ -240,9 +257,13 @@ async def test_waived_duplicate_stays_blocked_on_explicit_attach(engine, inv_tab
         await uow.review_cases.open_once(first.tenant_id, two.document_id, "DRAFT_MISSING", {})
         await uow.commit()
     await resolve(module, two.document_id, DUPLICATE, "waive", "credited to the next order")
-    await module.submit_draft.execute(draft(first, second.intent_id))
+    submitted = await module.submit_draft.execute(draft(first, second.intent_id))
     outcomes = await attach_explicitly(module, second)
     assert [(item.document_id, item.status) for item in outcomes] == [(two.document_id, "blocked")]
+    assert await draft_state(engine, inv_tables, submitted.draft_id) == (
+        "consumed",
+        two.document_id,
+    )
     document, cases = await state(engine, inv_tables, two.document_id)
     assert_held(document)
     assert document.document is not None
@@ -294,6 +315,42 @@ async def test_retried_duplicate_releases_hold(engine, inv_tables):
     assert reasons(cases) == [
         ("AMOUNT_MISMATCH", "cleared", "attach_draft"),
         (DUPLICATE, "cleared", "retry"),
+    ]
+
+
+async def two_mismatched_settlements(engine, tables):
+    """An order-wide draft with the wrong total blocks both settlements on AMOUNT_MISMATCH."""
+    first = settled()
+    module = await world(engine, tables, first)
+    await module.submit_draft.execute(draft(first, None, 200))
+    one = await module.record_settled_payment.execute(first)
+    two = await module.record_settled_payment.execute(next_settlement(first))
+    return module, first, one, two
+
+
+@pytest.mark.asyncio
+async def test_corrected_draft_holds_only_the_duplicate_of_two_mismatched_settlements(
+    engine, inv_tables
+):
+    module, first, one, two = await two_mismatched_settlements(engine, inv_tables)
+    _, first_cases = await state(engine, inv_tables, one.document_id)
+    _, second_cases = await state(engine, inv_tables, two.document_id)
+    assert reasons(first_cases) == [("AMOUNT_MISMATCH", "open", None)]
+    assert reasons(second_cases) == [
+        ("AMOUNT_MISMATCH", "open", None),
+        (DUPLICATE, "open", None),
+    ]
+    result = await module.submit_draft.execute(draft(first, None))
+    assert sorted((item.document_id, item.status) for item in result.attached) == sorted(
+        [(one.document_id, "queued"), (two.document_id, "blocked")]
+    )
+    queued, _ = await state(engine, inv_tables, one.document_id)
+    assert queued.status == "queued" and queued.queued_at is not None
+    held, cases = await state(engine, inv_tables, two.document_id)
+    assert_held(held)
+    assert reasons(cases) == [
+        ("AMOUNT_MISMATCH", "cleared", "attach_draft"),
+        (DUPLICATE, "open", None),
     ]
 
 

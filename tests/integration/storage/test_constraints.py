@@ -1101,6 +1101,23 @@ async def test_draft_delivery_mode_required_and_checked(rows: Rows) -> None:
     )
 
 
+async def test_delivery_mode_has_no_default(rows: Rows) -> None:
+    draft = rows.draft_row()
+    del draft["delivery_mode"]
+    with pytest.raises(IntegrityError) as caught:
+        await rows.insert(rows.tables.invoice_drafts, draft)
+    cause = caught.value.orig.__cause__
+    assert (cause.sqlstate, cause.column_name) == ("23502", "delivery_mode")
+    document = rows.document_row(status="blocked", issuer_account_id=None)
+    del document["delivery_mode"]
+    await rows.insert(rows.tables.documents, document)
+    table = rows.tables.documents
+    stored = await rows.conn.scalar(
+        sa.select(table.c.delivery_mode).where(table.c.id == document["id"])
+    )
+    assert stored is None
+
+
 async def test_frozen_original_requires_delivery_mode(rows: Rows) -> None:
     acc = await account(rows)
     await rows.expect_violation(
@@ -1191,6 +1208,18 @@ async def test_approval_on_correction_child_rejected(rows: Rows) -> None:
     await rows.expect_violation("documents_approval_ck", rows.tables.documents, **child)
 
 
+async def test_approval_on_original_without_snapshot_rejected(rows: Rows) -> None:
+    acc = await account(rows)
+    await rows.expect_violation(
+        "documents_approval_ck",
+        rows.tables.documents,
+        **rows.document_row(
+            **_manual(acc, status="blocked", document=None, buyer_source=None, total_vnd=None)
+            | _approval("ref-manual")
+        ),
+    )
+
+
 async def test_approved_reference_must_match_reference_code(rows: Rows) -> None:
     acc = await account(rows)
     await rows.expect_violation(
@@ -1217,6 +1246,19 @@ async def test_auto_awaiting_or_approved_rejected(
     if approval:
         values |= _approval("ref-manual")
     await rows.expect_violation(expected, rows.tables.documents, **rows.document_row(**values))
+
+
+async def test_correction_child_awaiting_with_null_mode_rejected(rows: Rows) -> None:
+    child = await _child(
+        rows,
+        document={"buyer": {}},
+        buyer_source="host",
+        total_vnd=100,
+        delivery_mode=None,
+        status="awaiting_approval",
+        **_frozen_request(),
+    )
+    await rows.expect_violation("documents_manual_status_ck", rows.tables.documents, **child)
 
 
 async def test_awaiting_approval_with_audit_rejected(rows: Rows) -> None:
