@@ -1,13 +1,16 @@
 import base64
 import inspect
 import json
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
 
 from tools.einvoice_probe.client import ProbeClient
 from tools.einvoice_probe.scenarios import (
+    SameDayError,
     _invoice_payload,
     _issue_payload,
     record_call,
@@ -15,6 +18,7 @@ from tools.einvoice_probe.scenarios import (
     s2_duplicate_reference,
     s3_failed_then_retry,
     s7_draft_then_issue,
+    s8_draft_cross_day,
     tax_matrix,
 )
 
@@ -588,3 +592,164 @@ def test_s7_check_by_reference_recovery_recorded_separately(references) -> None:
     )
     lookups = [path for path in fake.paths() if path == f"/v1/invoices/{lost}"]
     assert len(lookups) == 10
+
+
+SAIGON = ZoneInfo("Asia/Ho_Chi_Minh")
+DAY_D = datetime(2026, 10, 7, 11, 0, tzinfo=SAIGON)
+DAY_D1 = datetime(2026, 10, 8, 9, 30, tzinfo=SAIGON)
+ISSUED_D1 = "2026-10-08 09:30:00"
+
+
+def run_s8(fake: FakeSepay, phase: str, now: datetime, **kwargs) -> dict:
+    with ProbeClient(ENV, fake.transport()) as probe:
+        return s8_draft_cross_day(
+            probe, phase=phase, tax_rate=8, account=ACCOUNT, now=lambda: now, **kwargs
+        )
+
+
+def created_drafts(tmp_path: Path, fake: FakeSepay) -> Path:
+    references_file = tmp_path / "s8-references.json"
+    result = run_s8(fake, "create", DAY_D, issued_date=ISSUED, references_file=references_file)
+    assert result["references_written"] is True
+    return references_file
+
+
+def test_s8_create_phase_writes_references_with_created_on(tmp_path: Path) -> None:
+    fake = FakeSepay()
+    references_file = created_drafts(tmp_path, fake)
+    stored = json.loads(references_file.read_text(encoding="utf-8"))
+    assert stored["created_on"] == "2026-10-07"
+    assert stored["created_at"] == DAY_D.isoformat()
+    assert stored["issued_date"] == ISSUED
+    assert len(stored["references"]) == 2 and len(set(stored["references"])) == 2
+    created = [body for _, path, body in fake.requests if path == "/v1/invoices/create"]
+    assert [body["reference_code"] for body in created] == stored["references"]
+    assert all(body["is_draft"] is True and body["issued_date"] == ISSUED for body in created)
+    assert fake.issue_bodies() == []
+    assert all(fake.invoices[ref]["status"] == "draft" for ref in stored["references"])
+    # A second create run never overwrites references held for the next day.
+    with pytest.raises(FileExistsError, match="references_file_exists"):
+        run_s8(FakeSepay(), "create", DAY_D, issued_date=ISSUED, references_file=references_file)
+    assert json.loads(references_file.read_text(encoding="utf-8")) == stored
+
+
+def test_s8_create_phase_without_drafts_writes_no_references(tmp_path: Path) -> None:
+    fake = FakeSepay()
+    fake.create = lambda body: error(422, "INVALID")  # type: ignore[method-assign]
+    references_file = tmp_path / "s8-references.json"
+    result = run_s8(fake, "create", DAY_D, issued_date=ISSUED, references_file=references_file)
+    assert result["references_written"] is False
+    assert not references_file.exists()
+
+
+@pytest.mark.parametrize(
+    "now",
+    [
+        datetime(2026, 10, 7, 23, 59, 59, tzinfo=SAIGON),
+        datetime(2026, 10, 6, 12, 0, tzinfo=SAIGON),
+    ],
+    ids=["same-day", "earlier-day"],
+)
+def test_s8_issue_phase_refuses_same_day(tmp_path: Path, now: datetime) -> None:
+    fake = FakeSepay()
+    references_file = created_drafts(tmp_path, fake)
+    before = len(fake.requests)
+    with pytest.raises(SameDayError, match="same_day"):
+        run_s8(fake, "issue", now, issued_date=ISSUED, references_file=references_file)
+    assert len(fake.requests) == before
+
+
+def test_s8_cli_issue_phase_exits_2_on_same_day(tmp_path: Path, monkeypatch, capsys) -> None:
+    import tools.einvoice_probe.__main__ as cli
+
+    references_file = tmp_path / "s8-references.json"
+    references_file.write_text(
+        json.dumps({"created_on": "2999-01-01", "references": ["a", "b"]}), encoding="utf-8"
+    )
+    settings = tmp_path / "probe-settings.txt"
+    settings.write_text(
+        "\n".join(f"{key}={value}" for key, value in ENV.items()) + "\n", encoding="utf-8"
+    )
+
+    def no_network(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"network call on a same-day run: {request.url.path}")
+
+    monkeypatch.setattr(
+        "tools.einvoice_probe.__main__.ProbeClient",
+        lambda env: ProbeClient(env, httpx.MockTransport(no_network)),
+    )
+    argv = ["einvoice_probe", "s8", "--env", str(settings), "--out", str(tmp_path)]
+    argv += ["--phase", "issue", "--references-file", str(references_file)]
+    monkeypatch.setattr("sys.argv", [*argv, "--issued-date", ISSUED])
+    assert cli.main() == 2
+    assert "same_day" in capsys.readouterr().err
+    assert not (tmp_path / "s8-issue.json").exists()
+
+
+def test_s8_issue_phase_classifies_issue_day(tmp_path: Path) -> None:
+    fake = FakeSepay(issue_date_mode="issue_day", issue_day="2026-10-08")
+    references_file = created_drafts(tmp_path, fake)
+    stored = json.loads(references_file.read_text(encoding="utf-8"))
+    reference_a, reference_b = stored["references"]
+    result = run_s8(fake, "issue", DAY_D1, issued_date=ISSUED_D1, references_file=references_file)
+    assert fake.issue_bodies() == [
+        {"reference_code": reference_a},
+        {"reference_code": reference_b, "issued_date": ISSUED_D1},
+    ]
+    assert result["run_on"] == "2026-10-08"
+    assert result["created_on"] == "2026-10-07"
+    assert result["issue_a"]["issued_on"] == "2026-10-08"
+    assert result["issued_date_on_issue"] == "issue_day"
+    assert result["issue_accepts_issued_date"] is True
+    # Both dates fall on the run day, so "accepted" cannot be told apart from "ignored".
+    assert result["issue_accepts_issued_date_distinguishable"] is False
+    assert result["classifier_paths"]["issued_date_on_issue"] == (
+        "s8_issue_a_lookup.json:body.data.issued_date"
+    )
+
+
+def test_s8_issue_phase_classifies_draft_day(tmp_path: Path) -> None:
+    fake = FakeSepay(issue_date_mode="draft_day")
+    references_file = created_drafts(tmp_path, fake)
+    result = run_s8(fake, "issue", DAY_D1, issued_date=ISSUED_D1, references_file=references_file)
+    assert result["issue_a"]["issued_on"] == "2026-10-07"
+    assert result["issued_date_on_issue"] == "draft_day"
+    assert result["issue_accepts_issued_date"] == "ignored"
+    assert result["issue_accepts_issued_date_distinguishable"] is True
+
+
+def test_s8_issue_phase_records_rejections(tmp_path: Path) -> None:
+    fake = FakeSepay(reject_issue_with_date=True, issue_day="2026-10-08")
+    references_file = created_drafts(tmp_path, fake)
+    result = run_s8(fake, "issue", DAY_D1, issued_date=ISSUED_D1, references_file=references_file)
+    assert result["issued_date_on_issue"] == "issue_day"
+    assert result["issue_b"]["issue"]["http_status"] == 422
+    assert result["issue_accepts_issued_date"] is False
+    missing_file = tmp_path / "missing-references.json"
+    missing_file.write_text(
+        json.dumps({"created_on": "2026-10-07", "references": ["gone-a", "gone-b"]}),
+        encoding="utf-8",
+    )
+    gone = run_s8(FakeSepay(), "issue", DAY_D1, issued_date=ISSUED_D1, references_file=missing_file)
+    assert gone["issue_a"]["issue"]["error_code"] == "EINVOICE_DRAFT_NOT_FOUND"
+    assert gone["issued_date_on_issue"] == "rejected"
+
+
+def test_s8_backdate_recorded_separately(tmp_path: Path) -> None:
+    fake = FakeSepay(issue_date_mode="draft_day")
+    draft_date = "2026-10-06 09:00:00"
+    result = run_s8(
+        fake, "backdate", DAY_D, issued_date=ISSUED, draft_issued_date=draft_date, out_dir=tmp_path
+    )
+    created = [body for _, path, body in fake.requests if path == "/v1/invoices/create"]
+    assert len(created) == 1
+    assert created[0]["is_draft"] is True
+    assert created[0]["issued_date"] == draft_date
+    assert fake.issue_bodies() == [{"reference_code": created[0]["reference_code"]}]
+    assert result["backdate_draft_accepted"] is True
+    assert result["backdate_issued_date_on_issue"] == "draft_day"
+    assert "issued_date_on_issue" not in result
+    assert "issue_accepts_issued_date" not in result
+    assert not list(tmp_path.glob("*references*"))
+    assert (tmp_path / "s8_backdate_draft_create.json").exists()
+    assert (tmp_path / "s8_backdate_issue_lookup.json").exists()
