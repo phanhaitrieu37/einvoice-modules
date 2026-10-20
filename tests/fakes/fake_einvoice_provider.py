@@ -6,7 +6,7 @@ moment it receives the request, as the sandbox did with ``400 ISSUED_DATE_INVALI
 
 Counting: ``calls`` holds one entry per transport request (a POST that reached the provider,
 whatever its answer) and per read; ``effective_creates`` counts invoices that really exist at the
-provider for a reference.
+provider for a reference (a job that ends ``Failed`` is not an invoice).
 """
 
 from __future__ import annotations
@@ -428,7 +428,8 @@ class FakeEInvoiceProvider:
             provider_invoice_id=f"inv-{reference_code}",
         )
         self.invoices[reference_code] = invoice
-        self.effective_creates[reference_code] += 1
+        if state == "success":  # a job that ends Failed leaves no invoice behind
+            self.effective_creates[reference_code] += 1
 
     def _request_facts(self, request: Mapping[str, Any]) -> tuple[int | None, date]:
         built = self._built.get(_canonical(request))
