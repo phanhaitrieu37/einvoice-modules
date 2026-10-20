@@ -104,7 +104,7 @@ def define_tables(metadata: sa.MetaData, prefix: str = "inv_") -> InvoiceTables:
             "credential_ref LIKE 'env:%'", name=n("issuer_accounts_credential_ref_ck")
         ),
         sa.CheckConstraint(
-            "length(btrim(buyer_fallback_name)) > 0 AND length(btrim(buyer_fallback_address)) > 0",
+            "length(btrim(buyer_fallback_name)) > 0",
             name=n("issuer_accounts_fallback_ck"),
         ),
         sa.CheckConstraint(
@@ -182,6 +182,10 @@ def define_tables(metadata: sa.MetaData, prefix: str = "inv_") -> InvoiceTables:
         sa.Column(
             "request_authorized_resend", sa.Boolean(), nullable=False, server_default=sa.false()
         ),
+        _ts("send_started_at", nullable=True),
+        sa.Column("post_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("post_limit", sa.Integer(), nullable=False, server_default="2"),
+        _ts("date_resend_at", nullable=True),
         sa.Column("delivery_mode", sa.String(8)),
         _ts("approved_at", nullable=True),
         sa.Column("approved_by", sa.String(128)),
@@ -366,6 +370,18 @@ def define_tables(metadata: sa.MetaData, prefix: str = "inv_") -> InvoiceTables:
         sa.CheckConstraint(
             "attempts >= 0 AND poll_count >= 0 AND lease_generation >= 0 AND request_revision >= 0",
             name=n("documents_counters_ck"),
+        ),
+        sa.CheckConstraint(
+            "post_count >= 0 AND ((post_count = 0) = (send_started_at IS NULL))",
+            name=n("documents_post_count_ck"),
+        ),
+        sa.CheckConstraint(
+            "post_limit >= 1 AND post_count <= post_limit",
+            name=n("documents_post_limit_ck"),
+        ),
+        sa.CheckConstraint(
+            "date_resend_at IS NULL OR post_count >= 2",
+            name=n("documents_date_resend_ck"),
         ),
         sa.CheckConstraint(
             "last_error_code IS NULL OR " + _in("last_error_code", IssueErrorCode),
