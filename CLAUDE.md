@@ -9,7 +9,7 @@ Package Python `invoice-module`: xuất hoá đơn VAT qua SePay eInvoice cho m�
 - Mọi settlement đều có hoá đơn, trừ settlement trùng đơn mà operator waive (xem dòng dưới); thiếu người mua dùng chuỗi "người mua không lấy hoá đơn" từ cấu hình. Tổng hoá đơn gốc = `amount_vnd` đã settle.
 - `reference_code` gốc = `settlement_id`, ghi DB trước mọi lần gọi mạng; 409 thì tra theo reference, không đổi `reference_code` để thử lại.
 - Settlement thứ hai cho cùng đơn: không tự xuất; giữ ở `blocked` và mở review `DUPLICATE_SETTLEMENT`, operator chọn retry (xuất) hoặc waive (hoàn tiền/cấn trừ). Người dùng đổi ngày 07/10/2026 theo ý kế toán.
-- Hai chế độ xuất theo draft của host: `auto` phát hành ngay khi tiền về; `manual` tạo nháp SePay khi tiền về, kế toán duyệt qua use case/CLI (ghi actor) rồi mới phát hành; ngày lập là ngày SePay ký phát hành (ghi cả ngày duyệt để đối soát). Nháp sai thì operator giữ lại sang review; draft sửa phải duyệt lại. Người dùng chốt ngày 07/10/2026.
+- Hai chế độ xuất theo draft của host: `auto` phát hành ngay khi tiền về; `manual` giữ nháp trong module khi tiền về (không gọi SePay), kế toán duyệt qua use case/CLI (ghi actor), duyệt xong module mới tạo và phát hành một lần; ngày lập là ngày gửi (ghi cả ngày duyệt để đối soát). Người dùng đổi ngày 20/10/2026 sau khi sandbox cho thấy SePay giữ ngày nháp và bắt ngày lập không giảm theo ký hiệu. Nháp sai thì operator giữ lại sang review; draft sửa phải duyệt lại. Người dùng chốt ngày 07/10/2026.
 - Module không tự bịa dòng hàng hay thuế suất. Chưa có draft thì ở `needs_draft`.
 - Tiền: `Decimal`, không dùng `float`.
 - Bảng SQLAlchemy Core prefix `inv_`, không FK sang `pm_*`.
