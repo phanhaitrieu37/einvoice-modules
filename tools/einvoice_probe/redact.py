@@ -18,8 +18,6 @@ def redact(obj: object) -> object:
 
 def _redact(obj: object, *, in_party: bool, field_name: str | None = None) -> object:
     if isinstance(obj, Mapping):
-        if _is_pii_field_descriptor(obj):
-            return {**obj, "value": "REDACTED"}
         redacted: dict[object, object] = {}
         for key, value in obj.items():
             normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", str(key)).lower()
@@ -41,6 +39,9 @@ def _redact(obj: object, *, in_party: bool, field_name: str | None = None) -> ob
                     in_party=in_party or normalized in {"buyer", "seller", "seller_store"},
                     field_name=normalized,
                 )
+        if _is_pii_field_descriptor(obj):
+            # Siblings are redacted like any other key; only the field's own value is masked.
+            redacted["value"] = "REDACTED"
         return redacted
     if isinstance(obj, list):
         return [_redact(value, in_party=in_party) for value in obj]

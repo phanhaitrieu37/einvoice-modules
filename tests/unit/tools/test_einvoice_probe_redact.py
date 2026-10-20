@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from tools.einvoice_probe.redact import redact
 
 
@@ -162,3 +164,55 @@ def test_address_state_never_carries_text_through_write_json(tmp_path) -> None:
     assert loaded["variant_omitted"]["lookup_address"]["value"] == "REDACTED"
     assert loaded["blank"] == findings["blank"]
     assert loaded["classifier_paths"] == findings["classifier_paths"]
+
+
+SIBLINGS = {
+    "message": "bad 0312345678 at https://portal.test/a?sig=abc",
+    "token": "sekret",
+    "tax_code": "0312345678",
+}
+REDACTED_SIBLINGS = {
+    "message": "bad 0000000000 at https://portal.test/a?REDACTED",
+    "token": "REDACTED",
+    "tax_code": "0000000000",
+}
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["body.data.buyer.address", "body.data.invoice.buyer_address", "buyer.name"],
+    ids=["address", "suffixed-address", "name"],
+)
+def test_field_descriptor_masks_value_and_still_redacts_siblings(tmp_path, path) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    written = write_json(
+        tmp_path,
+        "errors",
+        {"errors": [{"path": path, "value": SYNTHETIC_ADDRESS, **SIBLINGS}]},
+    )
+    saved = written.read_text(encoding="utf-8")
+    for text in (SYNTHETIC_ADDRESS, "sekret", "0312345678", "sig=abc"):
+        assert text not in saved
+    assert json.loads(saved)["errors"] == [{"path": path, "value": "REDACTED", **REDACTED_SIBLINGS}]
+
+
+def test_blank_buyer_address_keeps_sibling_redaction(tmp_path) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    findings = {
+        "blank": {"path": "body.data.buyer.address", "value": "", **SIBLINGS},
+        "body": {"data": {"buyer": {"name": "Fallback", "address": "", **SIBLINGS}}},
+        "filled": {"data": {"buyer": {"address": SYNTHETIC_ADDRESS, **SIBLINGS}}},
+    }
+    written = write_json(tmp_path, "blank", findings)
+    saved = json.loads(written.read_text(encoding="utf-8"))
+    assert saved["blank"] == {"path": "body.data.buyer.address", "value": "", **REDACTED_SIBLINGS}
+    assert saved["body"]["data"]["buyer"] == {
+        "name": "REDACTED",
+        "address": "",
+        "message": "bad 0000000000 at https://portal.test/a?REDACTED",
+        "token": "REDACTED",
+        "tax_code": "0000000000",
+    }
+    assert saved["filled"]["data"]["buyer"] == {"address": "REDACTED", **REDACTED_SIBLINGS}
