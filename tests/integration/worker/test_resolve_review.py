@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -25,10 +26,14 @@ from tests.integration.worker.world import TENANT, vn
 from invoice_module.application import resolve_review as resolve_module
 from invoice_module.application.config import InvoiceModuleConfig
 from invoice_module.application.resolve_review import AmountMismatch
+from invoice_module.application.submit_draft import SubmitDraftCommand
 from invoice_module.domain.document import Buyer, SettledPayment
 from invoice_module.domain.enums import DeliveryMode, Environment
 from invoice_module.domain.errors import (
     DocumentInFlight,
+    InvalidLine,
+    InvalidQuantity,
+    InvalidTaxRate,
     ReferenceStillExists,
     ResolutionNotAllowed,
     ScopeMismatch,
@@ -940,18 +945,25 @@ async def test_retry_before_first_post_grants_exactly_one_post(world, mode, outc
 
 
 async def test_attach_draft_on_failed_grants_exactly_one_post(world):
-    settled = await failed_by(world, rejected("validation_error"))
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, TRANSIENT, rejected("validation_error"))
+    await world.issue()
+    world.past_lease()
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.post_count, doc.post_limit) == ("failed", 2, 2)
     await world.resolve(
         settled.document_id,
         "attach_draft",
         draft=world.draft_command(settled.host_ref_id, settled.intent_id, name="Corrected"),
     )
     doc = await world.doc(settled.document_id)
-    assert (doc.post_count, doc.post_limit) == (1, 2)
+    assert (doc.post_count, doc.post_limit) == (2, 3)
     world.provider.script_create(settled.reference, TRANSIENT, TRANSIENT)
     await run_claims(world, times=4, step=timedelta(minutes=5))
     doc = await world.doc(settled.document_id)
-    assert len(world.provider.posts()) == 2
+    assert len(world.provider.posts()) == 3
+    assert world.provider.posts()[-1].payload["items"][0]["name"] == "Corrected"
     assert (doc.status, doc.last_error_code) == ("failed", "max_attempts_exceeded")
     # A held draft was never sent: its correction keeps the default budget.
     held_doc = await held(world)
@@ -1199,3 +1211,53 @@ async def test_quota_review_on_approved_keeps_approval(world):
         doc.approved_reference_code,
     ) == approval
     assert await world.open_reasons(settled.document_id) == []
+
+
+def money_line(quantity=Decimal("1"), price=100, rate=0, **tax):
+    return {"quantity": quantity, "unit_price_vnd": price, "tax_rate": rate} | tax
+
+
+@pytest.mark.parametrize(
+    ("line", "error"),
+    [
+        (money_line(rate=-2), None),
+        (money_line(rate=-1), None),
+        (money_line(rate=0), None),
+        (money_line(price=91, rate=10, tax_amount_vnd=9), None),
+        (money_line(price=91, rate=10, tax_amount_vnd=None), None),
+        (money_line(rate=0, tax_amount_vnd=0), None),
+        (money_line(rate=10, tax_amount_vnd=-1), InvalidLine),
+        (money_line(quantity=Decimal("NaN")), InvalidQuantity),
+        (money_line(quantity=Decimal("Infinity")), InvalidQuantity),
+        (money_line(quantity=1.0), TypeError),
+        (money_line(price=100.0), TypeError),
+        (money_line(rate=7), InvalidTaxRate),
+    ],
+    ids=[
+        "rate-2", "rate-1", "rate0", "rate10-tax9", "tax-none", "tax-zero", "tax-negative",
+        "nan", "inf", "float-quantity", "float-price", "rate7",
+    ],
+)  # fmt: skip
+async def test_repair_validates_money_edges_before_db(world, line, error):
+    settled = await failed_by(world, rejected("validation_error"))
+    before = await world.doc(settled.document_id)
+    cmd = world.draft_command(settled.host_ref_id, settled.intent_id)
+    cmd = SubmitDraftCommand(
+        cmd.tenant_id,
+        cmd.merchant_id,
+        cmd.host_ref_type,
+        cmd.host_ref_id,
+        cmd.intent_id,
+        ({"name": "Corrected", "unit": "each"} | line,),
+        100,
+        delivery_mode=cmd.delivery_mode,
+    )
+    if error is None:
+        await world.resolve(settled.document_id, "attach_draft", draft=cmd)
+        doc = await world.doc(settled.document_id)
+        assert (doc.status, doc.total_vnd) == ("queued", 100)
+        assert sum(item["line_total_vnd"] for item in doc.document["lines"]) == 100
+    else:
+        with pytest.raises(error):
+            await world.resolve(settled.document_id, "attach_draft", draft=cmd)
+        assert await world.doc(settled.document_id) == before

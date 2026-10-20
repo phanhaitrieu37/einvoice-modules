@@ -108,7 +108,7 @@ class IssueQueued:
                 results.append(await self._process(document))
             except Exception as exc:
                 # The lease expires and a later claim looks the reference up before any send.
-                logger.exception(
+                logger.error(
                     "invoice_issue_step_failed",
                     extra={"document_id": str(document.id), "error": type(exc).__name__},
                 )

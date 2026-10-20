@@ -380,12 +380,15 @@ class FakeEInvoiceProvider:
     async def describe_account(
         self, account: IssuerAccountView, creds: ClientCredentials
     ) -> AccountFacts:
+        self.calls.append(Call("describe_account", account.provider_account_id, self.clock.now()))
         return AccountFacts(account.provider_account_id, ("1",), ("C26TSE",))
 
-    async def adjust(self, *args: object, **kwargs: object) -> Accepted:
+    async def adjust(self, account: Any, creds: Any, request: Mapping[str, object]) -> Accepted:
+        self.calls.append(Call("adjust", str(request.get("reference_code")), self.clock.now()))
         raise NotImplementedError
 
-    async def replace(self, *args: object, **kwargs: object) -> Accepted:
+    async def replace(self, account: Any, creds: Any, request: Mapping[str, object]) -> Accepted:
+        self.calls.append(Call("replace", str(request.get("reference_code")), self.clock.now()))
         raise NotImplementedError
 
     def build_adjust_payload(self, *args: object, **kwargs: object) -> dict[str, object]:

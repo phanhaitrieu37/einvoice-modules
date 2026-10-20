@@ -176,7 +176,9 @@ async def test_approval_across_midnight_records_provider_issue_date(world):
     await world.approve(settled)
     await world.drive(rounds=3, step=timedelta(seconds=5))
     doc = await world.doc(settled.document_id)
+    [post] = world.provider.posts()
     assert (doc.status, doc.issued_date) == ("issued", date(2026, 10, 22))
+    assert post.payload["issued_date"][:10] == "2026-10-22"
     assert doc.approved_at == vn(2026, 10, 22, 8)
 
 
