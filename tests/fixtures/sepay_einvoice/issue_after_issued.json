@@ -1,0 +1,20 @@
+{
+  "body": {
+    "error": {
+      "code": "EINVOICE_DRAFT_NOT_FOUND",
+      "message": "Kh\u00f4ng t\u00ecm th\u1ea5y b\u1ea3n nh\u00e1p c\u1ee7a h\u00f3a \u0111\u01a1n v\u1edbi reference_code \u0111\u00e3 cho"
+    },
+    "success": false
+  },
+  "classifier_paths": {
+    "error_code": "body.error.code",
+    "http_status": "status",
+    "response_reference": "body.data.reference_code",
+    "tracking_code": "body.data.tracking_code"
+  },
+  "headers": {
+    "content-length": null,
+    "content-type": "application/json; charset=UTF-8"
+  },
+  "status": 500
+}

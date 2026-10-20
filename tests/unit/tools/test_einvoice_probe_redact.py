@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from tools.einvoice_probe.redact import redact
 
 
@@ -99,3 +103,188 @@ def test_redact_jwt_anywhere() -> None:
     assert redact({"message": "bad token eyJabcdefghijk.payload.signature at provider"}) == {
         "message": "bad token REDACTED_JWT at provider"
     }
+
+
+SYNTHETIC_ADDRESS = "SYNTHETIC NONEMPTY ADDRESS"
+
+
+def test_redact_keeps_blank_buyer_address_states(tmp_path) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    calls = {
+        "missing": {"buyer": {"name": "Fallback"}},
+        "empty": {"buyer": {"name": "Fallback", "address": ""}},
+        "null": {"buyer": {"name": "Fallback", "address": None}},
+    }
+    for name, buyer in calls.items():
+        written = write_json(tmp_path, name, {"body": {"data": {"invoice": buyer}}})
+        saved = json.loads(written.read_text(encoding="utf-8"))["body"]["data"]["invoice"]
+        assert saved["buyer"]["name"] == "REDACTED"
+        assert {key: value for key, value in saved["buyer"].items() if key != "name"} == {
+            key: value for key, value in buyer["buyer"].items() if key != "name"
+        }
+    # The exception is narrow: a blank seller address is still masked.
+    assert redact({"seller": {"address": ""}}) == {"seller": {"address": "REDACTED"}}
+
+
+def test_redact_masks_nonempty_buyer_address(tmp_path) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    written = write_json(
+        tmp_path,
+        "lookup",
+        {"body": {"data": {"buyer": {"name": "Fallback", "address": SYNTHETIC_ADDRESS}}}},
+    )
+    saved = written.read_text(encoding="utf-8")
+    assert SYNTHETIC_ADDRESS not in saved
+    assert json.loads(saved)["body"]["data"]["buyer"]["address"] == "REDACTED"
+    assert redact({"buyer": {"address": " "}}) == {"buyer": {"address": "REDACTED"}}
+
+
+def test_address_state_never_carries_text_through_write_json(tmp_path) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    findings = {
+        "variant_omitted": {
+            "check_address": {"path": "body.data.invoice.buyer.address", "state": "nonempty"},
+            "lookup_address": {"path": "body.data.buyer.address", "value": SYNTHETIC_ADDRESS},
+        },
+        "blank": {"path": "body.data.buyer.address", "value": ""},
+        "classifier_paths": {
+            "lookup_address": "buyer_address_*_lookup.json:body.data.buyer.address"
+        },
+    }
+    written = write_json(tmp_path, "findings_buyer", findings)
+    saved = written.read_text(encoding="utf-8")
+    assert SYNTHETIC_ADDRESS not in saved
+    loaded = json.loads(saved)
+    assert (
+        loaded["variant_omitted"]["check_address"] == findings["variant_omitted"]["check_address"]
+    )
+    assert loaded["variant_omitted"]["lookup_address"]["value"] == "REDACTED"
+    assert loaded["blank"] == findings["blank"]
+    assert loaded["classifier_paths"] == findings["classifier_paths"]
+
+
+SIBLINGS = {
+    "message": "bad 0312345678 at https://portal.test/a?sig=abc",
+    "token": "sekret",
+    "tax_code": "0312345678",
+}
+REDACTED_SIBLINGS = {
+    "message": "bad 0000000000 at https://portal.test/a?REDACTED",
+    "token": "REDACTED",
+    "tax_code": "0000000000",
+}
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["body.data.buyer.address", "body.data.invoice.buyer_address", "buyer.name"],
+    ids=["address", "suffixed-address", "name"],
+)
+def test_field_descriptor_masks_value_and_still_redacts_siblings(tmp_path, path) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    written = write_json(
+        tmp_path,
+        "errors",
+        {"errors": [{"path": path, "value": SYNTHETIC_ADDRESS, **SIBLINGS}]},
+    )
+    saved = written.read_text(encoding="utf-8")
+    for text in (SYNTHETIC_ADDRESS, "sekret", "0312345678", "sig=abc"):
+        assert text not in saved
+    assert json.loads(saved)["errors"] == [{"path": path, "value": "REDACTED", **REDACTED_SIBLINGS}]
+
+
+def test_blank_buyer_address_keeps_sibling_redaction(tmp_path) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    findings = {
+        "blank": {"path": "body.data.buyer.address", "value": "", **SIBLINGS},
+        "body": {"data": {"buyer": {"name": "Fallback", "address": "", **SIBLINGS}}},
+        "filled": {"data": {"buyer": {"address": SYNTHETIC_ADDRESS, **SIBLINGS}}},
+    }
+    written = write_json(tmp_path, "blank", findings)
+    saved = json.loads(written.read_text(encoding="utf-8"))
+    assert saved["blank"] == {"path": "body.data.buyer.address", "value": "", **REDACTED_SIBLINGS}
+    assert saved["body"]["data"]["buyer"] == {
+        "name": "REDACTED",
+        "address": "",
+        "message": "bad 0000000000 at https://portal.test/a?REDACTED",
+        "token": "REDACTED",
+        "tax_code": "0000000000",
+    }
+    assert saved["filled"]["data"]["buyer"] == {"address": "REDACTED", **REDACTED_SIBLINGS}
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("body.data.Buyer.Name", "SYNTHETIC BUYER NAME"),
+        ("body.data.buyer.Address", SYNTHETIC_ADDRESS),
+        ("buyer.phone", 84901234567),
+        ("buyer.address", {"line": SYNTHETIC_ADDRESS}),
+    ],
+    ids=["capitalised-name-path", "capitalised-address-path", "int-phone", "dict-address"],
+)
+def test_field_descriptor_masks_any_case_and_any_value_type(tmp_path, path, value) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    written = write_json(tmp_path, "errors", {"errors": [{"path": path, "value": value}]})
+    saved = written.read_text(encoding="utf-8")
+    for text in ("SYNTHETIC", "84901234567"):
+        assert text not in saved
+    assert json.loads(saved)["errors"] == [{"path": path, "value": "REDACTED"}]
+
+
+@pytest.mark.parametrize("parent", ["buyer", "Buyer"])
+@pytest.mark.parametrize("blank", ["", None], ids=["empty", "null"])
+def test_redact_keeps_capitalised_blank_buyer_address(tmp_path, parent, blank) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    body = {"data": {parent: {"Name": "Fallback", "Address": blank}}}
+    written = write_json(tmp_path, "lookup", body)
+    saved = json.loads(written.read_text(encoding="utf-8"))
+    assert saved["data"][parent] == {"Name": "REDACTED", "Address": blank}
+    filled = write_json(tmp_path, "filled", {"data": {parent: {"Address": SYNTHETIC_ADDRESS}}})
+    assert json.loads(filled.read_text(encoding="utf-8"))["data"][parent] == {"Address": "REDACTED"}
+
+
+@pytest.mark.parametrize(
+    "path", ["buyer.tax_code", "body.data.invoice.buyer.TAX_CODE"], ids=["snake", "upper"]
+)
+def test_field_descriptor_masks_a_tax_code(tmp_path, path) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    written = write_json(
+        tmp_path,
+        "errors",
+        {"errors": [{"path": path, "value": "0312345678", "message": "invalid"}]},
+    )
+    saved = written.read_text(encoding="utf-8")
+    assert "0312345678" not in saved
+    assert json.loads(saved)["errors"] == [
+        {"path": path, "value": "0000000000", "message": "invalid"}
+    ]
+    blank = write_json(tmp_path, "blank", {"path": path, "value": ""})
+    assert json.loads(blank.read_text(encoding="utf-8")) == {"path": path, "value": ""}
+
+
+@pytest.mark.parametrize("key", ["buyer_address", "buyerAddress"])
+def test_flat_buyer_address_is_masked_unless_blank(tmp_path, key) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    filled = write_json(tmp_path, "filled", {"data": {key: SYNTHETIC_ADDRESS, "status": "x"}})
+    saved = filled.read_text(encoding="utf-8")
+    assert SYNTHETIC_ADDRESS not in saved
+    assert json.loads(saved) == {"data": {key: "REDACTED", "status": "x"}}
+    structured = write_json(tmp_path, "structured", {"data": {key: {"line": SYNTHETIC_ADDRESS}}})
+    assert json.loads(structured.read_text(encoding="utf-8")) == {"data": {key: "REDACTED"}}
+    for name, data in {
+        "empty": {key: ""},
+        "null": {key: None},
+        "missing": {"status": "x"},
+    }.items():
+        written = write_json(tmp_path, name, {"data": data})
+        assert json.loads(written.read_text(encoding="utf-8")) == {"data": data}

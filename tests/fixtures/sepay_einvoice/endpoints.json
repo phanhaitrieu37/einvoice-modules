@@ -4,6 +4,11 @@
     "path": "/v1/invoices/create/check/{tracking_code}",
     "verified": true
   },
+  "check_issue": {
+    "method": "GET",
+    "path": "/v1/invoices/issue/check/{tracking_code}",
+    "verified": true
+  },
   "create": {
     "method": "POST",
     "path": "/v1/invoices/create",
@@ -26,8 +31,8 @@
   },
   "publish": {
     "method": "POST",
-    "path": null,
-    "verified": false
+    "path": "/v1/invoices/issue",
+    "verified": true
   },
   "quota": {
     "method": "GET",

@@ -1,0 +1,31 @@
+{
+  "attempts": [
+    {
+      "issue_status": 202,
+      "pending": null,
+      "probe_endpoint": "check_issue",
+      "probe_state": "Success",
+      "reference": "00000000-0000-4000-8000-000000000001",
+      "skipped": null
+    },
+    {
+      "issue_status": 202,
+      "pending": null,
+      "probe_endpoint": "check_issue",
+      "probe_state": "Success",
+      "reference": "00000000-0000-4000-8000-000000000003",
+      "skipped": null
+    },
+    {
+      "issue_status": 202,
+      "pending": null,
+      "probe_endpoint": "check_issue",
+      "probe_state": "Success",
+      "reference": "00000000-0000-4000-8000-000000000004",
+      "skipped": null
+    }
+  ],
+  "classifier_paths": {},
+  "issue_pending_observed": false,
+  "status": null
+}

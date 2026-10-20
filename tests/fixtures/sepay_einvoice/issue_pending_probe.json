@@ -1,0 +1,49 @@
+{
+  "body": {
+    "data": {
+      "invoice": {
+        "buyer": {
+          "address": "REDACTED",
+          "buyer_code": null,
+          "email": "REDACTED",
+          "legal_name": "REDACTED",
+          "name": "REDACTED",
+          "national_id": "REDACTED",
+          "phone": "REDACTED",
+          "tax_code": "0000000000",
+          "type": "personal"
+        },
+        "document_type": 2,
+        "invoice_number": "316527",
+        "invoice_series": "C26TSE",
+        "issued_date": "2026-10-07",
+        "notes": "",
+        "payment_method": "TM/CK",
+        "pdf_url": "https://beta-portalv2.mifi.vn/DownloadPDFCA.aspx?REDACTED",
+        "provider_status": null,
+        "reference_code": "00000000-0000-4000-8000-000000000004",
+        "seller_store": null,
+        "source": "api",
+        "status": "issued",
+        "tax_amount": 80,
+        "tax_authority_code": null,
+        "total_amount": 1080,
+        "total_before_tax": 1000,
+        "xml_url": null
+      },
+      "message": "Xu\u1ea5t b\u1ea3n h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed th\u00e0nh c\u00f4ng",
+      "reference_code": "00000000-0000-4000-8000-000000000004",
+      "status": "Success"
+    },
+    "success": true
+  },
+  "classifier_paths": {
+    "endpoint": "check_issue",
+    "pending_state": "body.data.status"
+  },
+  "headers": {
+    "content-length": null,
+    "content-type": "application/json; charset=UTF-8"
+  },
+  "status": 200
+}

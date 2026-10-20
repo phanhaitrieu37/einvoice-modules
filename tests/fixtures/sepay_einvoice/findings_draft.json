@@ -1,0 +1,76 @@
+{
+  "backdate_draft_accepted": false,
+  "classifier_paths": {
+    "backdate_draft_accepted": "s8_backdate_draft_create.json:status+body.error.code",
+    "draft_consumes_quota": "quota_0.json|quota_1.json:body.data.quota_remaining",
+    "draft_create_accepted": "draft_create_accepted.json:status|draft_check.json:body.data.status",
+    "draft_marker": "draft_check.json:body.data.invoice.status",
+    "draft_marker_lookup": "draft_lookup.json:body.data.status",
+    "draft_recreate_behaviour": "draft_recreate.json:body.error.code",
+    "issue_accepts_issued_date": "s8_issue_b.json:status|s8_issue_b_check_poll_01.json:body.data.status+body.data.invoice.issued_date|s8_issue_b_lookup.json:body.data.issued_date",
+    "issue_after_issued": "issue_after_issued.json:body.error.code",
+    "issue_after_issued_same_invoice": "issue_lookup_issued.json|issue_after_issued_lookup.json:body.data.invoice_number",
+    "issue_check_state": "issue_check_success.json:body.data.status",
+    "issue_consumes_quota": "quota_2.json|quota_3.json:body.data.quota_remaining",
+    "issue_endpoint_verified": "issue_accepted.json:status|issue_check_success.json:body.data.invoice.invoice_number|issue_lookup_issued.json:body.data.invoice_number",
+    "issue_idempotent": "issue_pending_probe.json|issue_resend_pending.json|issue_after_issued.json|issue_lookup_issued.json|issue_after_issued_lookup.json",
+    "issue_pending_observed": "issue_pending_probe.json:body.data.status",
+    "issue_tracking_equals_reference": "issue_accepted.json:body.data.tracking_code",
+    "issue_unknown_reference": "issue_unknown_reference.json:body.error.code",
+    "issued_date_on_issue": "s8_issue_a.json:status|s8_issue_a_check_poll_01.json:body.data.status+body.data.message+body.data.invoice.issued_date|s8_issue_a_lookup.json:body.data.status+body.data.invoice_number+body.data.issued_date",
+    "issued_lookup_has_numbers": "issue_lookup_issued.json:body.data.invoice_number",
+    "provider_issued_date_path": "issue_check_success.json:body.data.invoice.issued_date|issue_lookup_issued.json:body.data.issued_date",
+    "recover_after_lost_issue_response": "issue_recovered_lookup.json:body.data.invoice_number+body.data.issued_date",
+    "recover_by_check_reference": "issue_recovered_check.json:body.data.reference_code+body.data.invoice.invoice_number+body.data.invoice.issued_date",
+    "recover_by_check_reference_endpoint": "check_issue",
+    "recover_numbers_by_reference": "issue_lookup_issued.json:body.data.invoice_number+body.data.issued_date"
+  },
+  "draft_consumes_quota": false,
+  "draft_create_accepted": true,
+  "draft_marker": {
+    "path": "body.data.invoice.status",
+    "value": "draft"
+  },
+  "draft_marker_lookup": {
+    "path": "body.data.status",
+    "value": "draft"
+  },
+  "draft_recreate_behaviour": {
+    "error_code": "EINVOICE_DOCUMENT_EXISTED",
+    "http_status": 409,
+    "path": "body.error.code"
+  },
+  "issue_accepts_issued_date": false,
+  "issue_after_issued": {
+    "error_code": "EINVOICE_DRAFT_NOT_FOUND",
+    "http_status": 500,
+    "path": "body.error.code",
+    "response_reference": null
+  },
+  "issue_check_state": {
+    "path": "body.data.status",
+    "value": "Success"
+  },
+  "issue_consumes_quota": false,
+  "issue_endpoint_verified": true,
+  "issue_idempotent": "inconclusive",
+  "issue_pending_observed": false,
+  "issue_resend_while_pending": null,
+  "issue_tracking_equals_reference": true,
+  "issue_unknown_reference": {
+    "error_code": "EINVOICE_DRAFT_NOT_FOUND",
+    "http_status": 500,
+    "path": "body.error.code",
+    "state": "rejected"
+  },
+  "issued_date_on_issue": "rejected",
+  "issued_lookup_has_numbers": true,
+  "probed_at": "2026-10-20T13:11:55.144291+07:00",
+  "provider_issued_date_path": {
+    "check": "body.data.invoice.issued_date",
+    "lookup": "body.data.issued_date"
+  },
+  "recover_after_lost_issue_response": true,
+  "recover_by_check_reference": true,
+  "recover_numbers_by_reference": true
+}

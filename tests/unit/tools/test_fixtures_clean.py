@@ -14,6 +14,12 @@ PHONE_VN = re.compile(r"(?<!\d)\+84[ .-]?(?:\d[ .-]?){8,10}(?!\d)")
 URL_QUERY = re.compile(r"https?://[^\s\"'<>?#]+\?([^\s\"'<>#]+)", re.IGNORECASE)
 SECRET_KEYS = {"access_token", "token", "client_id", "client_secret", "authorization"}
 TIME_KEYS = {"time", "timestamp", "created_at", "updated_at", "issued_date", "date"}
+ANY_UUID = re.compile(r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# Draft, issue and buyer address fixtures keep reference/tracking identity only as
+# numbered placeholders.
+PLACEHOLDER_UUID = re.compile(
+    r"00000000-0000-4000-8000-\d{12}|00000000-0000-0000-0000-000000000000"
+)
 
 
 def test_fixtures_have_no_secret_or_pii() -> None:
@@ -47,7 +53,7 @@ def test_fixtures_have_no_secret_or_pii() -> None:
             value = account.get("id")
             if isinstance(value, str) and UUID.fullmatch(value):
                 assert value == "00000000-0000-0000-0000-000000000000", path
-        for key, value, in_party in _walk_context(payload):
+        for key, value, in_party, parent in _walk_context(payload):
             if key.lower() == "provider_account_id":
                 assert value == "00000000-0000-0000-0000-000000000000", path
             if in_party and key.lower() in {
@@ -58,7 +64,53 @@ def test_fixtures_have_no_secret_or_pii() -> None:
                 "phone",
                 "email",
             }:
-                assert value == "REDACTED", path
+                # Only a blank fallback buyer address may stay as observed.
+                blank_buyer_address = (
+                    key.lower() == "address" and parent == "buyer" and value in ("", None)
+                )
+                assert value == "REDACTED" or blank_buyer_address, path
+            if path.name == "findings_buyer.json" and key.lower().endswith("_address"):
+                # Buyer findings record address states only, never the observed value.
+                assert not (isinstance(value, dict) and "value" in value), path
+
+
+def test_draft_and_issue_fixtures_hold_no_real_identifiers() -> None:
+    for pattern in ("draft_*.json", "issue_*.json", "buyer_address_*.json"):
+        for path in FIXTURE_DIR.glob(pattern):
+            raw = path.read_text(encoding="utf-8")
+            assert all(PLACEHOLDER_UUID.fullmatch(value) for value in ANY_UUID.findall(raw)), path
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["draft_check.json", "issue_accepted.json", "buyer_address_empty_create.json"],
+)
+@pytest.mark.parametrize(
+    ("key", "identifier"),
+    [
+        ("tracking_code", "084e179d-d95a-11f0-aef4-52c7e9b4f41b"),
+        # A version 4 UUID, the form of the reference codes the probe sends.
+        ("reference_code", "6f1c2e8a-3b5d-4c7e-9a10-2d4b8e6f0c13"),
+    ],
+    ids=["v1-tracking-code", "v4-reference-code"],
+)
+def test_draft_fixture_scan_rejects_a_real_tracking_code(
+    tmp_path, monkeypatch, name, key, identifier
+) -> None:
+    fixture_dir = tmp_path / "fixtures"
+    fixture_dir.mkdir()
+    (fixture_dir / name).write_text(
+        '{"body":{"data":{"' + key + '":"' + identifier + '"}}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys.modules[__name__], "FIXTURE_DIR", fixture_dir)
+    with pytest.raises(AssertionError):
+        test_draft_and_issue_fixtures_hold_no_real_identifiers()
+    (fixture_dir / name).write_text(
+        '{"body":{"data":{"tracking_code":"00000000-0000-4000-8000-000000000001"}}}\n',
+        encoding="utf-8",
+    )
+    test_draft_and_issue_fixtures_hold_no_real_identifiers()
 
 
 def test_ten_digit_timestamps_are_allowed_in_fixtures(tmp_path, monkeypatch) -> None:
@@ -146,6 +198,37 @@ def test_fixture_scan_rejects_each_single_pii_violation(payload, tmp_path, monke
         test_fixtures_have_no_secret_or_pii()
 
 
+def test_fixture_scan_accepts_blank_address_and_rejects_real_address(tmp_path, monkeypatch) -> None:
+    fixture_dir = tmp_path / "fixtures"
+    fixture_dir.mkdir()
+    monkeypatch.setattr(sys.modules[__name__], "FIXTURE_DIR", fixture_dir)
+    target = fixture_dir / "buyer_address_check.json"
+    for buyer in (
+        '{"name":"REDACTED"}',
+        '{"name":"REDACTED","address":""}',
+        '{"name":"REDACTED","address":null}',
+        '{"name":"REDACTED","address":"REDACTED"}',
+    ):
+        target.write_text('{"data":{"invoice":{"buyer":' + buyer + "}}}\n", encoding="utf-8")
+        test_fixtures_have_no_secret_or_pii()
+    for payload in (
+        '{"data":{"invoice":{"buyer":{"address":"12 Real Street"}}}}',
+        '{"data":{"seller":{"address":""}}}',
+    ):
+        target.write_text(payload + "\n", encoding="utf-8")
+        with pytest.raises(AssertionError):
+            test_fixtures_have_no_secret_or_pii()
+    target.unlink()
+    findings = fixture_dir / "findings_buyer.json"
+    state = '{"path":"body.data.buyer.address","state":"empty"}'
+    findings.write_text('{"variant_empty":{"lookup_address":' + state + "}}\n", encoding="utf-8")
+    test_fixtures_have_no_secret_or_pii()
+    leak = '{"path":"body.data.buyer.address","value":""}'
+    findings.write_text('{"variant_empty":{"lookup_address":' + leak + "}}\n", encoding="utf-8")
+    with pytest.raises(AssertionError):
+        test_fixtures_have_no_secret_or_pii()
+
+
 def _walk(value: object):
     if isinstance(value, dict):
         for key, nested in value.items():
@@ -167,12 +250,12 @@ def _provider_accounts(value: object):
             yield from _provider_accounts(nested)
 
 
-def _walk_context(value: object, *, in_party: bool = False):
+def _walk_context(value: object, *, in_party: bool = False, parent: str | None = None):
     if isinstance(value, dict):
         for key, nested in value.items():
             party = in_party or key.lower() in {"buyer", "seller", "seller_store"}
-            yield key, nested, party
-            yield from _walk_context(nested, in_party=party)
+            yield key, nested, party, parent
+            yield from _walk_context(nested, in_party=party, parent=key.lower())
     elif isinstance(value, list):
         for nested in value:
             yield from _walk_context(nested, in_party=in_party)
