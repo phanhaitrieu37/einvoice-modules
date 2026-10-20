@@ -8,6 +8,7 @@ from invoice_module.adapters.sqlalchemy.repositories.documents import DocumentRo
 from invoice_module.adapters.sqlalchemy.repositories.drafts import DraftRow
 from invoice_module.domain.document import DraftData, InvoiceDocument
 from invoice_module.domain.enums import DocumentStatus, DraftStatus, ReviewReason
+from invoice_module.domain.errors import ScopeMismatch
 from invoice_module.domain.money import LineInput, check_declared_total
 from invoice_module.ports.unit_of_work import InvoiceUnitOfWork
 
@@ -68,6 +69,9 @@ async def attach_draft_to_documents(
     account_lookup: Any,
     now: datetime,
     documents: list[DocumentRow] | tuple[DocumentRow, ...] | None = None,
+    *,
+    actor: str = "system:attach_draft",
+    note: str | None = None,
 ) -> list[AttachOutcome]:
     candidates = (
         documents
@@ -76,6 +80,11 @@ async def attach_draft_to_documents(
             draft.tenant_id, draft.host_ref_type, draft.host_ref_id
         )
     )
+    # A draft of another merchant must fail here, before any write: the draft foreign key would
+    # otherwise raise inside the host's transaction when the submit runs joined.
+    foreign = [document.id for document in candidates if document.merchant_id != draft.merchant_id]
+    if foreign:
+        raise ScopeMismatch("draft merchant does not match the document merchant")
     outcomes: list[AttachOutcome] = []
     data = _draft_data(draft)
     for document in candidates:
@@ -119,12 +128,7 @@ async def attach_draft_to_documents(
                 case_id = await uow.review_cases.get_open_id(document.id)
                 assert case_id is not None
                 await uow.review_cases.clear_reason(
-                    case_id,
-                    ReviewReason.DRAFT_MISSING.value,
-                    "attach_draft",
-                    "system:attach_draft",
-                    None,
-                    now,
+                    case_id, ReviewReason.DRAFT_MISSING.value, "attach_draft", actor, note, now
                 )
             outcomes.append(AttachOutcome(document.id, DocumentStatus.BLOCKED.value))
             continue
@@ -153,7 +157,7 @@ async def attach_draft_to_documents(
             ):
                 if reason in await uow.review_cases.open_reasons(document.id):
                     await uow.review_cases.clear_reason(
-                        case_id, reason, "attach_draft", "system:attach_draft", None, now
+                        case_id, reason, "attach_draft", actor, note, now
                     )
         outcomes.append(AttachOutcome(document.id, status.value))
     return outcomes
