@@ -27,11 +27,8 @@ def test_invalid_transition_raises() -> None:
 
 MANUAL_RECOVERY_EDGES = [
     (DocumentStatus.QUEUED, DocumentStatus.AWAITING_APPROVAL),
-    (DocumentStatus.PENDING_PROVIDER, DocumentStatus.AWAITING_APPROVAL),
-    (DocumentStatus.PENDING_PROVIDER, DocumentStatus.APPROVED),
     (DocumentStatus.AWAITING_APPROVAL, DocumentStatus.APPROVED),
     (DocumentStatus.AWAITING_APPROVAL, DocumentStatus.BLOCKED),
-    (DocumentStatus.AWAITING_APPROVAL, DocumentStatus.FAILED),
     (DocumentStatus.APPROVED, DocumentStatus.APPROVED),
     (DocumentStatus.APPROVED, DocumentStatus.PENDING_PROVIDER),
     (DocumentStatus.APPROVED, DocumentStatus.ISSUED),
@@ -39,10 +36,8 @@ MANUAL_RECOVERY_EDGES = [
     (DocumentStatus.APPROVED, DocumentStatus.BLOCKED),
     (DocumentStatus.APPROVED, DocumentStatus.AWAITING_APPROVAL),
     (DocumentStatus.BLOCKED, DocumentStatus.AWAITING_APPROVAL),
-    (DocumentStatus.BLOCKED, DocumentStatus.FAILED),
     (DocumentStatus.BLOCKED, DocumentStatus.QUEUED),
     (DocumentStatus.BLOCKED, DocumentStatus.NEEDS_DRAFT),
-    (DocumentStatus.FAILED, DocumentStatus.AWAITING_APPROVAL),
     (DocumentStatus.FAILED, DocumentStatus.APPROVED),
 ]
 
@@ -50,7 +45,6 @@ MANUAL_RECOVERY_EDGES = [
 def test_manual_flow_edges() -> None:
     chain = [
         DocumentStatus.QUEUED,
-        DocumentStatus.PENDING_PROVIDER,
         DocumentStatus.AWAITING_APPROVAL,
         DocumentStatus.APPROVED,
         DocumentStatus.PENDING_PROVIDER,
@@ -71,7 +65,6 @@ def test_awaiting_approval_targets_are_exact() -> None:
     assert ALLOWED_TRANSITIONS[DocumentStatus.AWAITING_APPROVAL] == {
         DocumentStatus.APPROVED,
         DocumentStatus.BLOCKED,
-        DocumentStatus.FAILED,
     }
 
 
@@ -83,7 +76,6 @@ def test_allowed_transitions_are_exact() -> None:
             DocumentStatus.NEEDS_DRAFT,
             DocumentStatus.BLOCKED,
             DocumentStatus.AWAITING_APPROVAL,
-            DocumentStatus.FAILED,
         },
         DocumentStatus.QUEUED: {
             DocumentStatus.PENDING_PROVIDER,
@@ -97,13 +89,10 @@ def test_allowed_transitions_are_exact() -> None:
             DocumentStatus.PENDING_PROVIDER,
             DocumentStatus.ISSUED,
             DocumentStatus.FAILED,
-            DocumentStatus.AWAITING_APPROVAL,
-            DocumentStatus.APPROVED,
         },
         DocumentStatus.AWAITING_APPROVAL: {
             DocumentStatus.APPROVED,
             DocumentStatus.BLOCKED,
-            DocumentStatus.FAILED,
         },
         DocumentStatus.APPROVED: {
             DocumentStatus.APPROVED,
@@ -117,7 +106,6 @@ def test_allowed_transitions_are_exact() -> None:
             DocumentStatus.QUEUED,
             DocumentStatus.PENDING_PROVIDER,
             DocumentStatus.ISSUED,
-            DocumentStatus.AWAITING_APPROVAL,
             DocumentStatus.APPROVED,
         },
         DocumentStatus.ISSUED: {DocumentStatus.REPLACED, DocumentStatus.CANCELLED_EXTERNALLY},
@@ -125,6 +113,21 @@ def test_allowed_transitions_are_exact() -> None:
         DocumentStatus.CANCELLED_EXTERNALLY: set(),
     }
     assert expected == ALLOWED_TRANSITIONS
+
+
+SEPAY_DRAFT_EDGES = [
+    (DocumentStatus.PENDING_PROVIDER, DocumentStatus.AWAITING_APPROVAL),
+    (DocumentStatus.PENDING_PROVIDER, DocumentStatus.APPROVED),
+    (DocumentStatus.AWAITING_APPROVAL, DocumentStatus.FAILED),
+    (DocumentStatus.BLOCKED, DocumentStatus.FAILED),
+    (DocumentStatus.FAILED, DocumentStatus.AWAITING_APPROVAL),
+]
+
+
+@pytest.mark.parametrize(("current", "target"), SEPAY_DRAFT_EDGES)
+def test_sepay_draft_edges_removed(current: DocumentStatus, target: DocumentStatus) -> None:
+    with pytest.raises(InvalidTransition):
+        ensure_transition(current, target)
 
 
 def test_queued_cannot_skip_approval() -> None:

@@ -9,7 +9,6 @@ ALLOWED_TRANSITIONS: dict[DocumentStatus, frozenset[DocumentStatus]] = {
             DocumentStatus.NEEDS_DRAFT,
             DocumentStatus.BLOCKED,
             DocumentStatus.AWAITING_APPROVAL,
-            DocumentStatus.FAILED,
         }
     ),
     DocumentStatus.QUEUED: frozenset(
@@ -23,17 +22,9 @@ ALLOWED_TRANSITIONS: dict[DocumentStatus, frozenset[DocumentStatus]] = {
         }
     ),
     DocumentStatus.PENDING_PROVIDER: frozenset(
-        {
-            DocumentStatus.PENDING_PROVIDER,
-            DocumentStatus.ISSUED,
-            DocumentStatus.FAILED,
-            DocumentStatus.AWAITING_APPROVAL,
-            DocumentStatus.APPROVED,
-        }
+        {DocumentStatus.PENDING_PROVIDER, DocumentStatus.ISSUED, DocumentStatus.FAILED}
     ),
-    DocumentStatus.AWAITING_APPROVAL: frozenset(
-        {DocumentStatus.APPROVED, DocumentStatus.BLOCKED, DocumentStatus.FAILED}
-    ),
+    DocumentStatus.AWAITING_APPROVAL: frozenset({DocumentStatus.APPROVED, DocumentStatus.BLOCKED}),
     DocumentStatus.APPROVED: frozenset(
         {
             DocumentStatus.APPROVED,
@@ -49,7 +40,6 @@ ALLOWED_TRANSITIONS: dict[DocumentStatus, frozenset[DocumentStatus]] = {
             DocumentStatus.QUEUED,
             DocumentStatus.PENDING_PROVIDER,
             DocumentStatus.ISSUED,
-            DocumentStatus.AWAITING_APPROVAL,
             DocumentStatus.APPROVED,
         }
     ),
