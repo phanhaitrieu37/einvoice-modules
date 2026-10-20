@@ -19,6 +19,7 @@ from tools.einvoice_probe.scenarios import (
     s3_failed_then_retry,
     s7_draft_then_issue,
     s8_draft_cross_day,
+    s9_fallback_buyer_address,
     tax_matrix,
 )
 
@@ -753,3 +754,203 @@ def test_s8_backdate_recorded_separately(tmp_path: Path) -> None:
     assert not list(tmp_path.glob("*references*"))
     assert (tmp_path / "s8_backdate_draft_create.json").exists()
     assert (tmp_path / "s8_backdate_issue_lookup.json").exists()
+
+
+FALLBACK_NAME = "Người mua không lấy hóa đơn"
+FILLED_ADDRESS = "SYNTHETIC PROVIDER ADDRESS"
+
+
+class FakeBuyerProvider:
+    """Issues invoices at once and echoes the buyer, optionally filling a default address."""
+
+    def __init__(
+        self,
+        *,
+        reject: tuple[bool, bool] = (False, False),
+        fill_address: tuple[bool, bool] = (False, False),
+        fail_create: dict[int, object] | None = None,
+    ) -> None:
+        self.reject = reject
+        self.fill_address = fill_address
+        self.fail_create = fail_create or {}
+        self.create_bodies: list[dict] = []
+        self.invoices: dict[str, dict] = {}
+
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self.handle)
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        setup = token_or_account(request)
+        if setup:
+            return setup
+        path = request.url.path
+        if path == "/v1/invoices/create":
+            body = json.loads(request.content)
+            index = len(self.create_bodies)
+            self.create_bodies.append(body)
+            failure = self.fail_create.get(index)
+            if isinstance(failure, Exception):
+                raise failure
+            if isinstance(failure, int):
+                return httpx.Response(failure, json={"success": False})
+            if self.reject[index]:
+                return httpx.Response(
+                    422, json={"success": False, "error": {"code": "BUYER_ADDRESS_REQUIRED"}}
+                )
+            buyer = dict(body["buyer"])
+            if self.fill_address[index]:
+                buyer["address"] = FILLED_ADDRESS
+            reference = body["reference_code"]
+            self.invoices[reference] = {
+                "reference_code": reference,
+                "status": "issued",
+                "invoice_number": str(1000 + index),
+                "issued_date": "2026-10-20",
+                "buyer": buyer,
+            }
+            return httpx.Response(202, json={"success": True, "data": {"tracking_code": reference}})
+        if path.startswith("/v1/invoices/create/check/"):
+            invoice = self.invoices[path.rsplit("/", 1)[-1]]
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "data": {
+                        "status": "Success",
+                        "reference_code": invoice["reference_code"],
+                        "invoice": invoice,
+                    },
+                },
+            )
+        if path.startswith("/v1/invoices/"):
+            invoice = self.invoices.get(path.rsplit("/", 1)[-1])
+            if invoice is None:
+                return httpx.Response(404, json={"success": False})
+            return httpx.Response(200, json={"success": True, "data": invoice})
+        raise AssertionError(path)
+
+
+def run_s9(fake: FakeBuyerProvider, out_dir: Path | None = None) -> dict:
+    with ProbeClient(ENV, fake.transport()) as probe:
+        return s9_fallback_buyer_address(
+            probe,
+            tax_rate=8,
+            issued_date=ISSUED,
+            buyer_name=FALLBACK_NAME,
+            account=ACCOUNT,
+            out_dir=out_dir,
+        )
+
+
+def test_s9_sends_exactly_two_creates_with_omitted_and_empty_address(tmp_path: Path) -> None:
+    fake = FakeBuyerProvider()
+    result = run_s9(fake, tmp_path)
+    assert [body["buyer"] for body in fake.create_bodies] == [
+        {"name": FALLBACK_NAME},
+        {"name": FALLBACK_NAME, "address": ""},
+    ]
+    assert all(body["is_draft"] is False for body in fake.create_bodies)
+    assert result["create_count"] == 2 and result["run_complete"] is True
+    assert result["variant_omitted"] == {
+        "outcome": "issued",
+        "invoice_number_valid": True,
+        "check_address": {"path": "body.data.invoice.buyer.address", "state": "missing"},
+        "lookup_address": {"path": "body.data.buyer.address", "state": "missing"},
+        "error": None,
+    }
+    assert result["variant_empty"]["check_address"]["state"] == "empty"
+    assert result["variant_empty"]["lookup_address"]["state"] == "empty"
+    assert result["address_rule"] == "omit"
+    for name in (
+        "buyer_address_omitted_create",
+        "buyer_address_omitted_check",
+        "buyer_address_omitted_lookup",
+        "buyer_address_empty_create",
+        "buyer_address_empty_check",
+        "buyer_address_empty_lookup",
+    ):
+        assert (tmp_path / f"{name}.json").exists(), name
+    empty_lookup = json.loads((tmp_path / "buyer_address_empty_lookup.json").read_text())
+    assert empty_lookup["body"]["data"]["buyer"] == {"name": "REDACTED", "address": ""}
+    omitted_check = json.loads((tmp_path / "buyer_address_omitted_check.json").read_text())
+    assert "address" not in omitted_check["body"]["data"]["invoice"]["buyer"]
+
+
+def test_s9_records_rejection_without_retry() -> None:
+    fake = FakeBuyerProvider(reject=(True, False))
+    result = run_s9(fake)
+    assert len(fake.create_bodies) == 2
+    assert len({body["reference_code"] for body in fake.create_bodies}) == 2
+    assert fake.create_bodies[1]["buyer"] == {"name": FALLBACK_NAME, "address": ""}
+    assert result["variant_omitted"]["outcome"] == "rejected"
+    assert result["variant_omitted"]["error"] == {
+        "http_status": 422,
+        "error_code": "BUYER_ADDRESS_REQUIRED",
+    }
+    assert result["variant_omitted"]["lookup_address"]["state"] == "unobserved"
+    assert result["create_count"] == 2 and result["run_complete"] is True
+    assert result["address_rule"] == "empty_string"
+
+
+@pytest.mark.parametrize(
+    ("reject", "expected"),
+    [
+        ((False, False), "omit"),
+        ((False, True), "omit"),
+        ((True, False), "empty_string"),
+        ((True, True), "neither"),
+    ],
+    ids=["both-issued", "omitted-only", "empty-only", "both-rejected"],
+)
+def test_s9_rule_matrix_four_accept_combinations(reject, expected) -> None:
+    fake = FakeBuyerProvider(reject=reject)
+    result = run_s9(fake)
+    assert len(fake.create_bodies) == 2
+    outcomes = [result[key]["outcome"] for key in ("variant_omitted", "variant_empty")]
+    assert outcomes == ["rejected" if flag else "issued" for flag in reject]
+    assert result["run_complete"] is True
+    assert result["address_rule"] == expected
+
+
+@pytest.mark.parametrize(
+    ("fill_address", "expected"),
+    [((True, False), "empty_string"), ((True, True), "neither")],
+    ids=["omitted-filled", "both-filled"],
+)
+def test_s9_provider_filled_address_does_not_choose_omit(fill_address, expected, tmp_path) -> None:
+    fake = FakeBuyerProvider(fill_address=fill_address)
+    result = run_s9(fake, tmp_path)
+    assert result["variant_omitted"]["outcome"] == "issued"
+    assert result["variant_omitted"]["check_address"]["state"] == "nonempty"
+    assert result["variant_omitted"]["lookup_address"]["state"] == "nonempty"
+    assert result["address_rule"] == expected
+    saved = "".join(path.read_text(encoding="utf-8") for path in tmp_path.glob("*.json"))
+    assert FILLED_ADDRESS not in saved
+
+
+@pytest.mark.parametrize(
+    ("fail_create", "creates", "stopped"),
+    [
+        ({0: 401}, 1, "HTTP 401"),
+        ({1: httpx.ReadTimeout("read timed out")}, 2, "ReadTimeout"),
+        ({0: 503}, 1, "HTTP 503"),
+    ],
+    ids=["auth-on-first-create", "timeout-on-second-create", "server-error-on-first-create"],
+)
+def test_s9_auth_or_infra_failure_is_inconclusive_with_at_most_two_calls(
+    fail_create, creates, stopped
+) -> None:
+    fake = FakeBuyerProvider(fail_create=fail_create)
+    result = run_s9(fake)
+    assert len(fake.create_bodies) == creates
+    assert result["create_count"] == creates <= 2
+    assert result["run_complete"] is False
+    assert result["address_rule"] == "inconclusive"
+    assert stopped in result["stopped"]
+    failed = "variant_omitted" if 0 in fail_create else "variant_empty"
+    assert result[failed]["outcome"] == "inconclusive"
+    assert result[failed]["lookup_address"]["state"] == "unobserved"
+    if failed == "variant_empty":
+        assert result["variant_omitted"]["outcome"] == "issued"
+    else:
+        assert result["variant_empty"]["outcome"] == "inconclusive"

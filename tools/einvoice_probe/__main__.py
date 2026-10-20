@@ -23,6 +23,7 @@ from .scenarios import (
     s6_quota,
     s7_draft_then_issue,
     s8_draft_cross_day,
+    s9_fallback_buyer_address,
     tax_matrix,
     write_json,
 )
@@ -50,6 +51,7 @@ def main() -> int:
             "s6",
             "s7",
             "s8",
+            "s9",
             "evidence",
             "error_401",
             "error_422",
@@ -77,6 +79,9 @@ def main() -> int:
         type=_issued_date,
         help="s8 --phase backdate only: past YYYY-MM-DD HH:mm:ss for the draft",
     )
+    parser.add_argument(
+        "--buyer-name", help="s9 only: fallback buyer name sent with no other buyer field"
+    )
     parser.add_argument("--template-code", help="select a template when the account offers several")
     parser.add_argument("--invoice-series", help="select a series when the account offers several")
     args = parser.parse_args()
@@ -97,13 +102,15 @@ def main() -> int:
             )
             else 2
         )
-    needed_tax = args.command in {"s1", "s2", "s3", "s4", "s7", "evidence"} or (
+    needed_tax = args.command in {"s1", "s2", "s3", "s4", "s7", "s9", "evidence"} or (
         args.command == "s8" and args.phase in {"create", "backdate"}
     )
     if needed_tax and args.tax_rate is None:
         parser.error("--tax-rate is required for invoice scenarios")
     if (needed_tax or args.command == "s8") and args.issued_date is None:
         parser.error("--issued-date is required for invoice scenarios")
+    if args.command == "s9" and not args.buyer_name:
+        parser.error("--buyer-name is required for s9")
     if args.command == "s8":
         if args.phase is None:
             parser.error("--phase is required for s8")
@@ -174,6 +181,16 @@ def main() -> int:
             except (SameDayError, FileExistsError) as refused:
                 print(refused, file=sys.stderr)
                 return 2
+        elif args.command == "s9":
+            result = s9_fallback_buyer_address(
+                client,
+                tax_rate=args.tax_rate,
+                issued_date=args.issued_date,
+                buyer_name=args.buyer_name,
+                template_code=args.template_code,
+                invoice_series=args.invoice_series,
+                out_dir=output_dir,
+            )
         elif args.command == "error_401":
             result = error_401(client)
         elif args.command == "error_422":

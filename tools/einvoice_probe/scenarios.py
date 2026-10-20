@@ -15,6 +15,8 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+import httpx
+
 from . import client as client_module
 from .candidates import CANDIDATES
 from .client import ProbeClient
@@ -48,6 +50,11 @@ PENDING_REFERENCE_LIMIT = 3
 PENDING_STATES = frozenset({"pending", "processing"})
 STOP_STATUSES = frozenset({401, 403})
 S8_PHASES = ("create", "issue", "backdate")
+# Fallback buyer address probe: the two forms of an empty address, in the order they are sent.
+S9_VARIANTS = (("variant_omitted", "omitted"), ("variant_empty", "empty"))
+BLANK_ADDRESS_STATES = frozenset({"missing", "null", "empty"})
+CHECK_ADDRESS_PATH = "body.data.invoice.buyer.address"
+LOOKUP_ADDRESS_PATH = "body.data.buyer.address"
 SAIGON = ZoneInfo("Asia/Ho_Chi_Minh")
 # theo-doi-trang-thai-phat-hanh-hoa-don: the outcome is unknown; SePay says not to resend.
 UNCONFIRMED_RESULT_MESSAGE = (
@@ -1481,6 +1488,196 @@ def _s8_backdate(
     result["classifier_paths"]["backdate_issued_date_on_issue"] = (
         f"s8_backdate_issue_lookup.json:{LOOKUP_PATHS['issued_date']}"
     )
+
+
+def s9_fallback_buyer_address(
+    client: ProbeClient,
+    *,
+    tax_rate: int | str,
+    issued_date: str,
+    buyer_name: str,
+    template_code: str | None = None,
+    invoice_series: str | None = None,
+    account: dict[str, str] | None = None,
+    out_dir: str | Path | None = None,
+    sleep: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> dict[str, Any]:
+    """Issue one invoice per empty-address form and read the address back after issue.
+
+    A complete run sends exactly two creates. Any outcome that is not decisive stops the run
+    with no retry and no further create, so a partial run never yields a usable rule.
+    """
+    pace = dict(zip(("sleep", "clock"), _pace_functions(sleep, clock), strict=True))
+    account = account or select_provider_account(
+        accounts(client), client, template_code=template_code, invoice_series=invoice_series
+    )
+    recorder = _Recorder(out_dir)
+    result: dict[str, Any] = {
+        "issued_date": issued_date,
+        "create_count": 0,
+        "details": {},
+        "classifier_paths": {
+            "outcome": f"buyer_address_*_create.json:status+{ERROR_CODE_PATH}"
+            f"|buyer_address_*_check.json:{JOB_STATE_PATH}",
+            "invoice_number": f"buyer_address_*_check.json:{CHECK_PATHS['invoice_number']}",
+            "check_address": f"buyer_address_*_check.json:{CHECK_ADDRESS_PATH}",
+            "lookup_address": f"buyer_address_*_lookup.json:{LOOKUP_ADDRESS_PATH}",
+        },
+    }
+    for key, _ in S9_VARIANTS:
+        result[key] = _s9_unobserved("inconclusive")
+    for key, form in S9_VARIANTS:
+        buyer: dict[str, str] = {"name": buyer_name}
+        if form == "empty":
+            buyer["address"] = ""
+        payload = _invoice_payload(str(uuid4()), tax_rate, issued_date, account, is_draft=False)
+        payload["buyer"] = buyer
+        result["create_count"] += 1
+        prefix = f"buyer_address_{form}"
+        variant, detail, stop = _s9_variant(client, recorder, prefix, payload, pace)
+        result[key] = variant
+        result["details"][key] = detail
+        if stop:
+            result["stopped"] = detail.get("stop_reason")
+            break
+    result["run_complete"] = all(
+        result[key]["outcome"] in {"issued", "rejected"} for key, _ in S9_VARIANTS
+    )
+    result["address_rule"] = _address_rule(
+        result["variant_omitted"], result["variant_empty"], result["run_complete"]
+    )
+    result["steps"] = [record["name"] for record in recorder.records]
+    result["records"] = recorder.records
+    return result
+
+
+def _s9_unobserved(outcome: str) -> dict[str, Any]:
+    return {
+        "outcome": outcome,
+        "invoice_number_valid": False,
+        "check_address": {"path": CHECK_ADDRESS_PATH, "state": "unobserved"},
+        "lookup_address": {"path": LOOKUP_ADDRESS_PATH, "state": "unobserved"},
+        "error": None,
+    }
+
+
+def _s9_variant(
+    client: ProbeClient,
+    recorder: _Recorder,
+    prefix: str,
+    payload: dict[str, Any],
+    pace: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    """One create, its final check and a lookup; returns (variant, detail, stop the run)."""
+    reference = payload["reference_code"]
+    variant = _s9_unobserved("inconclusive")
+    detail: dict[str, Any] = {"reference": reference, "buyer_fields": sorted(payload["buyer"])}
+    check_paths = {**CHECK_PATHS, "address": CHECK_ADDRESS_PATH}
+    lookup_paths = {**LOOKUP_PATHS, "address": LOOKUP_ADDRESS_PATH}
+    try:
+        created = recorder.record(
+            f"{prefix}_create", _call(client, "create", payload=payload), CREATE_PATHS
+        )
+        status, code = created["status"], _error_code(created)
+        detail["create"] = {"http_status": status, "error_code": code}
+        tracking = _at(created, "body.data.tracking_code")
+        if 400 <= status < 500 and status != 429 and code:
+            variant.update(outcome="rejected", error={"http_status": status, "error_code": code})
+        elif not (_ok(created) and tracking):
+            variant["error"] = {"http_status": status, "error_code": code}
+            detail["stop_reason"] = f"create returned HTTP {status} without a usable tracking code"
+            return variant, detail, True
+        else:
+            polls, exhausted = recorder.poll(
+                f"{prefix}_check",
+                lambda: _call(client, "check_create", path_values={"tracking_code": str(tracking)}),
+                _job_done,
+                check_paths,
+                **pace,
+            )
+            final = recorder.alias(
+                f"{prefix}_check", polls[-1], f"{prefix}_check_poll_{len(polls):02d}"
+            )
+            job_state = _job_state(final)
+            detail.update(check_calls=len(polls), poll_exhausted=exhausted, job_state=job_state)
+            variant["check_address"] = {
+                "path": CHECK_ADDRESS_PATH,
+                "state": _address_state(final, CHECK_ADDRESS_PATH),
+            }
+            if exhausted or not _ok(final):
+                variant["error"] = {
+                    "http_status": final["status"],
+                    "error_code": _error_code(final),
+                }
+                detail["stop_reason"] = "create job did not reach a final state"
+                return variant, detail, True
+            if job_state == "failed":
+                variant.update(
+                    outcome="rejected",
+                    error={"http_status": final["status"], "error_code": _error_code(final)},
+                )
+            elif job_state == "success":
+                number = _at(final, CHECK_PATHS["invoice_number"])
+                detail["check_invoice_number_present"] = _has_number(number)
+                variant["invoice_number_valid"] = _has_number(number)
+        lookup = recorder.record(f"{prefix}_lookup", _lookup(client, reference), lookup_paths)
+        detail["lookup"] = {"http_status": lookup["status"], "error_code": _error_code(lookup)}
+        variant["lookup_address"] = {
+            "path": LOOKUP_ADDRESS_PATH,
+            "state": _address_state(lookup, LOOKUP_ADDRESS_PATH),
+        }
+        if variant["outcome"] == "rejected":
+            return variant, detail, lookup["status"] >= 500
+        if variant["invoice_number_valid"] and _ok(lookup):
+            variant["outcome"] = "issued"
+            return variant, detail, False
+        detail["stop_reason"] = "issued invoice could not be confirmed by check and lookup"
+        return variant, detail, True
+    except ProbeStopped as stopped:
+        detail["stop_reason"] = str(stopped)
+    except (httpx.HTTPError, RuntimeError) as failure:
+        detail["stop_reason"] = f"{type(failure).__name__}: {failure}"
+    # A rejection already observed stays decisive; anything else is left inconclusive.
+    return variant, detail, True
+
+
+def _address_state(record: Any, path: str) -> str:
+    """missing / null / empty / nonempty for the address key, or unobserved without a buyer."""
+    if not _ok(record):
+        return "unobserved"
+    *parents, key = path.split(".")
+    parent = record
+    for name in parents:
+        parent = parent.get(name) if isinstance(parent, dict) else None
+    if not isinstance(parent, dict):
+        return "unobserved"
+    if key not in parent:
+        return "missing"
+    value = parent[key]
+    if value is None:
+        return "null"
+    return "empty" if value == "" else "nonempty"
+
+
+def _meets_blank_address_rule(variant: dict[str, Any]) -> bool:
+    """Issued with a valid number and an address that stays blank in both check and lookup."""
+    return (
+        variant["outcome"] == "issued"
+        and variant["invoice_number_valid"] is True
+        and variant["check_address"]["state"] in BLANK_ADDRESS_STATES
+        and variant["lookup_address"]["state"] in BLANK_ADDRESS_STATES
+    )
+
+
+def _address_rule(omitted: dict[str, Any], empty: dict[str, Any], run_complete: bool) -> str:
+    if not run_complete:
+        return "inconclusive"
+    if _meets_blank_address_rule(omitted):
+        return "omit"
+    if _meets_blank_address_rule(empty):
+        return "empty_string"
+    return "neither"
 
 
 def _pace_functions(
