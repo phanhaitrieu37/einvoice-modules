@@ -39,25 +39,34 @@ class Accepted:
     tracking_code: str | None
 
 
+# "draft" is defensive only: invoices are always created and issued in one step, so a
+# draft under one of our references is an anomaly the caller sends to review.
+ProviderState = Literal["pending", "success", "failed", "draft"]
+
+
 @dataclass(frozen=True)
 class ProviderProgress:
-    state: Literal["pending", "success", "failed"]
+    state: ProviderState
     invoice_number: str | None = None
     tax_authority_code: str | None = None
     provider_invoice_id: str | None = None
     next_retry_at: datetime | None = None
     error_code: str | None = None
+    issued_date: date | None = None
+    provider_message: str | None = None
 
 
 @dataclass(frozen=True)
 class ProviderInvoice:
     reference_code: str
-    state: Literal["pending", "success", "failed"]
+    state: ProviderState
     tracking_code: str | None = None
     provider_invoice_id: str | None = None
     invoice_number: str | None = None
     tax_authority_code: str | None = None
     total_amount_vnd: int | None = None
+    issued_date: date | None = None
+    provider_message: str | None = None
 
 
 @dataclass(frozen=True)
@@ -90,7 +99,12 @@ class EInvoiceProvider(Protocol):
         doc: InvoiceDocument,
         reference_code: str,
         issued_date: date,
-    ) -> dict[str, object]: ...
+    ) -> dict[str, object]:
+        """Build a create request that issues in one step (never a provider draft).
+
+        ``issued_date`` is the Asia/Saigon date the caller froze just before sending.
+        """
+        ...
 
     async def check_create(
         self, account: IssuerAccountView, creds: ClientCredentials, tracking_code: str
