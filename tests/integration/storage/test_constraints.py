@@ -1090,7 +1090,7 @@ def _approval(reference_code: str, **over: object) -> dict[str, object]:
 
 def _frozen_request() -> dict[str, object]:
     return {
-        "request": {"is_draft": True},
+        "request": {},
         "request_frozen_at": _now(),
         "issued_date": _now().date(),
     }
@@ -1481,6 +1481,7 @@ async def _stored_send_markers(rows: Rows, document_id: object) -> tuple[object,
         (_SENT, 2, 2, _SENT),
         (_SENT, 2, 3, None),
         (_SENT, 3, 3, _SENT),
+        (_SENT, 3, 4, None),
         (None, 0, 1, None),
         (_SENT, 1, 1, None),
     ],
@@ -1503,6 +1504,16 @@ async def test_send_markers_valid_combinations(
     async with rows.conn.begin_nested():
         await rows.conn.execute(table.update().where(table.c.id == fresh["id"]).values(**markers))
     assert await _stored_send_markers(rows, fresh["id"]) == tuple(markers.values())
+
+
+@pytest.mark.parametrize("column", ["post_count", "post_limit"])
+async def test_null_post_counter_rejected(rows: Rows, column: str) -> None:
+    acc = await account(rows)
+    values = _frozen(acc, status="queued", queued_at=_now()) | {column: None}
+    with pytest.raises(IntegrityError) as caught:
+        await rows.insert(rows.tables.documents, rows.document_row(**values))
+    cause = caught.value.orig.__cause__
+    assert (cause.sqlstate, cause.column_name) == ("23502", column)
 
 
 async def _expect_send_marker_violation(
