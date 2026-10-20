@@ -85,11 +85,22 @@ def test_draft_and_issue_fixtures_hold_no_real_identifiers() -> None:
     "name",
     ["draft_check.json", "issue_accepted.json", "buyer_address_empty_create.json"],
 )
-def test_draft_fixture_scan_rejects_a_real_tracking_code(tmp_path, monkeypatch, name) -> None:
+@pytest.mark.parametrize(
+    ("key", "identifier"),
+    [
+        ("tracking_code", "084e179d-d95a-11f0-aef4-52c7e9b4f41b"),
+        # A version 4 UUID, the form of the reference codes the probe sends.
+        ("reference_code", "6f1c2e8a-3b5d-4c7e-9a10-2d4b8e6f0c13"),
+    ],
+    ids=["v1-tracking-code", "v4-reference-code"],
+)
+def test_draft_fixture_scan_rejects_a_real_tracking_code(
+    tmp_path, monkeypatch, name, key, identifier
+) -> None:
     fixture_dir = tmp_path / "fixtures"
     fixture_dir.mkdir()
     (fixture_dir / name).write_text(
-        '{"body":{"data":{"tracking_code":"084e179d-d95a-11f0-aef4-52c7e9b4f41b"}}}\n',
+        '{"body":{"data":{"' + key + '":"' + identifier + '"}}}\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(sys.modules[__name__], "FIXTURE_DIR", fixture_dir)
