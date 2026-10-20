@@ -1637,6 +1637,12 @@ def _s9_variant(
                 return variant, detail, True
             return variant, detail, False
         if variant["invoice_number_valid"] and _ok(lookup):
+            if "unobserved" in {
+                variant[key]["state"] for key in ("check_address", "lookup_address")
+            }:
+                # No buyer object to read the address from: the rule cannot use this variant.
+                detail["stop_reason"] = "issued invoice showed no buyer object in check or lookup"
+                return variant, detail, True
             variant["outcome"] = "issued"
             return variant, detail, False
         detail["stop_reason"] = "issued invoice could not be confirmed by check and lookup"

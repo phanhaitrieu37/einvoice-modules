@@ -10,9 +10,13 @@ import pytest
 
 from tools.einvoice_probe.client import ProbeClient
 from tools.einvoice_probe.scenarios import (
+    CHECK_PATHS,
     SameDayError,
+    _draft_marker,
     _invoice_payload,
+    _issue_idempotency,
     _issue_payload,
+    _pending_marker,
     record_call,
     s1_create_poll,
     s2_duplicate_reference,
@@ -167,6 +171,8 @@ class FakeSepay:
         issue_error: tuple[int, str | None] | None = None,
         check_create_unknown: frozenset[str] = frozenset(),
         check_create_identity: dict[str, str] | None = None,
+        create_ignores_draft: bool = False,
+        lookup_status: int = 200,
     ) -> None:
         self.pending_checks = list(pending_checks)
         self.draft_quota_cost = draft_quota_cost
@@ -184,6 +190,8 @@ class FakeSepay:
         self.issue_error = issue_error
         self.check_create_unknown = check_create_unknown
         self.check_create_identity = check_create_identity or {}
+        self.create_ignores_draft = create_ignores_draft
+        self.lookup_status = lookup_status
         self.quota = 1000
         self.next_number = 307700
         self.invoices: dict[str, dict] = {}
@@ -218,7 +226,7 @@ class FakeSepay:
         reference = body["reference_code"]
         if reference in self.invoices:
             return error(409, "EINVOICE_DOCUMENT_EXISTED")
-        draft = body["is_draft"]
+        draft = body["is_draft"] and not self.create_ignores_draft
         self.invoices[reference] = {
             "status": "draft" if draft else "issued",
             "number": None if draft else self.number(),
@@ -242,6 +250,19 @@ class FakeSepay:
         if invoice["status"] == "issuing":
             if self.resend_while_pending == "accepted":
                 return accepted_issue(invoice["tracking"])
+            if self.resend_while_pending == "new_tracking":
+                # A fresh tracking code for the resend, with the reference echoed back.
+                return ok({"tracking_code": f"resend-{reference}", "reference_code": reference})
+            if self.resend_while_pending == "rejected":
+                # Rejected, though the body still names the same reference.
+                return httpx.Response(
+                    422,
+                    json={
+                        "success": False,
+                        "error": {"code": "EINVOICE_ISSUE_IN_PROGRESS", "message": "probe"},
+                        "data": {"reference_code": reference},
+                    },
+                )
             return error(409, "EINVOICE_ISSUE_IN_PROGRESS")
         if invoice["status"] == "issued":
             if self.after_issued == "renumber":
@@ -306,6 +327,9 @@ class FakeSepay:
             shown["invoice_number"] = None
         if self.lookup_hides_issued_date:
             shown["issued_date"] = None
+        if self.lookup_status != 200:
+            # The body keeps the invoice data; only the HTTP status says it failed.
+            return httpx.Response(self.lookup_status, json={"success": False, "data": shown})
         return ok(shown)
 
     def invoice(self, reference: str) -> dict:
@@ -503,6 +527,46 @@ def test_s7_resend_without_identity_stays_inconclusive(references) -> None:
     assert result["issue_idempotent"] == "inconclusive"
 
 
+def test_s7_resend_identity_through_the_original_tracking_code(references) -> None:
+    fake = FakeSepay(
+        pending_checks=(2,), issue_tracking_is_reference=False, after_issued="accepted"
+    )
+    result = run_s7(fake)
+    tracking = f"issue-{references[0]}"
+    assert result["issue_tracking_equals_reference"] is False
+    assert result["issue_pending_observed"] is True
+    # Neither answer carries the reference; both carry the first issue's tracking code.
+    assert result["issue_resend_while_pending"]["response_reference"] == tracking
+    assert result["issue_after_issued"]["response_reference"] == tracking
+    assert result["issue_resend_identity_matches"] is True
+    assert result["issue_after_issued_identity_matches"] is True
+    assert result["issue_idempotent"] == "proven"
+
+
+def test_s7_resend_reference_wins_over_a_new_tracking_code(references) -> None:
+    fake = FakeSepay(
+        pending_checks=(2,), resend_while_pending="new_tracking", after_issued="accepted"
+    )
+    result = run_s7(fake)
+    reference = references[0]
+    assert result["issue_resend_while_pending"]["response_reference"] == reference
+    assert result["issue_resend_while_pending"]["path"] == "body.data.reference_code"
+    assert result["issue_resend_identity_matches"] is True
+    assert result["issue_idempotent"] == "proven"
+
+
+def test_s7_rejected_resend_is_not_an_issued_answer(references) -> None:
+    fake = FakeSepay(pending_checks=(2,), resend_while_pending="rejected", after_issued="accepted")
+    result = run_s7(fake)
+    assert result["issue_pending_observed"] is True
+    assert result["issue_resend_while_pending"]["http_status"] == 422
+    assert result["issue_resend_kind"] == "rejected"
+    # Same identity, but a rejection is not an "issued / in progress" answer.
+    assert result["issue_resend_identity_matches"] is True
+    assert result["issue_after_issued_same_invoice"] is True
+    assert result["issue_idempotent"] == "inconclusive"
+
+
 def test_s7_issue_after_issued_classifies_same_invoice(references) -> None:
     fake = FakeSepay(after_issued="conflict")
     result = run_s7(fake)
@@ -663,6 +727,64 @@ def test_s7_neither_check_path_recovers(references) -> None:
     assert result["classifier_paths"]["recover_by_check_reference"].startswith(
         "issue_recovered_check.json|issue_recovered_check_create.json:"
     )
+
+
+@pytest.mark.parametrize(
+    ("status", "state", "expected"),
+    [
+        (200, "Pending", {"path": "body.data.status", "value": "Pending"}),
+        (200, "processing", {"path": "body.data.status", "value": "processing"}),
+        (200, "Success", None),
+        (500, "Pending", None),
+        (404, "Processing", None),
+    ],
+    ids=["pending", "processing", "finished", "server-error", "not-found"],
+)
+def test_pending_is_read_only_from_a_successful_probe(status, state, expected) -> None:
+    record = {"status": status, "body": {"data": {"status": state}}}
+    assert _pending_marker(record) == expected
+
+
+@pytest.mark.parametrize(
+    ("status", "number", "expected"),
+    [
+        ("draft", "0", {"path": "body.data.invoice.status", "value": "draft"}),
+        ("Draft", "0", {"path": "body.data.invoice.status", "value": "Draft"}),
+        ("issued", "307701", None),
+        ("Issued", "307701", None),
+        ("ISSUED", "307701", None),
+    ],
+    ids=["draft", "capitalised-draft", "issued", "capitalised-issued", "upper-issued"],
+)
+def test_draft_marker_ignores_the_case_of_issued(status, number, expected) -> None:
+    invoice = {"status": status, "invoice_number": number}
+    record = {"status": 200, "body": {"data": {"status": "Success", "invoice": invoice}}}
+    assert _draft_marker(record, CHECK_PATHS) == expected
+
+
+@pytest.mark.parametrize(
+    ("numbers", "expected"),
+    [
+        (["307701", "307701", "307701"], "proven"),
+        ([None, "0", ""], "inconclusive"),
+        ([], "inconclusive"),
+        (["307701", "307702"], "not_idempotent"),
+    ],
+    ids=["one-number", "no-number", "nothing-read", "two-numbers"],
+)
+def test_proven_needs_exactly_one_number_on_the_pending_reference(numbers, expected) -> None:
+    same_identity = {"kind": "accepted", "identity_matches": True}
+    pending = {
+        "pending": {"path": "body.data.status", "value": "Pending"},
+        "resend": same_identity,
+        "numbers": numbers,
+    }
+    result = {
+        "issue_after_issued_kind": "conflict",
+        "issue_after_issued_identity_matches": True,
+        "issue_after_issued_same_invoice": True,
+    }
+    assert _issue_idempotency(result, [pending]) == expected
 
 
 SAIGON = ZoneInfo("Asia/Ho_Chi_Minh")
@@ -870,6 +992,46 @@ def test_s8_lookup_number_without_issued_date_is_inconclusive(tmp_path: Path) ->
     assert result["issue_accepts_issued_date"] == "inconclusive"
 
 
+def test_s8_issue_phase_flags_a_date_on_neither_day(tmp_path: Path) -> None:
+    fake = FakeSepay(issue_date_mode="issue_day", issue_day="2026-10-09")
+    references_file = created_drafts(tmp_path, fake)
+    result = run_s8(fake, "issue", DAY_D1, issued_date=ISSUED_D1, references_file=references_file)
+    assert result["issue_a"]["issued"] is True
+    assert result["issue_a"]["issued_on"] == "2026-10-09"
+    assert result["run_on"] == "2026-10-08" and result["created_on"] == "2026-10-07"
+    # Neither the run day nor the draft day: no G7 branch may be picked from it.
+    assert result["issued_date_on_issue"] == "other_day"
+
+
+def test_s8_create_phase_skips_references_for_an_invoice_issued_at_once(tmp_path: Path) -> None:
+    fake = FakeSepay(create_ignores_draft=True)
+    references_file = tmp_path / "s8-references.json"
+    result = run_s8(fake, "create", DAY_D, issued_date=ISSUED, references_file=references_file)
+    for draft in result["drafts"]:
+        assert draft["accepted"] is True
+        assert draft["job_state"] == "Success"
+        assert draft["draft_marker"] is None
+    assert result["references_written"] is False
+    assert not references_file.exists()
+
+
+def test_s8_lookup_failure_with_body_data_is_not_issued(tmp_path: Path) -> None:
+    fake = FakeSepay(issue_day="2026-10-08")
+    references_file = created_drafts(tmp_path, fake)
+    fake.lookup_status = 500
+    result = run_s8(fake, "issue", DAY_D1, issued_date=ISSUED_D1, references_file=references_file)
+    for key in ("issue_a", "issue_b"):
+        outcome = result[key]
+        assert outcome["job_state"] == "success"
+        # The failed lookup still shows a number and a date; neither may count.
+        assert outcome["invoice_number"] not in (None, "", "0")
+        assert outcome["issued_on"] == "2026-10-08"
+        assert outcome["rejected"] is False
+        assert outcome["issued"] is False
+    assert result["issued_date_on_issue"] == "inconclusive"
+    assert result["issue_accepts_issued_date"] == "inconclusive"
+
+
 def test_s8_backdate_recorded_separately(tmp_path: Path) -> None:
     fake = FakeSepay(issue_date_mode="draft_day")
     draft_date = "2026-10-06 09:00:00"
@@ -901,7 +1063,8 @@ class FakeBuyerProvider:
     a string fills the address, ``None`` shows ``null``. ``address_key`` and ``buyer_key``
     rename the address key and its parent in both views. ``job_state``, ``invoice_number``
     and ``lookup_status`` override the check state, the check number and the lookup status
-    per create index.
+    per create index; ``check_status`` overrides the check HTTP status. ``no_buyer`` drops
+    the buyer object from one view: ``"null"`` shows ``buyer: null``, ``"absent"`` removes it.
     """
 
     def __init__(
@@ -916,6 +1079,8 @@ class FakeBuyerProvider:
         job_state: dict[int, str] | None = None,
         invoice_number: dict[int, str] | None = None,
         lookup_status: dict[int, int] | None = None,
+        check_status: dict[int, int] | None = None,
+        no_buyer: dict[tuple[int, str], str] | None = None,
     ) -> None:
         self.reject = reject
         self.fill_address = fill_address
@@ -926,6 +1091,8 @@ class FakeBuyerProvider:
         self.job_state = job_state or {}
         self.invoice_number = invoice_number or {}
         self.lookup_status = lookup_status or {}
+        self.check_status = check_status or {}
+        self.no_buyer = no_buyer or {}
         self.create_bodies: list[dict] = []
         self.invoices: dict[str, dict] = {}
         self.requests: list[str] = []
@@ -973,6 +1140,8 @@ class FakeBuyerProvider:
             self.requests.append("check")
             stored = self.invoices[path.rsplit("/", 1)[-1]]
             index, invoice = stored["index"], self.view(stored, "check")
+            if index in self.check_status:
+                return httpx.Response(self.check_status[index], json={"success": False})
             if index in self.invoice_number:
                 invoice["invoice_number"] = self.invoice_number[index]
             data = {"status": self.job_state.get(index, "Success")}
@@ -996,6 +1165,10 @@ class FakeBuyerProvider:
             invoice["buyer"].pop("address", None)
             invoice["buyer"][self.address_key] = self.shown[key]
         invoice[self.buyer_key] = invoice.pop("buyer")
+        if self.no_buyer.get(key) == "null":
+            invoice[self.buyer_key] = None
+        elif self.no_buyer.get(key) == "absent":
+            del invoice[self.buyer_key]
         return invoice
 
 
@@ -1270,6 +1443,80 @@ BOTH_VIEWS_NULL = {(0, "check"): None, (0, "lookup"): None, (1, "check"): None, 
             None,
             ["create", "lookup", "create", "check", "lookup"],
         ),
+        (
+            s9_case(shown={(0, "check"): "   ", (0, "lookup"): "   "}),
+            s9_case(outcome="issued", check="nonempty", lookup="nonempty", valid=True, error=None),
+            "empty_string",
+            None,
+            ["create", "check", "lookup"] * 2,
+        ),
+        (
+            s9_case(no_buyer={(0, "check"): "null"}),
+            s9_case(outcome="inconclusive", check="unobserved", lookup="missing", valid=True),
+            "inconclusive",
+            "no buyer object",
+            ["create", "check", "lookup"],
+        ),
+        (
+            s9_case(no_buyer={(0, "check"): "absent"}),
+            s9_case(outcome="inconclusive", check="unobserved", lookup="missing", valid=True),
+            "inconclusive",
+            "no buyer object",
+            ["create", "check", "lookup"],
+        ),
+        (
+            s9_case(no_buyer={(0, "lookup"): "null"}),
+            s9_case(outcome="inconclusive", check="missing", lookup="unobserved", valid=True),
+            "inconclusive",
+            "no buyer object",
+            ["create", "check", "lookup"],
+        ),
+        (
+            s9_case(no_buyer={(0, "lookup"): "absent"}),
+            s9_case(outcome="inconclusive", check="missing", lookup="unobserved", valid=True),
+            "inconclusive",
+            "no buyer object",
+            ["create", "check", "lookup"],
+        ),
+        (
+            s9_case(fail_create={0: (500, "CREATE_INVOICE_DATA_FAIL")}),
+            s9_case(
+                outcome="inconclusive",
+                check="unobserved",
+                lookup="unobserved",
+                valid=False,
+                error={"http_status": 500, "error_code": "CREATE_INVOICE_DATA_FAIL"},
+            ),
+            "inconclusive",
+            "create returned HTTP 500",
+            ["create"],
+        ),
+        (
+            s9_case(job_state={0: "Failed"}, lookup_status={0: 500}),
+            s9_case(
+                outcome="rejected",
+                check="missing",
+                lookup="unobserved",
+                valid=False,
+                error={"http_status": 200, "error_code": None},
+            ),
+            "inconclusive",
+            "lookup returned HTTP 500 after a rejection",
+            ["create", "check", "lookup"],
+        ),
+        (
+            s9_case(check_status={0: 500}),
+            s9_case(
+                outcome="inconclusive",
+                check="unobserved",
+                lookup="unobserved",
+                valid=False,
+                error={"http_status": 500, "error_code": None},
+            ),
+            "inconclusive",
+            "did not reach a final state",
+            ["create", "check"],
+        ),
     ],
     ids=[
         "null-address",
@@ -1287,6 +1534,14 @@ BOTH_VIEWS_NULL = {(0, "check"): None, (0, "lookup"): None, (1, "check"): None, 
         "capitalised-address-key",
         "capitalised-buyer-key",
         "conflict-with-code",
+        "whitespace-address",
+        "check-buyer-null",
+        "check-buyer-absent",
+        "lookup-buyer-null",
+        "lookup-buyer-absent",
+        "server-error-with-code",
+        "job-failed-then-lookup-500",
+        "check-server-error",
     ],
 )
 def test_s9_classifies_each_provider_answer(provider, omitted, rule, stopped, requests) -> None:
