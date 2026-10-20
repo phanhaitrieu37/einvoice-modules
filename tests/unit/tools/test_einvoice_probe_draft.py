@@ -158,6 +158,7 @@ class FakeSepay:
         resend_while_pending: str = "accepted",
         after_issued: str = "conflict",
         lookup_hides_number: frozenset[str] = frozenset(),
+        lookup_hides_issued_date: bool = False,
         issue_date_mode: str = "issue_day",
         issue_day: str = "2026-10-07",
         reject_issue_with_date: bool = False,
@@ -174,6 +175,7 @@ class FakeSepay:
         self.resend_while_pending = resend_while_pending
         self.after_issued = after_issued
         self.lookup_hides_number = lookup_hides_number
+        self.lookup_hides_issued_date = lookup_hides_issued_date
         self.issue_date_mode = issue_date_mode
         self.issue_day = issue_day
         self.reject_issue_with_date = reject_issue_with_date
@@ -302,6 +304,8 @@ class FakeSepay:
         shown = self.invoice(reference)["invoice"]
         if reference in self.lookup_hides_number:
             shown["invoice_number"] = None
+        if self.lookup_hides_issued_date:
+            shown["issued_date"] = None
         return ok(shown)
 
     def invoice(self, reference: str) -> dict:
@@ -838,6 +842,34 @@ def test_s8_issue_server_error_is_inconclusive(tmp_path: Path, issue_error) -> N
     assert result["issue_accepts_issued_date"] == "inconclusive"
 
 
+def test_s8_issue_conflict_is_inconclusive(tmp_path: Path) -> None:
+    fake = FakeSepay(issue_error=(409, "EINVOICE_DOCUMENT_ISSUED"))
+    references_file = created_drafts(tmp_path, fake)
+    result = run_s8(fake, "issue", DAY_D1, issued_date=ISSUED_D1, references_file=references_file)
+    for key in ("issue_a", "issue_b"):
+        assert result[key]["issue"]["http_status"] == 409
+        assert result[key]["issue"]["kind"] == "conflict"
+        assert result[key]["rejected"] is False
+        assert result[key]["issued"] is False
+    assert result["issued_date_on_issue"] == "inconclusive"
+    assert result["issue_accepts_issued_date"] == "inconclusive"
+
+
+def test_s8_lookup_number_without_issued_date_is_inconclusive(tmp_path: Path) -> None:
+    fake = FakeSepay(issue_day="2026-10-08", lookup_hides_issued_date=True)
+    references_file = created_drafts(tmp_path, fake)
+    result = run_s8(fake, "issue", DAY_D1, issued_date=ISSUED_D1, references_file=references_file)
+    for key in ("issue_a", "issue_b"):
+        outcome = result[key]
+        assert outcome["job_state"] == "success"
+        assert outcome["invoice_number"] not in (None, "", "0")
+        assert outcome["issued_on"] is None
+        assert outcome["rejected"] is False
+        assert outcome["issued"] is False
+    assert result["issued_date_on_issue"] == "inconclusive"
+    assert result["issue_accepts_issued_date"] == "inconclusive"
+
+
 def test_s8_backdate_recorded_separately(tmp_path: Path) -> None:
     fake = FakeSepay(issue_date_mode="draft_day")
     draft_date = "2026-10-06 09:00:00"
@@ -866,7 +898,8 @@ class FakeBuyerProvider:
     """Issues invoices at once and echoes the buyer, optionally filling a default address.
 
     ``shown`` overrides what one view returns, keyed by (create index, "check" | "lookup"):
-    a string fills the address, ``None`` shows ``null``. ``job_state``, ``invoice_number``
+    a string fills the address, ``None`` shows ``null``. ``address_key`` and ``buyer_key``
+    rename the address key and its parent in both views. ``job_state``, ``invoice_number``
     and ``lookup_status`` override the check state, the check number and the lookup status
     per create index.
     """
@@ -879,6 +912,7 @@ class FakeBuyerProvider:
         fail_create: dict[int, object] | None = None,
         shown: dict[tuple[int, str], str | None] | None = None,
         address_key: str = "address",
+        buyer_key: str = "buyer",
         job_state: dict[int, str] | None = None,
         invoice_number: dict[int, str] | None = None,
         lookup_status: dict[int, int] | None = None,
@@ -888,6 +922,7 @@ class FakeBuyerProvider:
         self.fail_create = fail_create or {}
         self.shown = shown or {}
         self.address_key = address_key
+        self.buyer_key = buyer_key
         self.job_state = job_state or {}
         self.invoice_number = invoice_number or {}
         self.lookup_status = lookup_status or {}
@@ -960,6 +995,7 @@ class FakeBuyerProvider:
         if key in self.shown:
             invoice["buyer"].pop("address", None)
             invoice["buyer"][self.address_key] = self.shown[key]
+        invoice[self.buyer_key] = invoice.pop("buyer")
         return invoice
 
 
@@ -1214,6 +1250,26 @@ BOTH_VIEWS_NULL = {(0, "check"): None, (0, "lookup"): None, (1, "check"): None, 
             None,
             ["create", "check", "lookup"] * 2,
         ),
+        (
+            s9_case(buyer_key="Buyer", shown={(0, "check"): FILLED_ADDRESS}),
+            s9_case(outcome="issued", check="nonempty", lookup="missing", valid=True, error=None),
+            "empty_string",
+            None,
+            ["create", "check", "lookup"] * 2,
+        ),
+        (
+            s9_case(fail_create={0: (409, "EINVOICE_DOCUMENT_EXISTED")}),
+            s9_case(
+                outcome="rejected",
+                check="unobserved",
+                lookup="unobserved",
+                valid=False,
+                error={"http_status": 409, "error_code": "EINVOICE_DOCUMENT_EXISTED"},
+            ),
+            "empty_string",
+            None,
+            ["create", "lookup", "create", "check", "lookup"],
+        ),
     ],
     ids=[
         "null-address",
@@ -1229,6 +1285,8 @@ BOTH_VIEWS_NULL = {(0, "check"): None, (0, "lookup"): None, (1, "check"): None, 
         "lookup-5xx-after-success",
         "poll-never-final",
         "capitalised-address-key",
+        "capitalised-buyer-key",
+        "conflict-with-code",
     ],
 )
 def test_s9_classifies_each_provider_answer(provider, omitted, rule, stopped, requests) -> None:

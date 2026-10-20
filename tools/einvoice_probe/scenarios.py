@@ -1439,8 +1439,8 @@ def _s8_issue_one(
         "request_fields": sorted(payload),
         "issue": outcome,
         "job_state": job_state,
-        # A 5xx or unclassified error leaves the outcome open, as in the buyer address probe.
-        "rejected": outcome["kind"] in {"rejected", "conflict"} or job_state == "failed",
+        # A 409, 5xx or unclassified error leaves the outcome open, as in the buyer address probe.
+        "rejected": outcome["kind"] == "rejected" or job_state == "failed",
         "issued": _ok(lookup) and _has_number(number) and bool(issued_date),
         "invoice_number": number,
         "issued_on": str(issued_date)[:10] if issued_date else None,
