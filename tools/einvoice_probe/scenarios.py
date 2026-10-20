@@ -1099,6 +1099,9 @@ def _record_pending_outcome(
     )
     if pending is None:
         result["issue_resend_while_pending"] = None
+        result["classifier_paths"]["issue_resend_while_pending"] = (
+            "issue_resend_pending.json:issue_pending_observed"
+        )
         recorder.alias(
             "issue_resend_pending",
             {"status": None, "issue_pending_observed": False, "attempts": summary},
@@ -1436,7 +1439,8 @@ def _s8_issue_one(
         "request_fields": sorted(payload),
         "issue": outcome,
         "job_state": job_state,
-        "rejected": outcome["kind"] != "accepted" or job_state == "failed",
+        # A 5xx or unclassified error leaves the outcome open, as in the buyer address probe.
+        "rejected": outcome["kind"] in {"rejected", "conflict"} or job_state == "failed",
         "issued": _ok(lookup) and _has_number(number) and bool(issued_date),
         "invoice_number": number,
         "issued_on": str(issued_date)[:10] if issued_date else None,
@@ -1628,7 +1632,10 @@ def _s9_variant(
             "state": _address_state(lookup, LOOKUP_ADDRESS_PATH),
         }
         if variant["outcome"] == "rejected":
-            return variant, detail, lookup["status"] >= 500
+            if lookup["status"] >= 500:
+                detail["stop_reason"] = f"lookup returned HTTP {lookup['status']} after a rejection"
+                return variant, detail, True
+            return variant, detail, False
         if variant["invoice_number_valid"] and _ok(lookup):
             variant["outcome"] = "issued"
             return variant, detail, False
@@ -1649,12 +1656,13 @@ def _address_state(record: Any, path: str) -> str:
     *parents, key = path.split(".")
     parent = record
     for name in parents:
-        parent = parent.get(name) if isinstance(parent, dict) else None
+        parent = _value(parent, name)
     if not isinstance(parent, dict):
         return "unobserved"
-    if key not in parent:
+    present = [value for name, value in parent.items() if str(name).lower() == key.lower()]
+    if not present:
         return "missing"
-    value = parent[key]
+    value = present[0]
     if value is None:
         return "null"
     return "empty" if value == "" else "nonempty"

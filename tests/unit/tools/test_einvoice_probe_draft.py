@@ -162,6 +162,10 @@ class FakeSepay:
         issue_day: str = "2026-10-07",
         reject_issue_with_date: bool = False,
         unknown_code: str = "EINVOICE_DRAFT_NOT_FOUND",
+        issue_job_fails: bool = False,
+        issue_error: tuple[int, str | None] | None = None,
+        check_create_unknown: frozenset[str] = frozenset(),
+        check_create_identity: dict[str, str] | None = None,
     ) -> None:
         self.pending_checks = list(pending_checks)
         self.draft_quota_cost = draft_quota_cost
@@ -174,6 +178,10 @@ class FakeSepay:
         self.issue_day = issue_day
         self.reject_issue_with_date = reject_issue_with_date
         self.unknown_code = unknown_code
+        self.issue_job_fails = issue_job_fails
+        self.issue_error = issue_error
+        self.check_create_unknown = check_create_unknown
+        self.check_create_identity = check_create_identity or {}
         self.quota = 1000
         self.next_number = 307700
         self.invoices: dict[str, dict] = {}
@@ -226,6 +234,9 @@ class FakeSepay:
             return error(500, self.unknown_code)
         if self.reject_issue_with_date and "issued_date" in body:
             return error(422, "INVOICE_DATE_NOT_ALLOWED")
+        if self.issue_error:
+            status, code = self.issue_error
+            return error(status, code) if code else httpx.Response(status, json={"success": False})
         if invoice["status"] == "issuing":
             if self.resend_while_pending == "accepted":
                 return accepted_issue(invoice["tracking"])
@@ -240,6 +251,11 @@ class FakeSepay:
         tracking = reference if self.issue_tracking_is_reference else f"issue-{reference}"
         self.issue_jobs[tracking] = reference
         invoice["tracking"] = tracking
+        if self.issue_job_fails:
+            # Day 2 sandbox shape: the issue is accepted, then the job ends Failed with a
+            # message and no error code, and the invoice keeps the draft date and number "0".
+            invoice["status"] = "failed"
+            return accepted_issue(tracking)
         invoice["pending_left"] = self.pending_checks.pop(0) if self.pending_checks else 0
         self.quota -= self.issue_quota_cost
         if self.issue_date_mode == "issue_day":
@@ -255,15 +271,24 @@ class FakeSepay:
         invoice["number"] = invoice["number"] or self.number()
 
     def check_create(self, reference: str) -> httpx.Response:
-        if reference not in self.invoices:
+        if reference not in self.invoices or (
+            reference in self.check_create_unknown and self.invoices[reference]["tracking"]
+        ):
             return error(404, "NOT_FOUND")
-        return ok({"reference_code": reference, "status": "Success", **self.invoice(reference)})
+        shown = {"reference_code": reference, "status": "Success", **self.invoice(reference)}
+        other = self.check_create_identity.get(reference)
+        if other:
+            shown["reference_code"] = shown["invoice"]["reference_code"] = other
+        return ok(shown)
 
     def check_issue(self, tracking: str) -> httpx.Response:
         reference = self.issue_jobs.get(tracking)
         if reference is None:
             return error(404, "NOT_FOUND")
         invoice = self.invoices[reference]
+        if invoice["status"] == "failed":
+            failed = {"reference_code": reference, "status": "Failed", "message": "probe"}
+            return ok({**failed, **self.invoice(reference)})
         if invoice["pending_left"]:
             invoice["pending_left"] -= 1
             return ok({"reference_code": reference, "status": "Pending", "invoice": None})
@@ -566,6 +591,9 @@ def test_s7_immediate_completion_does_not_prove_pending_idempotency(references) 
     result = run_s7(fake)
     assert result["issue_pending_observed"] is False
     assert result["issue_resend_while_pending"] is None
+    assert result["classifier_paths"]["issue_resend_while_pending"] == (
+        "issue_resend_pending.json:issue_pending_observed"
+    )
     assert result["issue_pending_references_tried"] == 3
     attempt_references = [attempt["reference"] for attempt in result["issue_pending_attempts"]]
     assert len(set(attempt_references)) == 3
@@ -593,6 +621,44 @@ def test_s7_check_by_reference_recovery_recorded_separately(references) -> None:
     )
     lookups = [path for path in fake.paths() if path == f"/v1/invoices/{lost}"]
     assert len(lookups) == 10
+
+
+def test_s7_check_recovery_requires_the_lost_reference_identity(references) -> None:
+    lost = references[1]
+    fake = FakeSepay(
+        issue_tracking_is_reference=False,
+        lookup_hides_number=frozenset({lost}),
+        check_create_identity={lost: references[0]},
+    )
+    result = run_s7(fake)
+    check = result["recovery_by_check"]["check_create"]
+    # The check carries a number and a date, but for another reference.
+    assert check["http_status"] == 200
+    assert check["identity_matches"] is False
+    assert check["recovered"] is False
+    assert result["recover_by_check_reference"] is False
+    assert result["recover_by_check_reference_endpoint"] is None
+
+
+def test_s7_neither_check_path_recovers(references) -> None:
+    lost = references[1]
+    fake = FakeSepay(
+        issue_tracking_is_reference=False,
+        lookup_hides_number=frozenset({lost}),
+        check_create_unknown=frozenset({lost}),
+    )
+    result = run_s7(fake)
+    assert result["recover_after_lost_issue_response"] is False
+    assert {key: value["http_status"] for key, value in result["recovery_by_check"].items()} == {
+        "check_issue": 404,
+        "check_create": 404,
+    }
+    assert not any(value["recovered"] for value in result["recovery_by_check"].values())
+    assert result["recover_by_check_reference"] is False
+    assert result["recover_by_check_reference_endpoint"] is None
+    assert result["classifier_paths"]["recover_by_check_reference"].startswith(
+        "issue_recovered_check.json|issue_recovered_check_create.json:"
+    )
 
 
 SAIGON = ZoneInfo("Asia/Ho_Chi_Minh")
@@ -736,6 +802,42 @@ def test_s8_issue_phase_records_rejections(tmp_path: Path) -> None:
     assert gone["issued_date_on_issue"] == "rejected"
 
 
+def test_s8_issue_job_failed_after_accept_is_rejected(tmp_path: Path) -> None:
+    fake = FakeSepay(issue_job_fails=True, issue_day="2026-10-08")
+    references_file = created_drafts(tmp_path, fake)
+    result = run_s8(fake, "issue", DAY_D1, issued_date=ISSUED_D1, references_file=references_file)
+    for key in ("issue_a", "issue_b"):
+        outcome = result[key]
+        assert outcome["issue"]["kind"] == "accepted"
+        assert outcome["issue"]["error_code"] is None
+        assert outcome["job_state"] == "failed"
+        assert outcome["rejected"] is True
+        assert outcome["issued"] is False
+        assert outcome["invoice_number"] == "0"
+        assert outcome["lookup_status"] == "failed"
+        assert outcome["issued_on"] == "2026-10-07"
+    assert result["issued_date_on_issue"] == "rejected"
+    assert result["issue_accepts_issued_date"] is False
+
+
+@pytest.mark.parametrize(
+    "issue_error",
+    [(503, None), (500, "CREATE_INVOICE_DATA_FAIL")],
+    ids=["unavailable", "unclassified-code"],
+)
+def test_s8_issue_server_error_is_inconclusive(tmp_path: Path, issue_error) -> None:
+    fake = FakeSepay(issue_error=issue_error)
+    references_file = created_drafts(tmp_path, fake)
+    result = run_s8(fake, "issue", DAY_D1, issued_date=ISSUED_D1, references_file=references_file)
+    for key in ("issue_a", "issue_b"):
+        assert result[key]["issue"]["http_status"] == issue_error[0]
+        assert result[key]["issue"]["kind"] == "error"
+        assert result[key]["rejected"] is False
+        assert result[key]["issued"] is False
+    assert result["issued_date_on_issue"] == "inconclusive"
+    assert result["issue_accepts_issued_date"] == "inconclusive"
+
+
 def test_s8_backdate_recorded_separately(tmp_path: Path) -> None:
     fake = FakeSepay(issue_date_mode="draft_day")
     draft_date = "2026-10-06 09:00:00"
@@ -761,7 +863,13 @@ FILLED_ADDRESS = "SYNTHETIC PROVIDER ADDRESS"
 
 
 class FakeBuyerProvider:
-    """Issues invoices at once and echoes the buyer, optionally filling a default address."""
+    """Issues invoices at once and echoes the buyer, optionally filling a default address.
+
+    ``shown`` overrides what one view returns, keyed by (create index, "check" | "lookup"):
+    a string fills the address, ``None`` shows ``null``. ``job_state``, ``invoice_number``
+    and ``lookup_status`` override the check state, the check number and the lookup status
+    per create index.
+    """
 
     def __init__(
         self,
@@ -769,12 +877,23 @@ class FakeBuyerProvider:
         reject: tuple[bool, bool] = (False, False),
         fill_address: tuple[bool, bool] = (False, False),
         fail_create: dict[int, object] | None = None,
+        shown: dict[tuple[int, str], str | None] | None = None,
+        address_key: str = "address",
+        job_state: dict[int, str] | None = None,
+        invoice_number: dict[int, str] | None = None,
+        lookup_status: dict[int, int] | None = None,
     ) -> None:
         self.reject = reject
         self.fill_address = fill_address
         self.fail_create = fail_create or {}
+        self.shown = shown or {}
+        self.address_key = address_key
+        self.job_state = job_state or {}
+        self.invoice_number = invoice_number or {}
+        self.lookup_status = lookup_status or {}
         self.create_bodies: list[dict] = []
         self.invoices: dict[str, dict] = {}
+        self.requests: list[str] = []
 
     def transport(self) -> httpx.MockTransport:
         return httpx.MockTransport(self.handle)
@@ -785,6 +904,7 @@ class FakeBuyerProvider:
             return setup
         path = request.url.path
         if path == "/v1/invoices/create":
+            self.requests.append("create")
             body = json.loads(request.content)
             index = len(self.create_bodies)
             self.create_bodies.append(body)
@@ -793,6 +913,8 @@ class FakeBuyerProvider:
                 raise failure
             if isinstance(failure, int):
                 return httpx.Response(failure, json={"success": False})
+            if isinstance(failure, tuple):
+                return error(*failure)
             if self.reject[index]:
                 return httpx.Response(
                     422, json={"success": False, "error": {"code": "BUYER_ADDRESS_REQUIRED"}}
@@ -802,32 +924,43 @@ class FakeBuyerProvider:
                 buyer["address"] = FILLED_ADDRESS
             reference = body["reference_code"]
             self.invoices[reference] = {
-                "reference_code": reference,
-                "status": "issued",
-                "invoice_number": str(1000 + index),
-                "issued_date": "2026-10-20",
-                "buyer": buyer,
+                "index": index,
+                "invoice": {
+                    "reference_code": reference,
+                    "status": "issued",
+                    "invoice_number": str(1000 + index),
+                    "issued_date": "2026-10-20",
+                    "buyer": buyer,
+                },
             }
             return httpx.Response(202, json={"success": True, "data": {"tracking_code": reference}})
         if path.startswith("/v1/invoices/create/check/"):
-            invoice = self.invoices[path.rsplit("/", 1)[-1]]
-            return httpx.Response(
-                200,
-                json={
-                    "success": True,
-                    "data": {
-                        "status": "Success",
-                        "reference_code": invoice["reference_code"],
-                        "invoice": invoice,
-                    },
-                },
-            )
+            self.requests.append("check")
+            stored = self.invoices[path.rsplit("/", 1)[-1]]
+            index, invoice = stored["index"], self.view(stored, "check")
+            if index in self.invoice_number:
+                invoice["invoice_number"] = self.invoice_number[index]
+            data = {"status": self.job_state.get(index, "Success")}
+            data.update(reference_code=invoice["reference_code"], invoice=invoice)
+            return httpx.Response(200, json={"success": True, "data": data})
         if path.startswith("/v1/invoices/"):
-            invoice = self.invoices.get(path.rsplit("/", 1)[-1])
-            if invoice is None:
+            self.requests.append("lookup")
+            stored = self.invoices.get(path.rsplit("/", 1)[-1])
+            if stored is None:
                 return httpx.Response(404, json={"success": False})
-            return httpx.Response(200, json={"success": True, "data": invoice})
+            status = self.lookup_status.get(stored["index"], 200)
+            if status != 200:
+                return httpx.Response(status, json={"success": False})
+            return httpx.Response(200, json={"success": True, "data": self.view(stored, "lookup")})
         raise AssertionError(path)
+
+    def view(self, stored: dict, where: str) -> dict:
+        invoice = json.loads(json.dumps(stored["invoice"]))
+        key = (stored["index"], where)
+        if key in self.shown:
+            invoice["buyer"].pop("address", None)
+            invoice["buyer"][self.address_key] = self.shown[key]
+        return invoice
 
 
 def run_s9(fake: FakeBuyerProvider, out_dir: Path | None = None) -> dict:
@@ -954,3 +1087,173 @@ def test_s9_auth_or_infra_failure_is_inconclusive_with_at_most_two_calls(
         assert result["variant_omitted"]["outcome"] == "issued"
     else:
         assert result["variant_empty"]["outcome"] == "inconclusive"
+
+
+def s9_case(**kwargs) -> dict:
+    return kwargs
+
+
+BOTH_VIEWS_NULL = {(0, "check"): None, (0, "lookup"): None, (1, "check"): None, (1, "lookup"): None}
+
+
+@pytest.mark.parametrize(
+    ("provider", "omitted", "rule", "stopped", "requests"),
+    [
+        (
+            s9_case(shown=BOTH_VIEWS_NULL),
+            s9_case(outcome="issued", check="null", lookup="null", valid=True, error=None),
+            "omit",
+            None,
+            ["create", "check", "lookup"] * 2,
+        ),
+        (
+            s9_case(shown={(0, "check"): FILLED_ADDRESS}),
+            s9_case(outcome="issued", check="nonempty", lookup="missing", valid=True, error=None),
+            "empty_string",
+            None,
+            ["create", "check", "lookup"] * 2,
+        ),
+        (
+            s9_case(shown={(0, "lookup"): FILLED_ADDRESS}),
+            s9_case(outcome="issued", check="missing", lookup="nonempty", valid=True, error=None),
+            "empty_string",
+            None,
+            ["create", "check", "lookup"] * 2,
+        ),
+        (
+            s9_case(shown={(0, "check"): FILLED_ADDRESS, (0, "lookup"): None}),
+            s9_case(outcome="issued", check="nonempty", lookup="null", valid=True, error=None),
+            "empty_string",
+            None,
+            ["create", "check", "lookup"] * 2,
+        ),
+        (
+            s9_case(job_state={0: "Failed"}, invoice_number={0: "0"}),
+            s9_case(
+                outcome="rejected",
+                check="missing",
+                lookup="missing",
+                valid=False,
+                error={"http_status": 200, "error_code": None},
+            ),
+            "empty_string",
+            None,
+            ["create", "check", "lookup"] * 2,
+        ),
+        (
+            s9_case(job_state={0: "Failed"}, lookup_status={0: 503}),
+            s9_case(
+                outcome="rejected",
+                check="missing",
+                lookup="unobserved",
+                valid=False,
+                error={"http_status": 200, "error_code": None},
+            ),
+            "inconclusive",
+            "lookup returned HTTP 503 after a rejection",
+            ["create", "check", "lookup"],
+        ),
+        (
+            s9_case(fail_create={0: (429, "RATE_LIMITED")}),
+            s9_case(
+                outcome="inconclusive",
+                check="unobserved",
+                lookup="unobserved",
+                valid=False,
+                error={"http_status": 429, "error_code": "RATE_LIMITED"},
+            ),
+            "inconclusive",
+            "create returned HTTP 429",
+            ["create"],
+        ),
+        (
+            s9_case(fail_create={0: 422}),
+            s9_case(
+                outcome="inconclusive",
+                check="unobserved",
+                lookup="unobserved",
+                valid=False,
+                error={"http_status": 422, "error_code": None},
+            ),
+            "inconclusive",
+            "create returned HTTP 422",
+            ["create"],
+        ),
+        (
+            s9_case(invoice_number={0: "0"}),
+            s9_case(outcome="inconclusive", check="missing", lookup="missing", valid=False),
+            "inconclusive",
+            "could not be confirmed",
+            ["create", "check", "lookup"],
+        ),
+        (
+            s9_case(invoice_number={0: ""}),
+            s9_case(outcome="inconclusive", check="missing", lookup="missing", valid=False),
+            "inconclusive",
+            "could not be confirmed",
+            ["create", "check", "lookup"],
+        ),
+        (
+            s9_case(lookup_status={0: 503}),
+            s9_case(outcome="inconclusive", check="missing", lookup="unobserved", valid=True),
+            "inconclusive",
+            "could not be confirmed",
+            ["create", "check", "lookup"],
+        ),
+        (
+            s9_case(job_state={0: "Pending"}),
+            s9_case(outcome="inconclusive", check="missing", lookup="unobserved", valid=False),
+            "inconclusive",
+            "did not reach a final state",
+            None,
+        ),
+        (
+            s9_case(address_key="Address", shown={(0, "check"): FILLED_ADDRESS}),
+            s9_case(outcome="issued", check="nonempty", lookup="missing", valid=True, error=None),
+            "empty_string",
+            None,
+            ["create", "check", "lookup"] * 2,
+        ),
+    ],
+    ids=[
+        "null-address",
+        "filled-in-check-only",
+        "filled-in-lookup-only",
+        "filled-in-check-null-in-lookup",
+        "job-failed",
+        "job-failed-then-lookup-5xx",
+        "rate-limited-with-code",
+        "4xx-without-code",
+        "number-zero",
+        "number-empty",
+        "lookup-5xx-after-success",
+        "poll-never-final",
+        "capitalised-address-key",
+    ],
+)
+def test_s9_classifies_each_provider_answer(provider, omitted, rule, stopped, requests) -> None:
+    fake = FakeBuyerProvider(**provider)
+    result = run_s9(fake)
+    variant = result["variant_omitted"]
+    assert variant["outcome"] == omitted["outcome"]
+    assert variant["check_address"]["state"] == omitted["check"]
+    assert variant["lookup_address"]["state"] == omitted["lookup"]
+    assert variant["invoice_number_valid"] is omitted["valid"]
+    if "error" in omitted:
+        assert variant["error"] == omitted["error"]
+    assert result["address_rule"] == rule
+    assert result["run_complete"] is (stopped is None and rule != "inconclusive")
+    assert result["create_count"] == fake.requests.count("create")
+    if stopped is None:
+        assert "stopped" not in result
+    else:
+        assert stopped in result["stopped"]
+        assert result["variant_empty"]["outcome"] == "inconclusive"
+    if requests is not None:
+        assert fake.requests == requests
+    else:
+        # The job never finished: no lookup and no second create.
+        assert fake.requests.count("create") == 1
+        assert "lookup" not in fake.requests
+        assert result["details"]["variant_omitted"]["poll_exhausted"] is True
+        assert result["details"]["variant_omitted"]["check_calls"] == fake.requests.count("check")
