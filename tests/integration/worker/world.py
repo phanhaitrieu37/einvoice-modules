@@ -183,9 +183,11 @@ class World:
             recorded.document_id, settlement_id, intent_id, host_ref_id, self.merchant_id
         )
 
-    async def settle_again(self, first: Settled, *, amount: int = 100) -> Settled:
+    async def settle_again(
+        self, first: Settled, *, amount: int = 100, intent_id: UUID | None = None
+    ) -> Settled:
         """A second settlement for the same order (a duplicate payment)."""
-        intent_id, settlement_id = uuid4(), uuid4()
+        intent_id, settlement_id = intent_id or uuid4(), uuid4()
         recorded = await self.module.record_settled_payment.execute(
             SettledPayment(
                 event_id=uuid4(),
