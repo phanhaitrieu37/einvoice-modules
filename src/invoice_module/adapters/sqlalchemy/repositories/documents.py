@@ -524,11 +524,14 @@ class DocumentRepository(SqlAlchemyRepository):
         invalidated_by: str,
         reason: str,
         now: datetime,
+        **values: Any,
     ) -> dict[str, Any] | None:
         """Drop an approval and keep it in ``details.previous_approvals`` of the case.
 
         Without ``case_id`` the open case, or else the latest case, of the document holds the
-        audit. Returns the audit entry, or ``None`` when there was no approval.
+        audit. ``values`` are written in the same statement (an ``approved`` document must
+        leave that status as its approval goes). Returns the audit entry, or ``None`` when
+        there was no approval (``values`` are still written).
         """
         table, reviews = self.tables.documents, self.tables.review_cases
         row = (
@@ -541,6 +544,10 @@ class DocumentRepository(SqlAlchemyRepository):
             .one()
         )
         if row["approved_at"] is None:
+            if values:
+                await self.session.execute(
+                    table.update().where(table.c.id == document_id).values(**values)
+                )
             return None
         entry = _approval_entry(row, invalidated_by, reason, now)
         await self.session.execute(
@@ -552,6 +559,7 @@ class DocumentRepository(SqlAlchemyRepository):
                 approved_snapshot_sha256=None,
                 approved_reference_code=None,
                 updated_at=now,
+                **values,
             )
         )
         if case_id is None:

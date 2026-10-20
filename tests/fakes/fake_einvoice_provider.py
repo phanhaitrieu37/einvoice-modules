@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import Counter, deque
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -82,6 +82,8 @@ class FakeInvoice:
     provider_message: str | None = None
     invoice_number: str | None = None
     provider_invoice_id: str | None = None
+    # A failed record that does not consume the reference lets a new create succeed.
+    consumes_reference: bool = True
 
 
 @dataclass
@@ -113,7 +115,9 @@ class FakeEInvoiceProvider:
         self._artifact_failures: Counter[str] = Counter()
         self._gates: dict[str, _Gate] = {}
         self._built: dict[str, tuple[int, date]] = {}
-        self._next_hooks: dict[str, deque[Callable[[], None]]] = {}
+        self._next_hooks: dict[str, deque[Callable[[], Awaitable[None] | None]]] = {}
+        self._prepare_delay: dict[str, deque[timedelta]] = {}
+        self._prepare_hooks: deque[Callable[[], Awaitable[None]]] = deque()
         self._number = 0
 
     # -- scripting -----------------------------------------------------------------------
@@ -178,9 +182,17 @@ class FakeEInvoiceProvider:
         gate.deliver, gate.respond = deliver, respond
         gate.event.set()
 
-    def on_next(self, op: str, hook: Callable[[], None]) -> None:
+    def on_next(self, op: str, hook: Callable[[], Awaitable[None] | None]) -> None:
         """Run ``hook`` once, right after the next ``op`` was answered by the provider."""
         self._next_hooks.setdefault(op, deque()).append(hook)
+
+    def delay_before_send(self, reference_code: str, *delays: timedelta) -> None:
+        """Clock time spent on token and rate limiter before the send-boundary hook runs."""
+        self._prepare_delay.setdefault(reference_code, deque()).extend(delays)
+
+    def on_next_prepare(self, hook: Callable[[], Awaitable[None]]) -> None:
+        """Run ``hook`` once inside the next create, before its send-boundary hook."""
+        self._prepare_hooks.append(hook)
 
     def posts(self, reference_code: str | None = None) -> list[Call]:
         return [
@@ -234,6 +246,10 @@ class FakeEInvoiceProvider:
         reference_code = str(request["reference_code"])
         outcome = self._next_create(reference_code)
         await asyncio.sleep(0)  # token and rate limiter
+        for delay in self._pop(self._prepare_delay, reference_code):
+            self.clock.advance(delay)
+        if self._prepare_hooks:
+            await self._prepare_hooks.popleft()()
         if outcome == AUTH_FAILED_BEFORE_SEND:
             raise ProviderAuthFailed("token request refused")
         if outcome == CRASH_BEFORE_SEND:
@@ -252,36 +268,36 @@ class FakeEInvoiceProvider:
             await gate.event.wait()
             if gate.deliver:
                 self._receive(reference_code, request)
-            self._fire("create")
+            await self._fire("create")
             if gate.respond == "accepted" and gate.deliver:
                 return Accepted(tracking_code=reference_code)
             raise ProviderTransient()
         if outcome == TRANSIENT:
-            self._fire("create")
+            await self._fire("create")
             raise ProviderTransient()
         if outcome == QUOTA:
-            self._fire("create")
+            await self._fire("create")
             raise QuotaExhausted("quota exhausted")
         if outcome == AUTH_FAILED:
-            self._fire("create")
+            await self._fire("create")
             raise ProviderAuthFailed("forbidden")
         if outcome == CONFLICT:
-            self._fire("create")
+            await self._fire("create")
             raise DocumentExists("forced conflict")
         if isinstance(outcome, tuple) and outcome[0] == "rejected":
-            self._fire("create")
+            await self._fire("create")
             raise ProviderRejected(outcome[1])
         try:
             self._receive(reference_code, request)
         except (DocumentExists, ProviderRejected):
             if outcome in (LOST_RESPONSE, CRASH_AFTER_RECEIVE):
-                self._fire("create")
+                await self._fire("create")
                 if outcome == CRASH_AFTER_RECEIVE:
                     raise Crash("crash after the provider answered") from None
                 raise ProviderTransient() from None
-            self._fire("create")
+            await self._fire("create")
             raise
-        self._fire("create")
+        await self._fire("create")
         if outcome == LOST_RESPONSE:
             raise ProviderTransient()
         if outcome == CRASH_AFTER_RECEIVE:
@@ -312,7 +328,7 @@ class FakeEInvoiceProvider:
                 provider_message=invoice.provider_message,
             )
         finally:
-            self._fire("check_create")
+            await self._fire("check_create")
 
     async def find_by_reference(
         self, account: IssuerAccountView, creds: ClientCredentials, reference_code: str
@@ -340,7 +356,7 @@ class FakeEInvoiceProvider:
                 provider_message=invoice.provider_message,
             )
         finally:
-            self._fire("find_by_reference")
+            await self._fire("find_by_reference")
 
     async def fetch_artifacts(
         self,
@@ -359,7 +375,7 @@ class FakeEInvoiceProvider:
                 xml=f"<invoice reference='{reference_code}'/>".encode(),
             )
         finally:
-            self._fire("fetch_artifacts")
+            await self._fire("fetch_artifacts")
 
     async def describe_account(
         self, account: IssuerAccountView, creds: ClientCredentials
@@ -391,7 +407,10 @@ class FakeEInvoiceProvider:
     def _receive(self, reference_code: str, request: Mapping[str, Any]) -> None:
         """The provider processes a request it received: 409, date refusal or a new invoice."""
         self.requests_received[reference_code] = dict(request)
-        if reference_code in self.invoices or reference_code in self.reconciled:
+        existing = self.invoices.get(reference_code)
+        if reference_code in self.reconciled or (
+            existing is not None and (existing.state != "failed" or existing.consumes_reference)
+        ):
             raise DocumentExists("reference already used")
         total, issued_date = self._request_facts(request)
         if issued_date < today_vn(self.clock.now()):
@@ -426,10 +445,12 @@ class FakeEInvoiceProvider:
         self._number += 1
         return f"{self._number:08d}"
 
-    def _fire(self, op: str) -> None:
+    async def _fire(self, op: str) -> None:
         hooks = self._next_hooks.get(op)
         if hooks:
-            hooks.popleft()()
+            result = hooks.popleft()()
+            if result is not None:
+                await result
 
     @staticmethod
     def _pop(store: dict[str, deque[Any]], key: str) -> list[Any]:
