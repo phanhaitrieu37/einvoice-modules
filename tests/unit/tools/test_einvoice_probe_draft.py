@@ -999,7 +999,7 @@ def test_s8_issue_phase_flags_a_date_on_neither_day(tmp_path: Path) -> None:
     assert result["issue_a"]["issued"] is True
     assert result["issue_a"]["issued_on"] == "2026-10-09"
     assert result["run_on"] == "2026-10-08" and result["created_on"] == "2026-10-07"
-    # Neither the run day nor the draft day: no G7 branch may be picked from it.
+    # Neither the run day nor the draft day: no issued-date branch may be picked from it.
     assert result["issued_date_on_issue"] == "other_day"
 
 
