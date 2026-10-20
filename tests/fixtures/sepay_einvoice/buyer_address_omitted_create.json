@@ -1,0 +1,20 @@
+{
+  "body": {
+    "data": {
+      "message": "\u0110\u00e3 t\u1ea1o y\u00eau c\u1ea7u xu\u1ea5t h\u00f3a \u0111\u01a1n \u0111i\u1ec7n t\u1eed",
+      "tracking_code": "00000000-0000-4000-8000-000000000005",
+      "tracking_url": "https://einvoice-api-sandbox.sepay.vn/v1/invoices/create/check/00000000-0000-4000-8000-000000000005"
+    },
+    "success": true
+  },
+  "classifier_paths": {
+    "error_code": "body.error.code",
+    "http_status": "status",
+    "tracking_code": "body.data.tracking_code"
+  },
+  "headers": {
+    "content-length": null,
+    "content-type": "application/json; charset=UTF-8"
+  },
+  "status": 202
+}

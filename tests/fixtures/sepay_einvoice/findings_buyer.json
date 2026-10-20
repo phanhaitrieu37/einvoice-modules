@@ -1,0 +1,38 @@
+{
+  "address_rule": "omit",
+  "classifier_paths": {
+    "check_address": "buyer_address_*_check.json:body.data.invoice.buyer.address",
+    "invoice_number": "buyer_address_*_check.json:body.data.invoice.invoice_number",
+    "lookup_address": "buyer_address_*_lookup.json:body.data.buyer.address",
+    "outcome": "buyer_address_*_create.json:status+body.error.code|buyer_address_*_check.json:body.data.status"
+  },
+  "create_count": 2,
+  "probed_at": "2026-10-20T13:11:44+07:00",
+  "run_complete": true,
+  "variant_empty": {
+    "check_address": {
+      "path": "body.data.invoice.buyer.address",
+      "state": "null"
+    },
+    "error": null,
+    "invoice_number_valid": true,
+    "lookup_address": {
+      "path": "body.data.buyer.address",
+      "state": "null"
+    },
+    "outcome": "issued"
+  },
+  "variant_omitted": {
+    "check_address": {
+      "path": "body.data.invoice.buyer.address",
+      "state": "null"
+    },
+    "error": null,
+    "invoice_number_valid": true,
+    "lookup_address": {
+      "path": "body.data.buyer.address",
+      "state": "null"
+    },
+    "outcome": "issued"
+  }
+}
