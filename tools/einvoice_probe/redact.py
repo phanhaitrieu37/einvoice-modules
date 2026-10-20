@@ -27,13 +27,9 @@ def _redact(obj: object, *, in_party: bool, field_name: str | None = None) -> ob
                 # A blank fallback buyer address is evidence, not personal data.
                 redacted[key] = value
             elif (
-                (
-                    normalized in SECRET_KEYS
-                    and not (normalized == "token" and _is_endpoint_descriptor(value))
-                )
-                or (normalized in PII_KEYS and in_party)
-                or (normalized.endswith("_address") and isinstance(value, str) and value != "")
-            ):
+                normalized in SECRET_KEYS
+                and not (normalized == "token" and _is_endpoint_descriptor(value))
+            ) or (normalized in PII_KEYS and in_party):
                 redacted[key] = "REDACTED"
             elif normalized == "tax_code":
                 redacted[key] = "0000000000"

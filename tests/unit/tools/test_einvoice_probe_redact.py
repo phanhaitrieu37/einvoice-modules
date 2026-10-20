@@ -147,8 +147,10 @@ def test_address_state_never_carries_text_through_write_json(tmp_path) -> None:
             "check_address": {"path": "body.data.invoice.buyer.address", "state": "nonempty"},
             "lookup_address": {"path": "body.data.buyer.address", "value": SYNTHETIC_ADDRESS},
         },
-        "variant_empty": {"lookup_address": SYNTHETIC_ADDRESS},
         "blank": {"path": "body.data.buyer.address", "value": ""},
+        "classifier_paths": {
+            "lookup_address": "buyer_address_*_lookup.json:body.data.buyer.address"
+        },
     }
     written = write_json(tmp_path, "findings_buyer", findings)
     saved = written.read_text(encoding="utf-8")
@@ -159,3 +161,4 @@ def test_address_state_never_carries_text_through_write_json(tmp_path) -> None:
     )
     assert loaded["variant_omitted"]["lookup_address"]["value"] == "REDACTED"
     assert loaded["blank"] == findings["blank"]
+    assert loaded["classifier_paths"] == findings["classifier_paths"]
