@@ -1,0 +1,11 @@
+{
+  "_synthetic": "Hand-built, not recorded. Code and path as observed on 2026-10-07 for a backdated draft create (HTTP 400, body.error.code ISSUED_DATE_INVALID); the message is invented.",
+  "status": 400,
+  "body": {
+    "success": false,
+    "error": {
+      "code": "ISSUED_DATE_INVALID",
+      "message": "Ngày lập hóa đơn không hợp lệ"
+    }
+  }
+}

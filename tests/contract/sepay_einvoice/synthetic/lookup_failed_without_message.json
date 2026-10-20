@@ -1,0 +1,14 @@
+{
+  "_synthetic": "Hand-built, not recorded. A reference lookup whose status is failed with no message field; values are invented.",
+  "status": 200,
+  "body": {
+    "success": true,
+    "data": {
+      "reference_code": "00000000-0000-4000-8000-0000000000f4",
+      "status": "failed",
+      "invoice_number": "0",
+      "issued_date": null,
+      "total_amount": 1080
+    }
+  }
+}
