@@ -138,6 +138,34 @@ async def test_fallback_strings_must_not_be_blank(rows: Rows) -> None:
     )
 
 
+async def test_blank_fallback_address_accepted(rows: Rows) -> None:
+    acc = await account(
+        rows, status="active", issue_date_cross_day_action="issue", buyer_fallback_address=""
+    )
+    table = rows.tables.issuer_accounts
+    stored = await rows.conn.scalar(
+        sa.select(table.c.buyer_fallback_address).where(table.c.id == acc["id"])
+    )
+    assert stored == ""
+
+
+async def test_fallback_name_still_rejected_when_address_blank(rows: Rows) -> None:
+    await rows.expect_violation(
+        "issuer_accounts_fallback_ck",
+        rows.tables.issuer_accounts,
+        **rows.issuer_account_row(buyer_fallback_name="   ", buyer_fallback_address=""),
+    )
+
+
+async def test_null_fallback_address_rejected(rows: Rows) -> None:
+    with pytest.raises(IntegrityError) as caught:
+        await rows.insert(
+            rows.tables.issuer_accounts, rows.issuer_account_row(buyer_fallback_address=None)
+        )
+    cause = caught.value.orig.__cause__
+    assert (cause.sqlstate, cause.column_name) == ("23502", "buyer_fallback_address")
+
+
 async def test_draft_declared_must_equal_computed(rows: Rows) -> None:
     await rows.expect_violation(
         "drafts_total_match_ck",

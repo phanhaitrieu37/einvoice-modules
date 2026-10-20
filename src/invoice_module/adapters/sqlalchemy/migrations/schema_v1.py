@@ -113,7 +113,7 @@ def upgrade(op: Any, prefix: str = "inv_") -> None:
             "environment IN ('live', 'test')", name=_name(prefix, "issuer_accounts_environment_ck")
         ),
         sa.CheckConstraint(
-            "length(btrim(buyer_fallback_name)) > 0 AND length(btrim(buyer_fallback_address)) > 0",
+            "length(btrim(buyer_fallback_name)) > 0",
             name=_name(prefix, "issuer_accounts_fallback_ck"),
         ),
         sa.CheckConstraint(
