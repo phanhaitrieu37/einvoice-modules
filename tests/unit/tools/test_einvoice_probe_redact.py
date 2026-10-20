@@ -216,3 +216,75 @@ def test_blank_buyer_address_keeps_sibling_redaction(tmp_path) -> None:
         "tax_code": "0000000000",
     }
     assert saved["filled"]["data"]["buyer"] == {"address": "REDACTED", **REDACTED_SIBLINGS}
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("body.data.Buyer.Name", "SYNTHETIC BUYER NAME"),
+        ("body.data.buyer.Address", SYNTHETIC_ADDRESS),
+        ("buyer.phone", 84901234567),
+        ("buyer.address", {"line": SYNTHETIC_ADDRESS}),
+    ],
+    ids=["capitalised-name-path", "capitalised-address-path", "int-phone", "dict-address"],
+)
+def test_field_descriptor_masks_any_case_and_any_value_type(tmp_path, path, value) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    written = write_json(tmp_path, "errors", {"errors": [{"path": path, "value": value}]})
+    saved = written.read_text(encoding="utf-8")
+    for text in ("SYNTHETIC", "84901234567"):
+        assert text not in saved
+    assert json.loads(saved)["errors"] == [{"path": path, "value": "REDACTED"}]
+
+
+@pytest.mark.parametrize("parent", ["buyer", "Buyer"])
+@pytest.mark.parametrize("blank", ["", None], ids=["empty", "null"])
+def test_redact_keeps_capitalised_blank_buyer_address(tmp_path, parent, blank) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    body = {"data": {parent: {"Name": "Fallback", "Address": blank}}}
+    written = write_json(tmp_path, "lookup", body)
+    saved = json.loads(written.read_text(encoding="utf-8"))
+    assert saved["data"][parent] == {"Name": "REDACTED", "Address": blank}
+    filled = write_json(tmp_path, "filled", {"data": {parent: {"Address": SYNTHETIC_ADDRESS}}})
+    assert json.loads(filled.read_text(encoding="utf-8"))["data"][parent] == {"Address": "REDACTED"}
+
+
+@pytest.mark.parametrize(
+    "path", ["buyer.tax_code", "body.data.invoice.buyer.TAX_CODE"], ids=["snake", "upper"]
+)
+def test_field_descriptor_masks_a_tax_code(tmp_path, path) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    written = write_json(
+        tmp_path,
+        "errors",
+        {"errors": [{"path": path, "value": "0312345678", "message": "invalid"}]},
+    )
+    saved = written.read_text(encoding="utf-8")
+    assert "0312345678" not in saved
+    assert json.loads(saved)["errors"] == [
+        {"path": path, "value": "0000000000", "message": "invalid"}
+    ]
+    blank = write_json(tmp_path, "blank", {"path": path, "value": ""})
+    assert json.loads(blank.read_text(encoding="utf-8")) == {"path": path, "value": ""}
+
+
+@pytest.mark.parametrize("key", ["buyer_address", "buyerAddress"])
+def test_flat_buyer_address_is_masked_unless_blank(tmp_path, key) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    filled = write_json(tmp_path, "filled", {"data": {key: SYNTHETIC_ADDRESS, "status": "x"}})
+    saved = filled.read_text(encoding="utf-8")
+    assert SYNTHETIC_ADDRESS not in saved
+    assert json.loads(saved) == {"data": {key: "REDACTED", "status": "x"}}
+    structured = write_json(tmp_path, "structured", {"data": {key: {"line": SYNTHETIC_ADDRESS}}})
+    assert json.loads(structured.read_text(encoding="utf-8")) == {"data": {key: "REDACTED"}}
+    for name, data in {
+        "empty": {key: ""},
+        "null": {key: None},
+        "missing": {"status": "x"},
+    }.items():
+        written = write_json(tmp_path, name, {"data": data})
+        assert json.loads(written.read_text(encoding="utf-8")) == {"data": data}

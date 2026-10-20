@@ -24,6 +24,9 @@ def _redact(obj: object, *, in_party: bool, field_name: str | None = None) -> ob
             if normalized == "address" and field_name == "buyer" and _is_blank(value):
                 # A blank fallback buyer address is evidence, not personal data.
                 redacted[key] = value
+            elif normalized == "buyer_address":
+                # A flat buyer address outside a buyer object follows the same rule.
+                redacted[key] = value if _is_blank(value) else "REDACTED"
             elif (
                 normalized in SECRET_KEYS
                 and not (normalized == "token" and _is_endpoint_descriptor(value))
@@ -39,9 +42,10 @@ def _redact(obj: object, *, in_party: bool, field_name: str | None = None) -> ob
                     in_party=in_party or normalized in {"buyer", "seller", "seller_store"},
                     field_name=normalized,
                 )
-        if _is_pii_field_descriptor(obj):
+        mask = _field_descriptor_mask(obj)
+        if mask is not None:
             # Siblings are redacted like any other key; only the field's own value is masked.
-            redacted["value"] = "REDACTED"
+            redacted["value"] = mask
         return redacted
     if isinstance(obj, list):
         return [_redact(value, in_party=in_party) for value in obj]
@@ -57,13 +61,17 @@ def _is_blank(value: object) -> bool:
     return value is None or value == ""
 
 
-def _is_pii_field_descriptor(value: Mapping[object, object]) -> bool:
-    """A ``{path, value}`` finding whose path names a personal-data field and holds text."""
+def _field_descriptor_mask(value: Mapping[object, object]) -> str | None:
+    """The mask for a ``{path, value}`` finding whose path names a personal-data or tax field."""
     path = value.get("path")
-    if not isinstance(path, str) or "value" not in value:
-        return False
+    if not isinstance(path, str) or "value" not in value or _is_blank(value["value"]):
+        return None
     field = path.rsplit(".", 1)[-1].lower()
-    return (field in PII_KEYS or field.endswith("_address")) and not _is_blank(value["value"])
+    if field == "tax_code":
+        return "0000000000"
+    if field in PII_KEYS or field.endswith("_address"):
+        return "REDACTED"
+    return None
 
 
 def _is_endpoint_descriptor(value: object) -> bool:
