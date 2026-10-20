@@ -1447,3 +1447,101 @@ async def test_test_environment_issued_accepts_null_tax_authority_code(rows: Row
     await rows.document(
         **_frozen(acc, status="issued", invoice_number="0000001", tax_authority_code=None)
     )
+
+
+_SENT = "sent"
+_SEND_COLUMNS = ("send_started_at", "post_count", "post_limit", "date_resend_at")
+
+
+def _send_markers(
+    send_started_at: str | None, post_count: int, post_limit: int, date_resend_at: str | None
+) -> dict[str, object]:
+    sent_at = _now()
+    return {
+        "send_started_at": sent_at if send_started_at == _SENT else None,
+        "post_count": post_count,
+        "post_limit": post_limit,
+        "date_resend_at": sent_at if date_resend_at == _SENT else None,
+    }
+
+
+async def _stored_send_markers(rows: Rows, document_id: object) -> tuple[object, ...]:
+    table = rows.tables.documents
+    result = await rows.conn.execute(
+        sa.select(*(table.c[name] for name in _SEND_COLUMNS)).where(table.c.id == document_id)
+    )
+    return tuple(result.one())
+
+
+@pytest.mark.parametrize(
+    ("send_started_at", "post_count", "post_limit", "date_resend_at"),
+    [
+        (None, 0, 2, None),
+        (_SENT, 1, 2, None),
+        (_SENT, 2, 2, _SENT),
+        (_SENT, 2, 3, None),
+        (_SENT, 3, 3, _SENT),
+        (None, 0, 1, None),
+        (_SENT, 1, 1, None),
+    ],
+)
+async def test_send_markers_valid_combinations(
+    rows: Rows,
+    send_started_at: str | None,
+    post_count: int,
+    post_limit: int,
+    date_resend_at: str | None,
+) -> None:
+    acc = await account(rows)
+    markers = _send_markers(send_started_at, post_count, post_limit, date_resend_at)
+    inserted = await rows.document(**_frozen(acc, status="queued", queued_at=_now()) | markers)
+    assert await _stored_send_markers(rows, inserted["id"]) == tuple(markers.values())
+
+    fresh = await rows.document(**_frozen(acc, status="queued", queued_at=_now()))
+    assert await _stored_send_markers(rows, fresh["id"]) == (None, 0, 2, None)
+    table = rows.tables.documents
+    async with rows.conn.begin_nested():
+        await rows.conn.execute(table.update().where(table.c.id == fresh["id"]).values(**markers))
+    assert await _stored_send_markers(rows, fresh["id"]) == tuple(markers.values())
+
+
+async def _expect_send_marker_violation(
+    rows: Rows, constraint: str, markers: dict[str, object]
+) -> None:
+    acc = await account(rows)
+    await rows.expect_violation(
+        constraint,
+        rows.tables.documents,
+        **rows.document_row(**_frozen(acc, status="queued", queued_at=_now()) | markers),
+    )
+
+
+@pytest.mark.parametrize(("send_started_at", "post_count"), [(None, 0), (_SENT, 1)])
+async def test_date_resend_requires_second_post(
+    rows: Rows, send_started_at: str | None, post_count: int
+) -> None:
+    await _expect_send_marker_violation(
+        rows, "documents_date_resend_ck", _send_markers(send_started_at, post_count, 2, _SENT)
+    )
+
+
+@pytest.mark.parametrize(("send_started_at", "post_count"), [(None, 1), (_SENT, 0), (_SENT, -1)])
+async def test_post_count_matches_send_started(
+    rows: Rows, send_started_at: str | None, post_count: int
+) -> None:
+    await _expect_send_marker_violation(
+        rows, "documents_post_count_ck", _send_markers(send_started_at, post_count, 2, None)
+    )
+
+
+@pytest.mark.parametrize(
+    ("send_started_at", "post_count", "post_limit"), [(None, 0, 0), (_SENT, 3, 2)]
+)
+async def test_post_limit_bounds(
+    rows: Rows, send_started_at: str | None, post_count: int, post_limit: int
+) -> None:
+    await _expect_send_marker_violation(
+        rows,
+        "documents_post_limit_ck",
+        _send_markers(send_started_at, post_count, post_limit, None),
+    )

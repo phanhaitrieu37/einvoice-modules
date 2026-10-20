@@ -172,6 +172,10 @@ def upgrade(op: Any, prefix: str = "inv_") -> None:
         sa.Column(
             "request_authorized_resend", sa.Boolean(), nullable=False, server_default=sa.false()
         ),
+        sa.Column("send_started_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("post_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("post_limit", sa.Integer(), nullable=False, server_default="2"),
+        sa.Column("date_resend_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("delivery_mode", sa.String(8), nullable=True),
         sa.Column("approved_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("approved_by", sa.String(128), nullable=True),
@@ -249,6 +253,10 @@ def upgrade(op: Any, prefix: str = "inv_") -> None:
             name=_name(prefix, "documents_counters_ck"),
         ),
         sa.CheckConstraint(
+            "date_resend_at IS NULL OR post_count >= 2",
+            name=_name(prefix, "documents_date_resend_ck"),
+        ),
+        sa.CheckConstraint(
             "delivery_mode IS NULL OR delivery_mode IN ('auto', 'manual')",
             name=_name(prefix, "documents_delivery_mode_ck"),
         ),
@@ -298,6 +306,14 @@ def upgrade(op: Any, prefix: str = "inv_") -> None:
         sa.CheckConstraint(
             "status <> 'pending_provider' OR pending_since IS NOT NULL",
             name=_name(prefix, "documents_pending_since_ck"),
+        ),
+        sa.CheckConstraint(
+            "post_count >= 0 AND ((post_count = 0) = (send_started_at IS NULL))",
+            name=_name(prefix, "documents_post_count_ck"),
+        ),
+        sa.CheckConstraint(
+            "post_limit >= 1 AND post_count <= post_limit",
+            name=_name(prefix, "documents_post_limit_ck"),
         ),
         sa.CheckConstraint(
             "status <> 'queued' OR queued_at IS NOT NULL",
