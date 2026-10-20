@@ -15,7 +15,8 @@ URL_QUERY = re.compile(r"https?://[^\s\"'<>?#]+\?([^\s\"'<>#]+)", re.IGNORECASE)
 SECRET_KEYS = {"access_token", "token", "client_id", "client_secret", "authorization"}
 TIME_KEYS = {"time", "timestamp", "created_at", "updated_at", "issued_date", "date"}
 ANY_UUID = re.compile(r"(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-# Draft and issue fixtures keep reference/tracking identity only as numbered placeholders.
+# Draft, issue and buyer address fixtures keep reference/tracking identity only as
+# numbered placeholders.
 PLACEHOLDER_UUID = re.compile(
     r"00000000-0000-4000-8000-\d{12}|00000000-0000-0000-0000-000000000000"
 )
@@ -74,9 +75,10 @@ def test_fixtures_have_no_secret_or_pii() -> None:
 
 
 def test_draft_and_issue_fixtures_hold_no_real_identifiers() -> None:
-    for path in [*FIXTURE_DIR.glob("draft_*.json"), *FIXTURE_DIR.glob("issue_*.json")]:
-        raw = path.read_text(encoding="utf-8")
-        assert all(PLACEHOLDER_UUID.fullmatch(value) for value in ANY_UUID.findall(raw)), path
+    for pattern in ("draft_*.json", "issue_*.json", "buyer_address_*.json"):
+        for path in FIXTURE_DIR.glob(pattern):
+            raw = path.read_text(encoding="utf-8")
+            assert all(PLACEHOLDER_UUID.fullmatch(value) for value in ANY_UUID.findall(raw)), path
 
 
 def test_draft_fixture_scan_rejects_a_real_tracking_code(tmp_path, monkeypatch) -> None:
