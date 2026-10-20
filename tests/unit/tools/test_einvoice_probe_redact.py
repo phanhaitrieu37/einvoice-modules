@@ -1,3 +1,5 @@
+import json
+
 from tools.einvoice_probe.redact import redact
 
 
@@ -99,3 +101,61 @@ def test_redact_jwt_anywhere() -> None:
     assert redact({"message": "bad token eyJabcdefghijk.payload.signature at provider"}) == {
         "message": "bad token REDACTED_JWT at provider"
     }
+
+
+SYNTHETIC_ADDRESS = "SYNTHETIC NONEMPTY ADDRESS"
+
+
+def test_redact_keeps_blank_buyer_address_states(tmp_path) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    calls = {
+        "missing": {"buyer": {"name": "Fallback"}},
+        "empty": {"buyer": {"name": "Fallback", "address": ""}},
+        "null": {"buyer": {"name": "Fallback", "address": None}},
+    }
+    for name, buyer in calls.items():
+        written = write_json(tmp_path, name, {"body": {"data": {"invoice": buyer}}})
+        saved = json.loads(written.read_text(encoding="utf-8"))["body"]["data"]["invoice"]
+        assert saved["buyer"]["name"] == "REDACTED"
+        assert {key: value for key, value in saved["buyer"].items() if key != "name"} == {
+            key: value for key, value in buyer["buyer"].items() if key != "name"
+        }
+    # The exception is narrow: a blank seller address is still masked.
+    assert redact({"seller": {"address": ""}}) == {"seller": {"address": "REDACTED"}}
+
+
+def test_redact_masks_nonempty_buyer_address(tmp_path) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    written = write_json(
+        tmp_path,
+        "lookup",
+        {"body": {"data": {"buyer": {"name": "Fallback", "address": SYNTHETIC_ADDRESS}}}},
+    )
+    saved = written.read_text(encoding="utf-8")
+    assert SYNTHETIC_ADDRESS not in saved
+    assert json.loads(saved)["body"]["data"]["buyer"]["address"] == "REDACTED"
+    assert redact({"buyer": {"address": " "}}) == {"buyer": {"address": "REDACTED"}}
+
+
+def test_address_state_never_carries_text_through_write_json(tmp_path) -> None:
+    from tools.einvoice_probe.scenarios import write_json
+
+    findings = {
+        "variant_omitted": {
+            "check_address": {"path": "body.data.invoice.buyer.address", "state": "nonempty"},
+            "lookup_address": {"path": "body.data.buyer.address", "value": SYNTHETIC_ADDRESS},
+        },
+        "variant_empty": {"lookup_address": SYNTHETIC_ADDRESS},
+        "blank": {"path": "body.data.buyer.address", "value": ""},
+    }
+    written = write_json(tmp_path, "findings_buyer", findings)
+    saved = written.read_text(encoding="utf-8")
+    assert SYNTHETIC_ADDRESS not in saved
+    loaded = json.loads(saved)
+    assert (
+        loaded["variant_omitted"]["check_address"] == findings["variant_omitted"]["check_address"]
+    )
+    assert loaded["variant_omitted"]["lookup_address"]["value"] == "REDACTED"
+    assert loaded["blank"] == findings["blank"]

@@ -18,13 +18,22 @@ def redact(obj: object) -> object:
 
 def _redact(obj: object, *, in_party: bool, field_name: str | None = None) -> object:
     if isinstance(obj, Mapping):
+        if _is_pii_field_descriptor(obj):
+            return {**obj, "value": "REDACTED"}
         redacted: dict[object, object] = {}
         for key, value in obj.items():
             normalized = re.sub(r"(?<!^)(?=[A-Z])", "_", str(key)).lower()
-            if (
-                normalized in SECRET_KEYS
-                and not (normalized == "token" and _is_endpoint_descriptor(value))
-            ) or (normalized in PII_KEYS and in_party):
+            if normalized == "address" and field_name == "buyer" and _is_blank(value):
+                # A blank fallback buyer address is evidence, not personal data.
+                redacted[key] = value
+            elif (
+                (
+                    normalized in SECRET_KEYS
+                    and not (normalized == "token" and _is_endpoint_descriptor(value))
+                )
+                or (normalized in PII_KEYS and in_party)
+                or (normalized.endswith("_address") and isinstance(value, str) and value != "")
+            ):
                 redacted[key] = "REDACTED"
             elif normalized == "tax_code":
                 redacted[key] = "0000000000"
@@ -45,6 +54,19 @@ def _redact(obj: object, *, in_party: bool, field_name: str | None = None) -> ob
             cleaned = TAX_ID_TEXT_RE.sub("0000000000", cleaned)
         return URL_QUERY_RE.sub(r"\1?REDACTED", cleaned)
     return obj
+
+
+def _is_blank(value: object) -> bool:
+    return value is None or value == ""
+
+
+def _is_pii_field_descriptor(value: Mapping[object, object]) -> bool:
+    """A ``{path, value}`` finding whose path names a personal-data field and holds text."""
+    path = value.get("path")
+    if not isinstance(path, str) or "value" not in value:
+        return False
+    field = path.rsplit(".", 1)[-1].lower()
+    return (field in PII_KEYS or field.endswith("_address")) and not _is_blank(value["value"])
 
 
 def _is_endpoint_descriptor(value: object) -> bool:
