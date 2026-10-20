@@ -46,6 +46,8 @@ OK_STATUSES = range(200, 300)
 
 @dataclass(frozen=True)
 class _Token:
+    """An access token; its repr never shows the value (tracebacks, logs)."""
+
     value: str = ""
     expires_at: datetime | None = None
 
@@ -134,7 +136,7 @@ class SePayEInvoiceClient:
 
     async def _token(
         self, account: IssuerAccountView, creds: ClientCredentials | None
-    ) -> tuple[str, bool]:
+    ) -> tuple[_Token, bool]:
         ref = account.credential_ref
         cached = self._tokens.get(ref)
         now = self._clock.now()
@@ -143,7 +145,7 @@ class SePayEInvoiceClient:
             and cached.expires_at is not None
             and now < cached.expires_at - REFRESH_MARGIN
         ):
-            return cached.value, False
+            return cached, False
         if creds is None:
             creds = await self._credentials.client_credentials(ref)
         method, path = endpoint("token")
@@ -169,18 +171,19 @@ class SePayEInvoiceClient:
         ttl = data.get("expires_in")
         if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
             ttl = TOKEN_TTL_SECONDS
-        self._tokens[ref] = _Token(value, now + timedelta(seconds=ttl))
-        return value, True
+        token = _Token(value, now + timedelta(seconds=ttl))
+        self._tokens[ref] = token
+        return token, True
 
     async def _send(
-        self, method: str, url: str, token: str, body: Mapping[str, object] | None
+        self, method: str, url: str, token: _Token, body: Mapping[str, object] | None
     ) -> Response:
         try:
             raw = await self._http.request(
                 method,
                 url,
                 json=dict(body) if body is not None else None,
-                headers={"Authorization": f"Bearer {token}"},
+                headers={"Authorization": f"Bearer {token.value}"},
                 timeout=self._timeout,
                 follow_redirects=False,
             )

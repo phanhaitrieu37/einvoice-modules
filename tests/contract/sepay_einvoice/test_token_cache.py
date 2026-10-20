@@ -155,3 +155,28 @@ async def test_authorization_never_logged(
     assert "Bearer" not in text
     assert "synthetic-client-secret" not in text
     assert "Authorization" not in text
+
+
+async def test_failure_tracebacks_never_show_the_token(
+    harness: Callable[..., Any], recorded: Loader, account: IssuerAccountView, creds: Any
+) -> None:
+    success = recorded("check_success.json")["body"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/download"):
+            raise httpx.ReadTimeout("slow")
+        return httpx.Response(200, json=success)
+
+    h = harness(handler)
+    await h.provider.check_create(account, creds, REFERENCE)
+    with pytest.raises(ProviderTransient) as raised:
+        await h.provider.fetch_artifacts(account, creds, REFERENCE, "unused")
+    frames = [
+        entry
+        for error in (raised.value, raised.value.__cause__)
+        for entry in pytest.ExceptionInfo.from_exception(error).traceback
+        if "invoice_module" in str(entry.path)
+    ]
+    shown = "\n".join(f"{name} = {value!r}" for f in frames for name, value in f.frame.getargs())
+    assert "token = _Token(<hidden>)" in shown
+    assert "synthetic-access-token-value" not in shown

@@ -11,7 +11,7 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Generator
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -47,6 +47,8 @@ CREDENTIAL_REF = "env:SEPAY_EINVOICE_SANDBOX"
 VN_TZ = ZoneInfo("Asia/Saigon")
 POLL_DELAYS = (3, 5, 10, 20, 30, 60)
 POLL_BUDGET_S = 600
+# The sandbox once took over 20 s to serve an XML download; the probe client used 30 s.
+SANDBOX_HTTP_TIMEOUT_S = 60.0
 # The sandbox refuses a goods line without item_code; the host supplies one.
 SANDBOX_ITEM_CODE = "SANDBOX-PHOTOSHOP"
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -66,6 +68,17 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         raise pytest.UsageError(
             f"sandbox tests need the sandbox marker and no integration: {wrong}"
         )
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+    """Render sandbox failures without argument values, so no credential reaches the log."""
+    report = yield
+    if HERE in item.path.parents and report.failed and call.excinfo is not None:
+        report.longrepr = call.excinfo.getrepr(style="short", funcargs=False, showlocals=False)
+    return report
 
 
 def today_vn() -> date:
@@ -228,7 +241,13 @@ async def sandbox(
     resolver = EnvCredentialResolver(environ=sandbox_env)
     creds = await resolver.client_credentials(CREDENTIAL_REF)
     async with httpx.AsyncClient(event_hooks={"response": [record]}) as http:
-        client = SePayEInvoiceClient(http, resolver, SystemClock(), ProcessRateLimiter(2.0))
+        client = SePayEInvoiceClient(
+            http,
+            resolver,
+            SystemClock(),
+            ProcessRateLimiter(2.0),
+            http_timeout_s=SANDBOX_HTTP_TIMEOUT_S,
+        )
         provider = SePayEInvoiceProvider(client)
         bootstrap = _bootstrap_account(accounting_config, "")
         ids = await provider.provider_account_ids(bootstrap, creds)
