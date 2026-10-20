@@ -1,0 +1,457 @@
+"""Manual mode: the draft stays in the module until approval; then one create issues it.
+
+Each scenario below is one row of the manual recovery matrix; ``test_matrix_manual_rows``
+runs them one by one and ``test_no_path_uses_removed_edges`` runs them all while recording
+every status edge the code asks for.
+"""
+
+from datetime import date, timedelta
+
+import pytest
+from tests.fakes.fake_einvoice_provider import (
+    AUTH_FAILED,
+    CONFLICT,
+    LOST_RESPONSE,
+    QUOTA,
+    TRANSIENT,
+    FakeInvoice,
+    failed_invoice,
+    rejected,
+)
+from tests.integration.worker.world import vn
+
+from invoice_module.application.hold_draft_invoice import HoldNotAllowed
+from invoice_module.domain.enums import DeliveryMode
+from invoice_module.domain.errors import ResolutionNotAllowed
+from invoice_module.ports.provider import ProviderInvoice, ProviderProgress
+
+pytestmark = pytest.mark.integration
+
+MANUAL = DeliveryMode.MANUAL
+REMOVED_EDGES = {
+    ("queued", "approved"),
+    ("pending_provider", "awaiting_approval"),
+    ("pending_provider", "approved"),
+    ("awaiting_approval", "failed"),
+    ("blocked", "failed"),
+    ("failed", "awaiting_approval"),
+}
+
+
+def issued(post) -> date:
+    return date.fromisoformat(str(post.payload["issued_date"])[:10])
+
+
+async def awaiting(world):
+    settled = await world.settle(mode=MANUAL)
+    await world.issue()
+    return settled
+
+
+async def approved(world):
+    settled = await awaiting(world)
+    await world.approve(settled)
+    return settled
+
+
+async def status(world, settled):
+    return (await world.doc(settled.document_id)).status
+
+
+async def row_m1(world):
+    settled = await world.settle(mode=MANUAL)
+    calls = len(world.provider.calls)
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.request is not None) == ("awaiting_approval", True)
+    assert world.provider.calls[calls:] == []
+
+
+async def row_m2(world):
+    first = await awaiting(world)
+    await world.approve(first)
+    assert await status(world, first) == "approved"
+    second = await awaiting(world)
+    await world.module.hold_draft_invoice.execute(second.document_id, "accountant-a", "Wrong")
+    assert await status(world, second) == "blocked"
+    third = await awaiting(world)
+    report = await world.module.escalate_overdue.run(world.clock.now() + timedelta(days=7))
+    assert third.document_id in report.approvals_overdue
+    assert await status(world, third) == "awaiting_approval"
+
+
+async def row_m3(world):
+    settled = await approved(world)
+    doc = await world.doc(settled.document_id)
+    changed = dict(doc.document) | {"notes": "changed"}
+    await world.set_columns(settled.document_id, document=changed)
+    calls = len(world.provider.calls)
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.approved_at, doc.request["notes"]) == (
+        "awaiting_approval",
+        None,
+        "changed",
+    )
+    assert world.provider.calls[calls:] == []
+
+
+async def row_m4(world):
+    settled = await awaiting(world)
+    world.advance(timedelta(days=1))
+    await world.approve(settled)
+    await world.issue()
+    [post] = world.provider.posts(settled.reference)
+    assert issued(post) == (world.clock.now() + timedelta(hours=7)).date()
+    assert world.provider.ops()[-2:] == ["find_by_reference", "create"]
+
+
+async def row_m5(world):
+    expected = {
+        "success": ("issued", None),
+        "pending": ("pending_provider", None),
+        "failed": ("failed", "PROVIDER_REJECTED"),
+        "draft": ("failed", "DOCUMENT_EXISTED_UNRESOLVED"),
+    }
+    for state, (final, reason) in expected.items():
+        settled = await approved(world)
+        found = {
+            "success": ProviderInvoice(
+                settled.reference, "success", invoice_number="9", issued_date=date(2026, 10, 21)
+            ),
+            "pending": ProviderInvoice(settled.reference, "pending"),
+            "failed": failed_invoice(settled.reference, "Synthetic"),
+            "draft": ProviderInvoice(settled.reference, "draft"),
+        }[state]
+        world.provider.script_lookup(settled.reference, found)
+        await world.issue()
+        assert await status(world, settled) == final, state
+        assert world.provider.posts(settled.reference) == []
+        if reason:
+            assert await world.open_reasons(settled.document_id) == [reason]
+
+
+async def row_m6(world):
+    expected = [
+        (None, "pending_provider", []),
+        (CONFLICT, "failed", ["DOCUMENT_EXISTED_UNRESOLVED"]),
+        (TRANSIENT, "approved", []),
+        (QUOTA, "approved", ["QUOTA_EXHAUSTED"]),
+        (rejected("validation_error"), "failed", ["PROVIDER_REJECTED"]),
+        (rejected("issued_date_invalid"), "pending_provider", []),
+        (AUTH_FAILED, "failed", ["AUTH_FAILED"]),
+    ]
+    for outcome, final, reasons in expected:
+        settled = await approved(world)
+        if outcome is not None:
+            world.provider.script_create(settled.reference, outcome)
+        await world.issue()
+        assert await status(world, settled) == final, outcome
+        assert await world.open_reasons(settled.document_id) == reasons, outcome
+    aborted = await approved(world)
+    world.provider.delay_before_send(aborted.reference, timedelta(seconds=45))
+    await world.issue()
+    assert await status(world, aborted) == "approved"
+    calls = len(world.provider.calls)
+    await world.issue()
+    assert [
+        c.op for c in world.provider.calls[calls:] if c.reference_code == aborted.reference
+    ] == ["find_by_reference", "create"]
+
+
+async def row_m7(world):
+    for progress, final in (
+        (None, "issued"),
+        (ProviderProgress(state="failed", provider_message="Synthetic"), "failed"),
+        (ProviderProgress(state="pending"), "pending_provider"),
+        (ProviderProgress(state="draft"), "failed"),
+    ):
+        settled = await approved(world)
+        await world.issue()
+        if progress is not None:
+            world.provider.script_check(settled.reference, progress)
+        world.advance(timedelta(seconds=3))
+        await world.poll()
+        assert await status(world, settled) == final
+    timeout = await approved(world)
+    world.provider.new_invoice(timeout.reference, pending_polls=10_000)
+    await world.issue()
+    report = await world.module.escalate_overdue.run(world.clock.now() + timedelta(hours=4))
+    assert timeout.document_id in report.timed_out
+
+
+async def row_m8(world):
+    for resolution, final in (
+        ("retry", "awaiting_approval"),
+        ("attach_draft", "queued"),
+        ("waive", "blocked"),
+    ):
+        settled = await awaiting(world)
+        await world.module.hold_draft_invoice.execute(settled.document_id, "accountant-a", "Wrong")
+        kwargs = {}
+        if resolution == "attach_draft":
+            kwargs["draft"] = world.draft_command(
+                settled.host_ref_id, settled.intent_id, mode=MANUAL, name="Fixed"
+            )
+        note = "Not invoiced" if resolution == "waive" else None
+        await world.resolve(settled.document_id, resolution, note=note, **kwargs)
+        assert await status(world, settled) == final
+        if resolution == "attach_draft":
+            await world.issue()
+            assert await status(world, settled) == "awaiting_approval"
+
+
+async def row_m9(world):
+    async def failed_manual():
+        settled = await approved(world)
+        world.provider.script_create(settled.reference, rejected("validation_error"))
+        await world.issue()
+        return settled
+
+    settled = await failed_manual()
+    world.provider.seed_invoice(FakeInvoice(settled.reference, date(2026, 10, 21), 100))
+    await world.resolve(settled.document_id, "retry")
+    assert await status(world, settled) == "issued"
+    settled = await failed_manual()
+    world.provider.seed_invoice(FakeInvoice(settled.reference, date(2026, 10, 21), 100))
+    await world.set_columns(settled.document_id, approved_snapshot_sha256="0" * 64)
+    with pytest.raises(ResolutionNotAllowed, match="issued_without_approval"):
+        await world.resolve(settled.document_id, "retry")
+    settled = await failed_manual()
+    world.provider.seed_invoice(
+        FakeInvoice(settled.reference, date(2026, 10, 21), 100, pending_polls=2)
+    )
+    await world.resolve(settled.document_id, "retry")
+    assert await status(world, settled) == "pending_provider"
+    settled = await failed_manual()
+    await world.resolve(settled.document_id, "retry")
+    assert await status(world, settled) == "approved"
+    settled = await failed_manual()
+    await world.set_columns(settled.document_id, approved_snapshot_sha256="0" * 64)
+    await world.resolve(settled.document_id, "retry")
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.approved_at) == ("queued", None)
+
+
+async def row_m10(world):
+    settled = await approved(world)
+    world.provider.script_create(settled.reference, CONFLICT)
+    await world.issue()
+    await world.set_columns(
+        settled.document_id,
+        approved_at=None,
+        approved_by=None,
+        approved_snapshot_sha256=None,
+        approved_reference_code=None,
+    )
+    await world.resolve(
+        settled.document_id,
+        "mark_external",
+        actor="operator-m",
+        invoice_number="00000100",
+        issued_date=date(2026, 10, 21),
+    )
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.approved_by, doc.approved_reference_code, doc.issued_date) == (
+        "issued",
+        "operator-m",
+        settled.reference,
+        date(2026, 10, 21),
+    )
+
+
+async def row_m11(world):
+    unsent = await approved(world)
+    await world.module.hold_draft_invoice.execute(unsent.document_id, "accountant-a", "Wrong")
+    assert await status(world, unsent) == "blocked"
+    sent = await approved(world)
+    world.provider.script_create(sent.reference, TRANSIENT)
+    await world.issue()
+    world.past_lease()
+    with pytest.raises(HoldNotAllowed, match="send_started"):
+        await world.module.hold_draft_invoice.execute(sent.document_id, "accountant-a", "Wrong")
+    pending = await approved(world)
+    await world.issue()
+    with pytest.raises(HoldNotAllowed, match="send_started"):
+        await world.module.hold_draft_invoice.execute(pending.document_id, "accountant-a", "x")
+
+
+ROWS = {
+    "M1": row_m1,
+    "M2": row_m2,
+    "M3": row_m3,
+    "M4": row_m4,
+    "M5": row_m5,
+    "M6": row_m6,
+    "M7": row_m7,
+    "M8": row_m8,
+    "M9": row_m9,
+    "M10": row_m10,
+    "M11": row_m11,
+}
+
+
+@pytest.mark.parametrize("row", sorted(ROWS, key=lambda name: int(name[1:])))
+async def test_matrix_manual_rows(world, row):
+    await ROWS[row](world)
+    assert all(post.payload.get("is_draft", False) is False for post in world.provider.posts())
+
+
+async def test_stale_hash_rebuilds_request_and_reapproval_sends_new_content(world):
+    settled = await approved(world)
+    doc = await world.doc(settled.document_id)
+    content_b = dict(doc.document)
+    content_b["buyer"] = {"name": "Buyer B", "address": "Street B"}
+    content_b["lines"] = [dict(doc.document["lines"][0]) | {"name": "Item B", "unit": "box"}]
+    await world.set_columns(settled.document_id, document=content_b)
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.approved_at) == ("awaiting_approval", None)
+    assert doc.request["buyer"] == {"name": "Buyer B", "address": "Street B"}
+    await world.approve(settled, actor="accountant-b")
+    await world.issue()
+    [post] = world.provider.posts()
+    assert post.payload["buyer"] == {"name": "Buyer B", "address": "Street B"}
+    assert [(item["name"], item["unit"]) for item in post.payload["items"]] == [("Item B", "box")]
+    assert post.payload == (await world.doc(settled.document_id)).request
+
+
+async def test_hold_refused_after_lost_create_then_retry(world):
+    settled = await approved(world)
+    world.provider.script_create(settled.reference, TRANSIENT, TRANSIENT)
+    for _ in range(3):
+        await world.issue()
+        world.past_lease()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.last_error_code) == ("failed", "max_attempts_exceeded")
+    # The only way back is a lookup-first retry; there is no attach that skips the lookup.
+    with pytest.raises(ResolutionNotAllowed):
+        await world.resolve(
+            settled.document_id,
+            "attach_draft",
+            draft=world.draft_command(settled.host_ref_id, settled.intent_id, mode=MANUAL),
+        )
+    await world.resolve(settled.document_id, "retry")
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.attempts, doc.send_started_at is not None) == ("approved", 0, True)
+    for _ in range(2):
+        with pytest.raises(HoldNotAllowed, match="send_started"):
+            await world.module.hold_draft_invoice.execute(settled.document_id, "accountant-a", "x")
+        world.restart()
+    assert await status(world, settled) == "approved"
+
+
+async def test_repair_and_rotation_clear_approval_with_audit(world):
+    settled = await approved(world)
+    world.provider.script_create(settled.reference, rejected("validation_error"))
+    await world.issue()
+    await world.resolve(
+        settled.document_id,
+        "attach_draft",
+        draft=world.draft_command(
+            settled.host_ref_id, settled.intent_id, mode=MANUAL, name="Fixed"
+        ),
+    )
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.approved_at) == ("queued", None)
+    [case] = await world.cases(settled.document_id)
+    assert case.details["previous_approvals"][0]["approved_by"] == "accountant-a"
+    await world.issue()
+    assert await status(world, settled) == "awaiting_approval"
+    await world.approve(settled, actor="accountant-b")
+    world.provider.script_create(settled.reference, CONFLICT)
+    await world.issue()
+    await world.resolve(
+        settled.document_id, "retry_with_new_reference", note="Reconciled at the portal"
+    )
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.approved_at, doc.approved_reference_code) == ("queued", None, None)
+    [second_case] = [
+        case
+        for case in await world.cases(settled.document_id)
+        if case.details["reasons"][0]["reason"] == "DOCUMENT_EXISTED_UNRESOLVED"
+    ]
+    assert second_case.details["previous_approvals"][-1]["approved_by"] == "accountant-b"
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.approved_at) == ("awaiting_approval", None)
+
+
+async def test_approved_across_midnight_sends_send_day_date_and_keeps_approved_at(world):
+    world.clock.set(vn(2026, 10, 21, 23, 0))
+    settled = await awaiting(world)
+    world.clock.set(vn(2026, 10, 21, 23, 59))
+    await world.approve(settled)
+    world.provider.script_create(settled.reference, QUOTA)
+    await world.issue()
+    world.advance(timedelta(hours=1, seconds=1))
+    await world.issue()
+    world.advance(timedelta(seconds=3))
+    await world.poll()
+    first, second = world.provider.posts()
+    doc = await world.doc(settled.document_id)
+    assert (issued(first), issued(second)) == (date(2026, 10, 21), date(2026, 10, 22))
+    assert (doc.status, doc.issued_date, doc.approved_at) == (
+        "issued",
+        date(2026, 10, 22),
+        vn(2026, 10, 21, 23, 59),
+    )
+
+
+async def test_lost_create_response_after_approval_recovers_by_lookup_one_post(world):
+    settled = await approved(world)
+    world.provider.script_create(settled.reference, LOST_RESPONSE)
+    await world.issue()
+    assert await status(world, settled) == "approved"
+    world.past_lease()
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert doc.status == "issued" and len(world.provider.posts()) == 1
+    assert world.provider.effective_creates[settled.reference] == 1
+
+
+async def test_no_path_uses_removed_edges(world, transitions):
+    for name in sorted(ROWS, key=lambda key: int(key[1:])):
+        await ROWS[name](world)
+    used = set(transitions.edges)
+    assert used & REMOVED_EDGES == set()
+    # The scenarios really walked the manual graph.
+    assert {
+        ("queued", "awaiting_approval"),
+        ("awaiting_approval", "approved"),
+        ("approved", "pending_provider"),
+        ("approved", "awaiting_approval"),
+        ("blocked", "awaiting_approval"),
+        ("failed", "approved"),
+    } <= used
+
+
+async def test_document_row_delivery_mode_is_enum(world):
+    auto = await world.settle()
+    manual = await world.settle(mode=MANUAL)
+    pending = await world.settle(draft=False)
+    async with world.crash() as uow:
+        rows = {name: await uow.documents.get(s.document_id) for name, s in (
+            ("auto", auto), ("manual", manual), ("pending", pending))}  # fmt: skip
+        listed = await uow.documents.list_by_status(rows["manual"].status)
+    assert isinstance(rows["auto"].delivery_mode, DeliveryMode)
+    assert rows["auto"].delivery_mode is DeliveryMode.AUTO
+    assert rows["manual"].delivery_mode is DeliveryMode.MANUAL
+    assert rows["pending"].delivery_mode is None
+    assert all(isinstance(row.delivery_mode, DeliveryMode) for row in listed)
+
+
+async def test_manual_never_calls_issue_endpoint(world):
+    for name in ("M4", "M6", "M7", "M9"):
+        await ROWS[name](world)
+    await world.artifacts()
+    assert set(world.provider.ops()) <= {
+        "create",
+        "check_create",
+        "find_by_reference",
+        "fetch_artifacts",
+    }
+    assert {"create", "check_create", "find_by_reference", "fetch_artifacts"} <= set(
+        world.provider.ops()
+    )
+    assert not hasattr(world.provider, "issue_draft") and not hasattr(world.provider, "check_issue")
