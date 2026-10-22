@@ -392,12 +392,15 @@ async def test_failing_sub_sweep_does_not_stop_the_others(world, monkeypatch):
     assert report.timed_out == [pending.document_id]
 
 
-async def test_draft_sweep_reaches_document_beyond_batch_of_stuck_documents(world):
+@pytest.mark.parametrize("stuck_by", ["no_draft", "foreign_draft"])
+async def test_draft_sweep_reaches_document_beyond_batch_of_stuck_documents(world, stuck_by):
     world.config = InvoiceModuleConfig(batch_size=2)
     world.restart()
     stuck = []
-    for _ in range(2):  # orders whose host never sends a draft
+    for _ in range(2):  # orders with no draft of their merchant to attach
         stuck.append(await world.settle(draft=False))
+        if stuck_by == "foreign_draft":
+            await foreign_draft(world, stuck[-1].host_ref_id)
         world.advance(timedelta(seconds=1))
     late = await world.settle(draft=False)
     draft_id = await insert_draft(world, late, intent_id=late.intent_id)  # the wake-up was missed
@@ -408,16 +411,18 @@ async def test_draft_sweep_reaches_document_beyond_batch_of_stuck_documents(worl
     assert [(await world.doc(s.document_id)).status for s in stuck] == ["needs_draft"] * 2
 
 
-async def test_draft_missing_reaches_newest_document_behind_waived_ones(world, monkeypatch):
+@pytest.mark.parametrize("older", ["waived", "open"])
+async def test_draft_missing_reaches_newest_document_behind_decided_ones(world, monkeypatch, older):
     monkeypatch.setattr(escalate_module, "_ALERT_SCAN_LIMIT", 2)
-    waived = []
+    decided = []
     for _ in range(2):
-        waived.append(await world.settle(draft=False))
+        decided.append(await world.settle(draft=False))
         world.advance(timedelta(seconds=1))
     world.advance(timedelta(minutes=61))
-    await escalate(world)
-    for settled in waived:
-        await world.resolve(settled.document_id, "waive", note="Invoiced by hand at the portal")
+    assert (await escalate(world)).draft_missing_opened == [s.document_id for s in decided]
+    if older == "waived":
+        for settled in decided:
+            await world.resolve(settled.document_id, "waive", note="Invoiced by hand at the portal")
     newest = await world.settle(draft=False)
     world.advance(timedelta(minutes=61))
     report = await escalate(world)
