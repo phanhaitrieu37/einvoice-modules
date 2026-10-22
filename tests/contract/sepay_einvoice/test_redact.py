@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from invoice_module.adapters.sepay.redact import normalise_key, redact
-from invoice_module.ports.provider import IssuerAccountView
+from invoice_module.ports.provider import IssuerAccountView, ProviderRejected, ProviderTransient
 
 pytestmark = pytest.mark.contract
 
@@ -157,32 +157,135 @@ def test_redact_masks_buyer_national_id_all_forms(
     assert "SYNTHETIC-ID" not in caplog.text
 
 
+@pytest.mark.parametrize("suffix", ["id_number", "identity_number", "citizen_id", "national_id"])
+@pytest.mark.parametrize("form", ["flat", "camel", "nested", "nested_camel", "descriptor"])
+def test_redact_masks_every_identity_suffix(suffix: str, form: str) -> None:
+    camel = "".join(part.title() for part in suffix.split("_"))
+    body = {
+        "flat": {f"buyer_{suffix}": "SYNTHETIC-ID"},
+        "camel": {f"buyer{camel}": "SYNTHETIC-ID"},
+        "nested": {"buyer": {suffix: "SYNTHETIC-ID"}},
+        "nested_camel": {"buyer": {camel[0].lower() + camel[1:]: "SYNTHETIC-ID"}},
+        "descriptor": {
+            "path": f"data.buyer.{camel[0].lower() + camel[1:]}",
+            "value": "SYNTHETIC-ID",
+        },
+    }[form]
+    redacted = redact(body)
+    assert "SYNTHETIC-ID" not in repr(redacted)
+    assert PII in repr(redacted)
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ({"buyer": [{"tax_code": "0312345678"}]}, {"buyer": [{"tax_code": TAX}]}),
+        ({"buyer": [{"name": "Synthetic"}, {"x": 1}]}, {"buyer": [{"name": PII}, {"x": 1}]}),
+        ({"Buyer": {"taxCode": "0312345678"}}, {"Buyer": {"taxCode": TAX}}),
+        ({"BUYER": {"name": "Synthetic"}}, {"BUYER": {"name": PII}}),
+        (
+            {"path": "data.Buyer.taxCode", "value": "0312345678"},
+            {"path": "data.Buyer.taxCode", "value": TAX},
+        ),
+    ],
+)
+def test_redact_keeps_buyer_context_through_lists_and_case(body: Any, expected: Any) -> None:
+    assert redact(body) == expected
+
+
+@pytest.mark.parametrize("value", [0, [], {}, False, 0.0])
+def test_redact_masks_falsy_values_that_are_not_blank(value: Any) -> None:
+    assert redact({"buyer_name": value}) == {"buyer_name": PII}
+    assert redact({"buyer": {"tax_code": value}}) == {"buyer": {"tax_code": TAX}}
+    assert redact({"path": "buyer.phone", "value": value}) == {"path": "buyer.phone", "value": PII}
+
+
+LOGGED_VALUES = (
+    "Mã số thuế người mua 0000000000 không hợp lệ",
+    "0000000000",
+    "Synthetic Buyer Name",
+    "SYNTHETIC-NATIONAL-ID",
+    "JVBERi0xLjQgc3ludGhldGlj",
+    "%PDF-1.4",
+    "<html",
+    "Xuất hóa đơn thất bại",
+    "keyinv",
+)
+
+
 async def test_adapter_logs_pass_through_redactor(
     harness: Callable[..., Any],
     account: IssuerAccountView,
     creds: Any,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    caplog.set_level(logging.DEBUG, logger="invoice_module")
-    body = {
+    """The adapter logs status, error code, job status and message length, never text.
+
+    Provider messages and bodies stay out of the log (the caller keeps the message);
+    downloads, failed jobs, rejected creates and proxy pages are all covered.
+    """
+    caplog.set_level(logging.DEBUG)
+    rejected = {
+        "success": False,
+        "error": {"code": "VALIDATION_ERROR", "message": LOGGED_VALUES[0]},
+    }
+    failed_job = {
         "success": True,
         "data": {
-            "status": "Success",
+            "status": "Failed",
             "reference_code": REFERENCE,
-            "buyerTaxCode": "0399999999",
-            "buyer": {"taxCode": "0388888888", "name": "Synthetic Buyer Name"},
-            "invoice": {"buyer": {"nationalId": "SYNTHETIC-NATIONAL-ID", "address": ""}},
+            "message": "Xuất hóa đơn thất bại: Synthetic Buyer Name",
+            "invoice": {"buyer": {"tax_code": "0000000000", "nationalId": "SYNTHETIC-NATIONAL-ID"}},
         },
     }
-    h = harness(lambda request: httpx.Response(200, json=body))
-    await h.provider.check_create(account, creds, REFERENCE)
-    failing = harness(lambda request: httpx.Response(422, json=body))
-    with pytest.raises(Exception, match="http_422"):
-        await failing.provider.check_create(account, creds, REFERENCE)
-    adapter_logs = [r for r in caplog.records if r.name.startswith("invoice_module")]
-    assert any(record.levelno == logging.WARNING for record in adapter_logs)
-    text = "\n".join(record.getMessage() for record in adapter_logs)
-    assert REFERENCE in text
-    for value in ("0399999999", "0388888888", "Synthetic Buyer Name", "SYNTHETIC-NATIONAL-ID"):
+    download = {
+        "success": True,
+        "data": {
+            "file_type": "pdf",
+            "file_name": "Synthetic Buyer Name.pdf",
+            "content": "JVBERi0xLjQgc3ludGhldGlj",
+            "pdf_url": "https://example.test/x?keyinv=1",
+        },
+    }
+    html = "<html><body>Synthetic Buyer Name 0000000000</body></html>"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(400, json=rejected)
+        if request.url.path.endswith("/download"):
+            return httpx.Response(200, json=download)
+        if "/check/" in request.url.path:
+            return httpx.Response(200, json=failed_job)
+        return httpx.Response(502, text=html, headers={"content-type": "text/html"})
+
+    h = harness(handler)
+    with pytest.raises(ProviderRejected):
+        await h.provider.create(account, creds, {"reference_code": REFERENCE})
+    progress = await h.provider.check_create(account, creds, REFERENCE)
+    assert progress.provider_message == failed_job["data"]["message"]
+    with pytest.raises(ProviderRejected, match="artifact_xml_missing"):
+        await h.provider.fetch_artifacts(account, creds, REFERENCE, "unused")
+    with pytest.raises(ProviderTransient):
+        await h.provider.find_by_reference(account, creds, REFERENCE)
+    adapter = [r for r in caplog.records if r.name.startswith("invoice_module")]
+    lines = [record.getMessage() for record in adapter]
+    text = "\n".join(lines) + caplog.text
+    for value in LOGGED_VALUES:
         assert value not in text
-        assert value not in caplog.text
+    message = len(LOGGED_VALUES[0])
+    job = len(failed_job["data"]["message"])
+    assert lines == [
+        "sepay einvoice POST /v1/invoices/create -> HTTP 400 code=VALIDATION_ERROR status=None"
+        f" message_length={message}",
+        f"sepay einvoice GET /v1/invoices/create/check/{REFERENCE} -> HTTP 200 code=None"
+        f" status=Failed message_length={job}",
+        f"sepay einvoice GET /v1/invoices/{REFERENCE}/download?type=pdf -> HTTP 200 code=None"
+        " status=None message_length=None",
+        f"sepay einvoice GET /v1/invoices/{REFERENCE}/download?type=xml -> HTTP 200 code=None"
+        " status=None message_length=None",
+        f"sepay einvoice GET /v1/invoices/{REFERENCE} -> HTTP 502 code=None status=None"
+        " message_length=None",
+    ]
+    levels = {record.getMessage().split(" -> ")[0]: record.levelno for record in adapter}
+    assert levels["sepay einvoice POST /v1/invoices/create"] == logging.WARNING
+    assert levels[f"sepay einvoice GET /v1/invoices/{REFERENCE}"] == logging.WARNING

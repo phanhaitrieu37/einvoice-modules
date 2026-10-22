@@ -31,7 +31,6 @@ PROVIDER_ACCOUNT_DETAIL: tuple[str, str] = ("GET", "/v1/provider-accounts/{id}")
 
 TOKEN_TTL_SECONDS = 86400
 LOOKUP_RETURNS_TOTAL = True
-QUOTA_ERROR_CODE: str | None = None
 DOWNLOAD_RETURNS = "bytes"
 
 # Where a provider draft shows up (defensive only: this adapter never creates one) and

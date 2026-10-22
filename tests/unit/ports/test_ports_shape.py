@@ -9,6 +9,7 @@ from invoice_module.builder import build_invoice_module
 from invoice_module.domain.document import _IssuerAccountView
 from invoice_module.ports import provider as provider_port
 from invoice_module.ports.provider import (
+    AccountFacts,
     ClientCredentials,
     EInvoiceProvider,
     IssuerAccountView,
@@ -69,9 +70,27 @@ def test_port_has_no_issue_draft_or_check_issue() -> None:
 
 
 def test_provider_states_include_draft() -> None:
-    expected = {"pending", "success", "failed", "draft"}
+    expected = {"pending", "success", "failed", "draft", "cancelled"}
     assert _states(ProviderProgress) == expected
     assert _states(ProviderInvoice) == expected
+
+
+def test_account_facts_carry_activation_and_approval_date() -> None:
+    hints = get_type_hints(AccountFacts)
+    assert hints["active"] == bool | None
+    assert hints["tax_authority_approved_date"] == date | None
+    facts = AccountFacts(provider_account_id="acc", templates=("1",), series=("C26TSE",))
+    assert facts.active is None
+    assert facts.tax_authority_approved_date is None
+    approved = AccountFacts(
+        provider_account_id="acc",
+        templates=("1",),
+        series=("C26TSE",),
+        active=True,
+        tax_authority_approved_date=date(2026, 4, 20),
+    )
+    assert approved.active is True
+    assert approved.tax_authority_approved_date == date(2026, 4, 20)
 
 
 def test_provider_invoice_has_issued_date() -> None:

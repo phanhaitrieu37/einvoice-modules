@@ -56,7 +56,6 @@ def test_findings_copied_into_adapter_constants() -> None:
     buyer = _load("findings_buyer.json")
     assert findings["token_ttl_seconds"] == endpoints.TOKEN_TTL_SECONDS
     assert findings["lookup_returns_total"] is endpoints.LOOKUP_RETURNS_TOTAL
-    assert findings["quota_error_code"] == endpoints.QUOTA_ERROR_CODE
     assert findings["download_returns"] == endpoints.DOWNLOAD_RETURNS
     assert findings["quota_endpoint"] is (ENDPOINTS["quota"] is not None)
     assert (

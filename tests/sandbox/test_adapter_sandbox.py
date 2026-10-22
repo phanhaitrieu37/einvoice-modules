@@ -1,11 +1,13 @@
 """Adapter behaviour proven on the SePay eInvoice sandbox (never run in CI).
 
 Create budget per full run: s1 one create, s2 two (one accepted, one duplicate), s4 and s6
-none, the issue-date rule at most two.
+none, the issue-date rule at most two, the unknown-reference lookup none, the fractional
+quantity one.
 """
 
 import hashlib
 from datetime import timedelta
+from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
@@ -281,3 +283,87 @@ async def test_issued_date_rule_backdated_create_then_same_reference_today(sandb
     if record["second"]["form"] == "accepted":
         assert record["second"]["final_state"] == "success"
         assert record["second"]["issued_date_provider"] == today.isoformat()
+
+
+async def test_lookup_unknown_reference_shape(sandbox: Any) -> None:
+    """One lookup GET of a random reference: the provider's "no such reference" response."""
+    reference = str(uuid4())
+    response = await sandbox.client.request(
+        "GET",
+        _lookup_path(reference),
+        account=sandbox.account,
+        creds=sandbox.creds,
+        accept=tuple(range(300, 600)),
+    )
+    lookups = [c for c in sandbox.wire if c.path == _lookup_path(reference)]
+    sandbox.evidence(
+        "lookup_unknown_reference",
+        {
+            "gets": len(lookups),
+            "status": response.status,
+            "content_type": lookups[-1].content_type,
+            "body": response.body,
+        },
+    )
+    assert len(lookups) == 1
+    assert response.status == 404, response.status
+
+
+async def test_fractional_quantity_create_as_serialised_today(sandbox: Any) -> None:
+    """One create of the e2e line with quantity 1.5, sent exactly as the adapter builds it."""
+    document = sandbox.document(SYNTHETIC_BUYER, quantity=Decimal("1.5"))
+    reference = str(uuid4())
+    request = sandbox.provider.build_create_payload(
+        sandbox.account, document, reference, sandbox.today()
+    )
+    item = request["items"][0]
+    record: dict[str, Any] = {
+        "request_item": item,
+        "quantity_sent": item["quantity"],
+        "quantity_json_type": type(item["quantity"]).__name__,
+        "total_amount_sent": request["total_amount"],
+    }
+    creates_before = len(sandbox.creates())
+    try:
+        accepted = await sandbox.provider.create(sandbox.account, sandbox.creds, request)
+    except ProviderError as error:
+        call = sandbox.creates()[-1]
+        record["create"] = {
+            "form": "rejected",
+            "status": call.status,
+            "error_code": call.error_code,
+            "error_message": call.error_message,
+            "body": call.body,
+            "content_type": call.content_type,
+            "error": type(error).__name__,
+        }
+    else:
+        call = sandbox.creates()[-1]
+        record["create"] = {
+            "form": "accepted",
+            "status": call.status,
+            "body": call.body,
+            "content_type": call.content_type,
+        }
+        progress, polls = await sandbox.poll(accepted.tracking_code)
+        record["check"] = {
+            "polls": polls,
+            "final_state": progress.state,
+            "provider_message": progress.provider_message,
+            "invoice_number_present": progress.invoice_number is not None,
+        }
+        if progress.state == "success":
+            lookup = await sandbox.raw_get(_lookup_path(reference))
+            data = lookup.get("data") if isinstance(lookup, dict) else {}
+            record["lookup"] = {
+                "items": [
+                    {key: row.get(key) for key in ("quantity", "unit_price", "total_amount")}
+                    for row in data.get("items") or []
+                ],
+                "total_amount": data.get("total_amount"),
+            }
+    record["creates"] = len(sandbox.creates()) - creates_before
+    sandbox.evidence("fractional_quantity", record)
+    assert record["creates"] == 1
+    assert record["create"]["form"] == "accepted", record["create"]
+    assert record["check"]["final_state"] == "success", record["check"]

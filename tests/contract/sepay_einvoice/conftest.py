@@ -178,15 +178,39 @@ def recorded_response(record: dict[str, Any], status: int | None = None) -> http
     return httpx.Response(status or record["status"], json=record["body"])
 
 
+def timeout_of(request: httpx.Request) -> dict[str, float]:
+    return dict(request.extensions["timeout"])
+
+
+def all_phases(seconds: float) -> dict[str, float]:
+    return {"connect": seconds, "read": seconds, "write": seconds, "pool": seconds}
+
+
 @pytest.fixture
 def harness(creds: ClientCredentials) -> Callable[..., Harness]:
-    def build(handler: Handler, *, token_handler: Handler | None = None) -> Harness:
+    """A client over ``MockTransport``; every request must carry the pinned timeout.
+
+    Downloads use ``artifact_timeout_s``, every other call (token included)
+    ``http_timeout_s``; both default to the client defaults (20 s and 90 s).
+    """
+
+    def build(
+        handler: Handler,
+        *,
+        token_handler: Handler | None = None,
+        http_timeout_s: float = 20.0,
+        artifact_timeout_s: float = 90.0,
+        **client_options: Any,
+    ) -> Harness:
         events: list[str] = []
         requests: list[httpx.Request] = []
         issued = iter(f"{TOKEN_VALUE}-{n}" for n in range(1, 100))
 
         def dispatch(request: httpx.Request) -> httpx.Response:
             requests.append(request)
+            download = request.url.path.endswith("/download")
+            expected = artifact_timeout_s if download else http_timeout_s
+            assert timeout_of(request) == all_phases(expected), request.url.path
             if request.url.path == "/v1/token":
                 events.append("token")
                 return token_handler(request) if token_handler else token_response(next(issued))
@@ -195,7 +219,14 @@ def harness(creds: ClientCredentials) -> Callable[..., Harness]:
 
         http = httpx.AsyncClient(transport=httpx.MockTransport(dispatch))
         clock = FakeClock()
-        client = SePayEInvoiceClient(http, StaticResolver(creds), clock, RecordingLimiter(events))
+        options: dict[str, Any] = {**client_options}
+        if http_timeout_s != 20.0:
+            options["http_timeout_s"] = http_timeout_s
+        if artifact_timeout_s != 90.0:
+            options["artifact_timeout_s"] = artifact_timeout_s
+        client = SePayEInvoiceClient(
+            http, StaticResolver(creds), clock, RecordingLimiter(events), **options
+        )
         return Harness(client, SePayEInvoiceProvider(client), clock, events, requests)
 
     return build

@@ -12,6 +12,7 @@ import pytest
 from invoice_module.adapters.sepay import endpoints
 from invoice_module.adapters.sepay.payload import build_create_payload
 from invoice_module.domain.document import Buyer, DraftData, InvoiceDocument, freeze_document
+from invoice_module.domain.enums import BuyerSource
 from invoice_module.domain.money import LineInput
 from invoice_module.ports.provider import IssuerAccountView
 from tools.einvoice_probe.scenarios import _invoice_payload
@@ -231,3 +232,93 @@ def test_issued_date_must_be_a_date(
 ) -> None:
     with pytest.raises(TypeError):
         build_create_payload(account, host_document, REFERENCE, datetime(2026, 10, 20, 9, 0))
+
+
+# --- money and quantity edge matrix ------------------------------------------------------
+# Documents are built directly because ``freeze_document`` already refuses these inputs;
+# the adapter keeps its own guard.
+
+
+def _line(**changes: object) -> dict[str, object]:
+    line: dict[str, object] = {
+        "name": "Dòng mẫu",
+        "unit": "Cái",
+        "item_code": "SYN-001",
+        "quantity": "1",
+        "unit_price_vnd": 1000,
+        "discount_vnd": 0,
+        "tax_rate": 0,
+        "before_vnd": 1000,
+        "taxable_vnd": 1000,
+        "tax_vnd": 0,
+        "line_total_vnd": 1000,
+    }
+    line.update(changes)
+    return line
+
+
+def _document(line: dict[str, object], total: object = 1000) -> InvoiceDocument:
+    return InvoiceDocument(
+        buyer={"name": "Người mua mẫu"},
+        buyer_source=BuyerSource.FALLBACK,
+        lines=(line,),
+        total_vnd=total,  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.parametrize(("rate", "tax"), [(-2, 0), (-1, 0), (0, 0), (5, 50), (8, 80), (10, 100)])
+def test_tax_rate_matrix_is_sent_unchanged(account: IssuerAccountView, rate: int, tax: int) -> None:
+    line = _line(tax_rate=rate, tax_vnd=tax, line_total_vnd=1000 + tax)
+    item = build_create_payload(account, _document(line, 1000 + tax), REFERENCE, ISSUED)["items"][0]
+    assert item["tax_rate"] == rate
+    assert type(item["tax_rate"]) is int
+    assert item["tax_amount"] == tax
+
+
+@pytest.mark.parametrize(
+    "field", ["unit_price_vnd", "discount_vnd", "tax_vnd", "before_vnd", "tax_rate"]
+)
+@pytest.mark.parametrize("value", [1000.0, True, False, Decimal("1000"), "1000", None])
+def test_money_fields_refuse_anything_but_int(
+    account: IssuerAccountView, field: str, value: object
+) -> None:
+    with pytest.raises(TypeError, match=field):
+        build_create_payload(account, _document(_line(**{field: value})), REFERENCE, ISSUED)
+
+
+@pytest.mark.parametrize("total", [1000.0, True, Decimal("1000"), "1000"])
+def test_document_total_refuses_anything_but_int(account: IssuerAccountView, total: object) -> None:
+    with pytest.raises(TypeError, match="total_vnd"):
+        build_create_payload(account, _document(_line(), total), REFERENCE, ISSUED)
+
+
+@pytest.mark.parametrize("quantity", [1.5, 1.0, True])
+def test_float_or_bool_quantity_is_refused(account: IssuerAccountView, quantity: object) -> None:
+    with pytest.raises(TypeError, match="quantity"):
+        build_create_payload(account, _document(_line(quantity=quantity)), REFERENCE, ISSUED)
+
+
+@pytest.mark.parametrize(
+    "quantity", ["NaN", "sNaN", "Infinity", "-Infinity", Decimal("NaN"), Decimal("Infinity")]
+)
+def test_non_finite_quantity_is_refused(account: IssuerAccountView, quantity: object) -> None:
+    with pytest.raises(ValueError, match="quantity"):
+        build_create_payload(account, _document(_line(quantity=quantity)), REFERENCE, ISSUED)
+
+
+@pytest.mark.parametrize(
+    ("quantity", "sent"),
+    [
+        ("1.50", "1.50"),
+        (Decimal("1.5"), "1.5"),
+        ("0.01", "0.01"),
+        ("2", 2),
+        ("2.00", 2),
+        (Decimal("3"), 3),
+        (4, 4),
+    ],
+)
+def test_quantity_wire_form(account: IssuerAccountView, quantity: object, sent: object) -> None:
+    item = build_create_payload(account, _document(_line(quantity=quantity)), REFERENCE, ISSUED)
+    assert item["items"][0]["quantity"] == sent
+    assert type(item["items"][0]["quantity"]) is type(sent)

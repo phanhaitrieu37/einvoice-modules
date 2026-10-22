@@ -29,6 +29,7 @@ from invoice_module.ports.provider import (
     IssuerAccountView,
     ProviderInvoice,
     ProviderProgress,
+    ProviderRejected,
     ProviderState,
 )
 
@@ -38,6 +39,16 @@ LINE_TYPE_GOODS = 1
 BUYER_TYPES = {"company": "company", "individual": "personal"}
 NO_INVOICE_NUMBER = "0"
 _ISO_DATE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+# The one provider message the docs give an instruction for (pages
+# ``theo-doi-trang-thai-xuat-hoa-don`` and ``xu-ly-loi``): when ``message`` is this sentence,
+# "trạng thái hóa đơn chưa xác định. Không gửi lại yêu cầu - hãy liên hệ SePay". It is
+# matched exactly (after strip) at any job status and reported as an error code; no other
+# provider text is interpreted.
+PROVIDER_UNCONFIRMED_MESSAGE = (
+    "Hệ thống chưa xác nhận được kết quả phát hành với nhà cung cấp hóa đơn"
+)
+PROVIDER_UNCONFIRMED = "provider_unconfirmed"
+LOOKUP_REFERENCE_MISMATCH = "lookup_reference_mismatch"
 
 
 def build_create_payload(
@@ -148,7 +159,7 @@ def _invoice_number(value: Any) -> str | None:
     return None if number is None or number.strip() == NO_INVOICE_NUMBER else number
 
 
-def _issued_date(value: Any) -> date | None:
+def _iso_date(value: Any) -> date | None:
     text = _text(value)
     match = _ISO_DATE.match(text) if text else None
     if match is None:
@@ -192,8 +203,22 @@ def _is_draft(body: Any, marker: tuple[str, str]) -> bool:
     return _at(body, path) == value
 
 
-def parse_accepted(body: Any) -> Accepted:
-    return Accepted(tracking_code=_text(response_data(body).get("tracking_code")))
+def parse_accepted(body: Any) -> Accepted | None:
+    """The create acceptance, or ``None`` without ``success: true`` and a tracking code.
+
+    Docs ``xu-ly-loi``: "success: true kèm data.tracking_code nghĩa là yêu cầu đã được tiếp
+    nhận".
+    """
+    if not isinstance(body, Mapping) or body.get("success") is not True:
+        return None
+    tracking_code = _text(response_data(body).get("tracking_code"))
+    return Accepted(tracking_code=tracking_code) if tracking_code is not None else None
+
+
+def _unconfirmed(message: str | None) -> str | None:
+    if message is not None and message.strip() == PROVIDER_UNCONFIRMED_MESSAGE:
+        return PROVIDER_UNCONFIRMED
+    return None
 
 
 def parse_progress(body: Any) -> ProviderProgress:
@@ -201,45 +226,57 @@ def parse_progress(body: Any) -> ProviderProgress:
     data = response_data(body)
     status = data.get("status")
     invoice = data.get("invoice") if isinstance(data.get("invoice"), Mapping) else {}
+    message = _text(data.get("message"))
     if status == "Failed":
-        return ProviderProgress(state="failed", provider_message=_text(data.get("message")))
+        return ProviderProgress(
+            state="failed", provider_message=message, error_code=_unconfirmed(message)
+        )
     if status == "Success":
         state: ProviderState = "draft" if _is_draft(body, DRAFT_MARKER) else "success"
         return ProviderProgress(
             state=state,
+            error_code=_unconfirmed(message),
             invoice_number=_invoice_number(invoice.get("invoice_number")),
             tax_authority_code=_text(invoice.get("tax_authority_code")),
-            issued_date=_issued_date(_at(body, PROVIDER_ISSUED_DATE_PATH["check"])),
+            issued_date=_iso_date(_at(body, PROVIDER_ISSUED_DATE_PATH["check"])),
         )
     retry = data.get("retry") if isinstance(data.get("retry"), Mapping) else {}
     return ProviderProgress(
-        state="pending", next_retry_at=_provider_datetime(retry.get("next_retry_at"))
+        state="pending",
+        next_retry_at=_provider_datetime(retry.get("next_retry_at")),
+        error_code=_unconfirmed(message),
     )
 
 
 def parse_invoice(body: Any, reference_code: str) -> ProviderInvoice:
     """A lookup by reference (``GET /v1/invoices/{reference_code}``).
 
-    ``issued`` is the only success. A draft, a failed job, or any status this adapter does
-    not know is never reported as success; unknown statuses stay ``pending``.
+    ``issued`` is the only success and ``cancelled`` is reported as such. A draft, a failed
+    job, or any status this adapter does not know is never reported as success; unknown
+    statuses stay ``pending``. An invoice of another reference is refused.
     """
     data = response_data(body)
     status = data.get("status")
+    returned = _text(data.get("reference_code"))
+    if returned is not None and returned != reference_code:
+        raise ProviderRejected(LOOKUP_REFERENCE_MISMATCH)
     if _is_draft(body, DRAFT_MARKER_LOOKUP):
         state: ProviderState = "draft"
     elif status == "issued":
         state = "success"
+    elif status == "cancelled":
+        state = "cancelled"
     elif status == "failed":
         state = "failed"
     else:
         state = "pending"
     return ProviderInvoice(
-        reference_code=_text(data.get("reference_code")) or reference_code,
+        reference_code=reference_code,
         state=state,
         invoice_number=_invoice_number(data.get("invoice_number")),
         tax_authority_code=_text(data.get("tax_authority_code")),
         total_amount_vnd=_amount(data.get("total_amount")) if LOOKUP_RETURNS_TOTAL else None,
-        issued_date=_issued_date(_at(body, PROVIDER_ISSUED_DATE_PATH["lookup"])),
+        issued_date=_iso_date(_at(body, PROVIDER_ISSUED_DATE_PATH["lookup"])),
         provider_message=_text(data.get("message")) if state == "failed" else None,
     )
 
@@ -258,9 +295,14 @@ def parse_account_facts(
     quota = None
     if ENDPOINTS["quota"] is not None and quota_body is not None:
         quota = _amount(response_data(quota_body).get("quota_remaining"))
+    active = response_data(detail_body).get("active")
     return AccountFacts(
         provider_account_id=provider_account_id,
         templates=tuple(template for template, _ in pairs),
         series=tuple(series for _, series in pairs),
         quota_remaining=quota,
+        active=active if isinstance(active, bool) else None,
+        tax_authority_approved_date=_iso_date(
+            response_data(detail_body).get("tax_authority_approved_date")
+        ),
     )

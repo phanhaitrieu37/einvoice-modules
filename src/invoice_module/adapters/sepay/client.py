@@ -9,12 +9,20 @@ corresponds to at most one request on the wire.
 ``http_timeout_s`` only ends the client's wait. It does not prove that the provider dropped
 the request; a document whose outcome is unclear stays for the operator to reconcile and
 its reference is never changed here.
+
+The access token travels only inside ``_Token`` and ``_BearerAuth``, whose reprs hide it, so
+no frame argument or local of a failure traceback shows it. Logs carry the method, path,
+HTTP status, ``error.code``, ``data.status`` and the length of the provider message, never a
+body or provider text (the full message is kept by the caller, not logged here).
+
+The ``httpx.AsyncClient`` is the host's: its own mounts, proxies or event hooks decide where
+a request really goes, so the sandbox guard here checks the configured base URLs only.
 """
 
 import json
 import logging
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Generator, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -22,9 +30,8 @@ from typing import Any
 import httpx
 
 from invoice_module.adapters.sepay.endpoints import SANDBOX_BASE_URL, TOKEN_TTL_SECONDS, endpoint
-from invoice_module.adapters.sepay.errors import map_error
+from invoice_module.adapters.sepay.errors import error_code, map_error
 from invoice_module.adapters.sepay.rate_limiter import ProcessRateLimiter
-from invoice_module.adapters.sepay.redact import redact
 from invoice_module.domain.enums import Environment
 from invoice_module.ports.clock import Clock
 from invoice_module.ports.credentials import CredentialResolver
@@ -42,6 +49,8 @@ logger = logging.getLogger(__name__)
 
 REFRESH_MARGIN = timedelta(minutes=5)
 OK_STATUSES = range(200, 300)
+# A token lifetime outside (0, one year] is not believed; the documented 24 h is used.
+MAX_TOKEN_TTL_SECONDS = 365 * 86400
 
 
 @dataclass(frozen=True)
@@ -55,11 +64,27 @@ class _Token:
         return "_Token(<hidden>)"
 
 
+class _BearerAuth(httpx.Auth):
+    """Adds ``Authorization: Bearer <token>`` at send time; the repr never shows the token."""
+
+    def __init__(self, token: _Token) -> None:
+        self._token = token
+
+    def __repr__(self) -> str:
+        return "_BearerAuth(<hidden>)"
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        request.headers["Authorization"] = "Bearer " + self._token.value
+        yield request
+
+
 @dataclass(frozen=True)
 class Response:
+    """A decoded response; the repr leaves out the body and headers (tracebacks)."""
+
     status: int
-    body: Any
-    headers: Mapping[str, str]
+    body: Any = field(repr=False)
+    headers: Mapping[str, str] = field(repr=False)
 
 
 class SePayEInvoiceClient:
@@ -71,7 +96,12 @@ class SePayEInvoiceClient:
         limiter: ProcessRateLimiter,
         base_urls: Mapping[Environment, str] | None = None,
         http_timeout_s: float = 20.0,
+        artifact_timeout_s: float = 90.0,
     ) -> None:
+        """``artifact_timeout_s`` bounds a PDF/XML download, which the sandbox served in
+        over 20 s; a longer wait there is safe because a download is a GET that carries no
+        POST budget and no lease.
+        """
         urls = dict(base_urls) if base_urls is not None else {Environment.TEST: SANDBOX_BASE_URL}
         if urls.get(Environment.TEST, SANDBOX_BASE_URL) != SANDBOX_BASE_URL:
             raise ProviderConfigError("the test environment must use the SePay sandbox")
@@ -82,7 +112,10 @@ class SePayEInvoiceClient:
         self._limiter = limiter
         self._base_urls = urls
         self._timeout = http_timeout_s
-        self._tokens: dict[str, _Token] = {}
+        self.artifact_timeout_s = artifact_timeout_s
+        # A token is bound to the environment that issued it (docs: a sandbox token gets
+        # 401 on production), so the cache key carries both.
+        self._tokens: dict[tuple[str, Environment], _Token] = {}
 
     def base_url_for(self, environment: Environment) -> str:
         url = self._base_urls.get(Environment(environment))
@@ -90,8 +123,8 @@ class SePayEInvoiceClient:
             raise ProviderConfigError(f"no SePay eInvoice URL configured for {environment}")
         return url.rstrip("/")
 
-    def invalidate(self, credential_ref: str) -> None:
-        self._tokens.pop(credential_ref, None)
+    def invalidate(self, account: IssuerAccountView) -> None:
+        self._tokens.pop(_token_key(account), None)
 
     async def request(
         self,
@@ -103,21 +136,23 @@ class SePayEInvoiceClient:
         json: Mapping[str, object] | None = None,
         before_send: BeforeSend | None = None,
         accept: tuple[int, ...] = (),
-        log_body: bool = True,
+        timeout_s: float | None = None,
     ) -> Response:
         """Send one API call and return a success (or ``accept``-listed) response.
 
         Any other status is raised as a port error. ``SendAborted`` means no request was
-        sent because ``before_send`` returned ``False``.
+        sent because ``before_send`` returned ``False``. ``timeout_s`` replaces
+        ``http_timeout_s`` for this call only.
         """
         url = self.base_url_for(account.environment) + path
+        timeout = self._timeout if timeout_s is None else timeout_s
         token, fresh = await self._token(account, creds)
         await self._limiter.acquire()
         if before_send is not None and not await before_send():
             raise SendAborted()
-        response = await self._send(method, url, token, json)
+        response = await self._send(method, url, token, json, timeout)
         if response.status == 401:
-            self.invalidate(account.credential_ref)
+            self.invalidate(account)
             if method != "GET":
                 # Never resend a create: the next call starts with a new token.
                 if fresh:
@@ -125,11 +160,11 @@ class SePayEInvoiceClient:
                 raise ProviderTransient(retry_after=None)
             token, _ = await self._token(account, creds)
             await self._limiter.acquire()
-            response = await self._send(method, url, token, json)
+            response = await self._send(method, url, token, json, timeout)
             if response.status == 401:
-                self.invalidate(account.credential_ref)
+                self.invalidate(account)
                 raise ProviderAuthFailed("token rejected")
-        self._log(method, path, response, log_body)
+        _log(method, path, response)
         if response.status in OK_STATUSES or response.status in accept:
             return response
         raise map_error(response.status, response.body, response.headers)
@@ -137,8 +172,8 @@ class SePayEInvoiceClient:
     async def _token(
         self, account: IssuerAccountView, creds: ClientCredentials | None
     ) -> tuple[_Token, bool]:
-        ref = account.credential_ref
-        cached = self._tokens.get(ref)
+        key = _token_key(account)
+        cached = self._tokens.get(key)
         now = self._clock.now()
         if (
             cached is not None
@@ -147,7 +182,7 @@ class SePayEInvoiceClient:
         ):
             return cached, False
         if creds is None:
-            creds = await self._credentials.client_credentials(ref)
+            creds = await self._credentials.client_credentials(account.credential_ref)
         method, path = endpoint("token")
         await self._limiter.acquire()
         try:
@@ -160,31 +195,25 @@ class SePayEInvoiceClient:
             )
         except httpx.HTTPError as error:
             raise ProviderTransient(retry_after=None) from error
-        response = _response(raw)
-        if response.status not in OK_STATUSES:
-            logger.warning("sepay einvoice token request failed with HTTP %s", response.status)
-            raise map_error(response.status, response.body, response.headers)
-        data = response.body.get("data") if isinstance(response.body, Mapping) else None
-        value = data.get("access_token") if isinstance(data, Mapping) else None
-        if not isinstance(value, str) or not value:
-            raise ProviderAuthFailed("token response without an access token")
-        ttl = data.get("expires_in")
-        if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl <= 0:
-            ttl = TOKEN_TTL_SECONDS
-        token = _Token(value, now + timedelta(seconds=ttl))
-        self._tokens[ref] = token
+        token = _parse_token(_response(raw), now)
+        self._tokens[key] = token
         return token, True
 
     async def _send(
-        self, method: str, url: str, token: _Token, body: Mapping[str, object] | None
+        self,
+        method: str,
+        url: str,
+        token: _Token,
+        body: Mapping[str, object] | None,
+        timeout: float,
     ) -> Response:
         try:
             raw = await self._http.request(
                 method,
                 url,
                 json=dict(body) if body is not None else None,
-                headers={"Authorization": f"Bearer {token.value}"},
-                timeout=self._timeout,
+                auth=_BearerAuth(token),
+                timeout=timeout,
                 follow_redirects=False,
             )
         except httpx.HTTPError as error:
@@ -192,24 +221,51 @@ class SePayEInvoiceClient:
             raise ProviderTransient(retry_after=None) from error
         return _response(raw)
 
-    def _log(self, method: str, path: str, response: Response, log_body: bool) -> None:
-        level = logging.DEBUG if response.status in OK_STATUSES else logging.WARNING
-        if log_body:
-            logger.log(
-                level,
-                "sepay einvoice %s %s -> HTTP %s %s",
-                method,
-                path,
-                response.status,
-                redact(response.body),
-            )
-        else:
-            logger.log(level, "sepay einvoice %s %s -> HTTP %s", method, path, response.status)
+
+def _token_key(account: IssuerAccountView) -> tuple[str, Environment]:
+    return account.credential_ref, Environment(account.environment)
+
+
+def _parse_token(response: Response, now: datetime) -> _Token:
+    """The token of a ``/v1/token`` response; nothing can raise once the value is read."""
+    if response.status not in OK_STATUSES:
+        logger.warning("sepay einvoice token request failed with HTTP %s", response.status)
+        raise map_error(response.status, response.body, response.headers)
+    data = response.body.get("data") if isinstance(response.body, Mapping) else None
+    if not isinstance(data, Mapping):
+        raise ProviderAuthFailed("token response without an access token")
+    ttl = data.get("expires_in")
+    if isinstance(ttl, bool) or not isinstance(ttl, int) or not 0 < ttl <= MAX_TOKEN_TTL_SECONDS:
+        ttl = TOKEN_TTL_SECONDS
+    expires_at = now + timedelta(seconds=ttl)
+    if not isinstance(data.get("access_token"), str) or not data["access_token"]:
+        raise ProviderAuthFailed("token response without an access token")
+    return _Token(data["access_token"], expires_at)
+
+
+def _log(method: str, path: str, response: Response) -> None:
+    """One line per response, without the body or any provider text."""
+    level = logging.DEBUG if response.status in OK_STATUSES else logging.WARNING
+    body = response.body if isinstance(response.body, Mapping) else {}
+    data = body.get("data") if isinstance(body.get("data"), Mapping) else {}
+    error = body.get("error") if isinstance(body.get("error"), Mapping) else {}
+    message = error.get("message", data.get("message"))
+    status = data.get("status")
+    logger.log(
+        level,
+        "sepay einvoice %s %s -> HTTP %s code=%s status=%s message_length=%s",
+        method,
+        path,
+        response.status,
+        error_code(body),
+        status if isinstance(status, str) else None,
+        len(message) if isinstance(message, str) else None,
+    )
 
 
 def _response(raw: httpx.Response) -> Response:
     try:
         body: Any = json.loads(raw.content, parse_float=Decimal) if raw.content else None
-    except ValueError:
+    except (ValueError, RecursionError):
         body = None
     return Response(status=raw.status_code, body=body, headers=dict(raw.headers))

@@ -121,6 +121,10 @@ class WireCall:
     status: int
     error_code: str | None = None
     error_message: str | None = None
+    content_type: str | None = None
+    # Decoded JSON body of API calls other than the token request and downloads (kept in
+    # memory only; evidence copies go through ``mask_ids``).
+    body: Any = None
 
 
 @dataclass(repr=False)
@@ -140,12 +144,13 @@ class Sandbox:
     def creates(self) -> list[WireCall]:
         return [c for c in self.wire if c.method == "POST" and c.path == "/v1/invoices/create"]
 
-    def document(self, buyer: Buyer | None) -> InvoiceDocument:
+    def document(self, buyer: Buyer | None, quantity: Decimal | None = None) -> InvoiceDocument:
+        """The e2e product line; ``quantity`` replaces the configured one when given."""
         product = self.config["product_lines"][0]
         line = LineInput(
             name=product["name"],
             unit=product["unit"],
-            quantity=Decimal(str(product["quantity"])),
+            quantity=Decimal(str(product["quantity"])) if quantity is None else quantity,
             unit_price_vnd=product["unit_price_vnd"],
             tax_rate=product["tax_rate"],
             item_code=SANDBOX_ITEM_CODE,
@@ -229,8 +234,15 @@ async def sandbox(
 
     async def record(response: httpx.Response) -> None:
         await response.aread()
-        call = WireCall(response.request.method, response.request.url.path, response.status_code)
-        if response.status_code >= 400 and response.request.url.path != "/v1/token":
+        path = response.request.url.path
+        call = WireCall(response.request.method, path, response.status_code)
+        call.content_type = response.headers.get("content-type")
+        if path != "/v1/token" and not path.endswith("/download"):
+            try:
+                call.body = json.loads(response.content)
+            except ValueError:
+                call.body = None
+        if response.status_code >= 400 and path != "/v1/token":
             try:
                 error = json.loads(response.content).get("error") or {}
                 call.error_code, call.error_message = error.get("code"), error.get("message")
