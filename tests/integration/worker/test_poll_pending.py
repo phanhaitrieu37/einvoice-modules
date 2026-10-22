@@ -2,7 +2,7 @@ from datetime import date, timedelta
 
 import pytest
 from tests.fakes.fake_einvoice_provider import TRANSIENT
-from tests.integration.worker.world import vn
+from tests.integration.worker.world import TENANT, vn
 
 from invoice_module.domain.enums import DeliveryMode
 from invoice_module.ports.provider import ProviderProgress
@@ -188,3 +188,24 @@ async def test_no_branching_on_provider_message_text(world):
     assert outcomes[0] == outcomes[1]
     await world.drive(rounds=3)
     assert len(world.provider.posts()) == 2
+
+
+async def test_finalize_issued_clears_open_provider_reasons(world):
+    settled = await accepted(world)
+    async with world.crash() as uow:
+        await uow.review_cases.open_once(
+            TENANT, settled.document_id, "PROVIDER_TIMEOUT", {"poll_count": 0}, world.clock.now()
+        )
+        await uow.commit()
+    await world.poll()
+    doc = await world.doc(settled.document_id)
+    [case] = await world.cases(settled.document_id)
+    [entry] = case.details["reasons"]
+    assert doc.status == "issued"
+    assert (entry["reason"], entry["status"], entry["resolution"], entry["cleared_by"]) == (
+        "PROVIDER_TIMEOUT",
+        "cleared",
+        "retry",
+        "system:issuance",
+    )
+    assert case.status == "resolved"

@@ -614,3 +614,27 @@ async def test_post_budget_caps_crash_then_timeout_at_two_posts(world, mode):
     doc = await assert_converged(world, settled)
     assert len(posts(world, settled)) == 2
     assert (doc.status, doc.last_error_code) == ("failed", "max_attempts_exceeded")
+
+
+async def test_refreeze_for_new_day_keeps_operator_resend_permission(world):
+    settled = await failed_record_retried(world)
+    world.provider.script_create(settled.reference, CRASH_BEFORE_SEND)
+    with pytest.raises(Crash):
+        await world.issue()  # frozen with the operator's permission, died before the send
+    world.clock.set(vn(2026, 10, 22, 0, 10))
+    world.restart()
+    world.provider.script_create(settled.reference, CRASH_BEFORE_SEND)
+    with pytest.raises(Crash):
+        await world.issue()  # refrozen for the new day, died before the send again
+    refrozen = await world.doc(settled.document_id)
+    assert (refrozen.issued_date, refrozen.request_authorized_resend) == (date(2026, 10, 22), True)
+    await restart(world)
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.request_authorized_resend) == ("pending_provider", False)
+    assert len(posts(world, settled)) == 2 and issued(posts(world, settled)[-1]) == date(
+        2026, 10, 22
+    )
+    await converge(world, rounds=3)
+    await assert_converged(world, settled)
+    assert len(posts(world, settled)) == 2

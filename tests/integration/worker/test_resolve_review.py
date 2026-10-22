@@ -1278,3 +1278,95 @@ async def test_retry_failed_refused_while_duplicate_hold_active(world):
         "DUPLICATE_SETTLEMENT",
         "PROVIDER_REJECTED",
     ]
+
+
+@pytest.mark.parametrize("history", ["after_grant", "after_date_resend"])
+async def test_rotation_resets_post_budget_after_grant_and_after_date_resend(world, history):
+    if history == "after_grant":
+        settled = await failed_by(world, AUTH_FAILED_BEFORE_SEND)
+        await world.resolve(settled.document_id, "retry")
+        assert (await world.doc(settled.document_id)).post_limit == 1
+        world.provider.script_create(settled.reference, AUTH_FAILED_BEFORE_SEND)
+        await world.issue()
+        doc = await world.doc(settled.document_id)
+        assert (doc.status, doc.post_count, doc.post_limit) == ("failed", 0, 1)
+    else:
+        settled = await failed_after_date_reviews(world)
+    await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    doc = await world.doc(settled.document_id)
+    assert doc.reference_code != settled.reference
+    assert (doc.post_count, doc.post_limit, doc.date_resend_at, doc.send_started_at) == (
+        0,
+        2,
+        None,
+        None,
+    )
+    # The new reference gets the default two automatic POSTs, no more and no fewer.
+    world.provider.script_create(doc.reference_code, TRANSIENT, TRANSIENT, TRANSIENT)
+    await run_claims(world, times=4, step=timedelta(minutes=10))
+    doc = await world.doc(settled.document_id)
+    assert len(world.provider.posts(doc.reference_code)) == 2
+    assert (doc.status, doc.last_error_code, doc.post_count) == (
+        "failed",
+        "max_attempts_exceeded",
+        2,
+    )
+
+
+@pytest.mark.parametrize("state", ["success", "pending"])
+async def test_attach_draft_on_failed_refused_when_provider_holds_record(world, state):
+    settled = await failed_by(world, rejected("validation_error"))
+    before = await world.doc(settled.document_id)
+    world.provider.seed_invoice(
+        FakeInvoice(
+            settled.reference,
+            date(2026, 10, 21),
+            100,
+            pending_polls=5 if state == "pending" else 0,
+        )
+    )
+    with pytest.raises(ResolutionNotAllowed, match=f"provider_record_{state}"):
+        await world.resolve(
+            settled.document_id,
+            "attach_draft",
+            draft=world.draft_command(settled.host_ref_id, settled.intent_id, name="Corrected"),
+        )
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.document, doc.request, doc.lease_generation) == (
+        "failed",
+        before.document,
+        before.request,
+        before.lease_generation,
+    )
+    assert await world.open_reasons(settled.document_id) == ["PROVIDER_REJECTED"]
+    assert len(world.provider.posts()) == 1
+
+
+async def test_operator_write_fenced_when_generation_moves_during_lookup(world):
+    settled = await failed_by(world, rejected("validation_error"))
+    case = await world.open_case(settled.document_id)
+    gate, entered = asyncio.Event(), asyncio.Event()
+    real = world.provider.find_by_reference
+
+    async def slow(account, creds, reference_code):
+        entered.set()
+        await gate.wait()
+        return await real(account, creds, reference_code)
+
+    world.provider.find_by_reference = slow
+    first = asyncio.create_task(world.module.resolve_review.execute(case.id, "retry", "op-a"))
+    await entered.wait()
+    world.provider.find_by_reference = real
+    # Another operator rotates meanwhile and stops after the first transaction.
+    world.crash.crash_after_next_commit()
+    with pytest.raises(Crash):
+        await world.build().resolve_review.execute(
+            case.id, "retry_with_new_reference", "op-b", NOTE
+        )
+    moved = await world.doc(settled.document_id)
+    assert moved.reference_code != settled.reference
+    gate.set()
+    with pytest.raises(DocumentInFlight):
+        await first
+    assert await world.doc(settled.document_id) == moved
+    assert await world.open_reasons(settled.document_id) == ["PROVIDER_REJECTED"]
