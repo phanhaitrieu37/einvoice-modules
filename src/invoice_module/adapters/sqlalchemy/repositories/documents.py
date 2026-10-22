@@ -624,10 +624,11 @@ class DocumentRepository(SqlAlchemyRepository):
     ) -> dict[str, Any] | None:
         """Drop an approval and keep it in ``details.previous_approvals`` of the case.
 
-        Without ``case_id`` the open case, or else the latest case, of the document holds the
-        audit. ``values`` are written in the same statement (an ``approved`` document must
-        leave that status as its approval goes). Returns the audit entry, or ``None`` when
-        there was no approval (``values`` are still written).
+        Without ``case_id`` the open case of the document holds the audit; a closed case is
+        never written, as it may belong to an unrelated decision (the caller logs the entry).
+        ``values`` are written in the same statement (an ``approved`` document must leave that
+        status as its approval goes). Returns the audit entry, or ``None`` when there was no
+        approval (``values`` are still written).
         """
         table, reviews = self.tables.documents, self.tables.review_cases
         row = (
@@ -660,13 +661,9 @@ class DocumentRepository(SqlAlchemyRepository):
         )
         if case_id is None:
             case_id = await self.session.scalar(
-                sa.select(reviews.c.id)
-                .where(reviews.c.document_id == document_id)
-                .order_by(
-                    sa.case((reviews.c.status == "open", 0), else_=1),
-                    reviews.c.opened_at.desc(),
+                sa.select(reviews.c.id).where(
+                    reviews.c.document_id == document_id, reviews.c.status == "open"
                 )
-                .limit(1)
             )
         if case_id is not None:
             details = dict(

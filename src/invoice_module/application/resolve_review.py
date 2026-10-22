@@ -437,9 +437,9 @@ class ResolveReview:
             # The earlier outcome is unknown: keep the frozen request; the worker looks the
             # reference up again before it resends it (or refreezes for a new day).
             if document.delivery_mode == DeliveryMode.MANUAL and approval_valid(document):
-                status = await self._requeue(uow, document, now, target=S.APPROVED)
+                status = await self._requeue(uow, document, now, request.case_id, target=S.APPROVED)
             else:
-                status = await self._requeue(uow, document, now, target=S.QUEUED)
+                status = await self._requeue(uow, document, now, request.case_id, target=S.QUEUED)
         else:
             # A known failed record: a new request is frozen and sent once; the permission to
             # resend survives a crash between that freeze and the POST.
@@ -447,6 +447,7 @@ class ResolveReview:
                 uow,
                 document,
                 now,
+                request.case_id,
                 target=S.QUEUED,
                 request=None,
                 request_frozen_at=None,
@@ -480,7 +481,7 @@ class ResolveReview:
                 await uow.documents.bump_generation(document.id)
                 return document.status
             if document.document is not None:
-                return await self._requeue(uow, document, now, target=S.QUEUED)
+                return await self._requeue(uow, document, now, request.case_id, target=S.QUEUED)
             return await self._evaluate_draft(uow, document, request, now)
         await self._clear(uow, document, request)
         if await duplicate_hold_active(uow, document.id):
@@ -493,7 +494,7 @@ class ResolveReview:
                 document.id, now, status=S.AWAITING_APPROVAL.value, next_attempt_at=None
             )
             return S.AWAITING_APPROVAL
-        return await self._requeue(uow, document, now, target=S.QUEUED)
+        return await self._requeue(uow, document, now, request.case_id, target=S.QUEUED)
 
     async def _evaluate_draft(
         self, uow: InvoiceUnitOfWork, document: DocumentRow, request: _Request, now: datetime
@@ -636,7 +637,7 @@ class ResolveReview:
             if await duplicate_hold_active(uow, document.id):
                 await uow.commit()
                 return document.status
-            status = await self._requeue(uow, document, now, target=S.QUEUED)
+            status = await self._requeue(uow, document, now, request.case_id, target=S.QUEUED)
             await uow.commit()
         return status
 
@@ -659,13 +660,17 @@ class ResolveReview:
         uow: InvoiceUnitOfWork,
         document: DocumentRow,
         now: datetime,
+        case_id: UUID,
         *,
         target: DocumentStatus,
         **values: Any,
     ) -> DocumentStatus:
         if target == S.QUEUED and document.delivery_mode == DeliveryMode.MANUAL:
-            # A manual document back in the queue always needs a fresh approval.
-            await uow.documents.clear_approval(document.id, None, "system:requeue", "requeued", now)
+            # A manual document back in the queue always needs a fresh approval; the case being
+            # resolved keeps the audit even when this resolution just closed it.
+            await uow.documents.clear_approval(
+                document.id, case_id, "system:requeue", "requeued", now
+            )
         state.ensure_transition(document.status, target)
         await uow.documents.operator_update(
             document.id,

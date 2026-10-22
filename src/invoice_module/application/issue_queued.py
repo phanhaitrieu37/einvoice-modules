@@ -147,8 +147,9 @@ class IssueQueued:
         """An unapproved manual draft stays in the module: no provider call before approval."""
         now = self._clock.now()
         async with self._uow_factory() as uow:
+            entry = None
             if document.approved_at is not None:
-                await uow.documents.clear_approval(
+                entry = await uow.documents.clear_approval(
                     document.id, None, "system:issue", "returned_to_queue", now
                 )
             if document.request is None:
@@ -164,6 +165,7 @@ class IssueQueued:
             ):
                 return self._lease_lost(document)
             await uow.commit()
+        _log_approval_invalidated(document, entry)
         return IssueResult(document.id, DocumentStatus.AWAITING_APPROVAL.value)
 
     async def _reset_stale_approval(
@@ -182,7 +184,7 @@ class IssueQueued:
             ):
                 return self._lease_lost(document)
             state.ensure_transition(document.status, DocumentStatus.AWAITING_APPROVAL)
-            await uow.documents.clear_approval(
+            entry = await uow.documents.clear_approval(
                 document.id,
                 None,
                 "system:issue",
@@ -194,7 +196,7 @@ class IssueQueued:
                 lease_until=None,
             )
             await uow.commit()
-        logger.warning("invoice_approval_invalidated", extra={"document_id": str(document.id)})
+        _log_approval_invalidated(document, entry)
         return IssueResult(document.id, DocumentStatus.AWAITING_APPROVAL.value)
 
     async def _freeze_and_send(
@@ -521,9 +523,13 @@ class IssueQueued:
             and current.date_resend_at is None
             and current.post_count < current.post_limit
         ):
-            return await self._freeze_send(
-                current, account, today_vn(self._clock.now()), date_resend=True
-            )
+            today = today_vn(self._clock.now())
+            # The resend goes through the cross-day policy like every other send.
+            if current.delivery_mode == DeliveryMode.AUTO and today != today_vn(current.settled_at):
+                blocked = await self._cross_day(current, account, today)
+                if blocked is not None:
+                    return blocked
+            return await self._freeze_send(current, account, today, date_resend=True)
         skipped = "earlier_post_unrecorded" if current.post_count >= 2 else "operator_grant_used"
         return await self._fail(
             current,
@@ -540,7 +546,7 @@ class IssueQueued:
         details: dict[str, Any] = {"after_date_resend": True}
         try:
             found = await self._provider.find_by_reference(account, creds, document.reference_code)
-        except ProviderTransient:
+        except (ProviderTransient, ProviderAuthFailed):
             details["lookup_state"] = "error"
         else:
             details["lookup_state"] = "none" if found is None else found.state
@@ -678,6 +684,23 @@ class IssueQueued:
 
     def _count(self, name: str, **tags: str) -> None:
         increment_safely(self._metrics, name, tags)
+
+
+def _log_approval_invalidated(document: DocumentRow, entry: dict[str, Any] | None) -> None:
+    """The log keeps the whole dropped approval, so the audit survives even without a case."""
+    if entry is None:
+        return
+    logger.warning(
+        "invoice_approval_invalidated",
+        extra={
+            "document_id": str(document.id),
+            "approved_by": entry["approved_by"],
+            "approved_at": entry["approved_at"],
+            "approved_snapshot_sha256": entry["approved_snapshot_sha256"],
+            "approved_reference_code": entry["approved_reference_code"],
+            "reason": entry["reason"],
+        },
+    )
 
 
 def failed_job_details(message: str | None) -> dict[str, Any]:

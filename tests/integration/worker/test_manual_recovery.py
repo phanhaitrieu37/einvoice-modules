@@ -5,9 +5,11 @@ runs them one by one and ``test_no_path_uses_removed_edges`` runs them all while
 every status edge the code asks for.
 """
 
+import logging
 from datetime import date, timedelta
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker
 from tests.fakes.fake_einvoice_provider import (
     AUTH_FAILED,
     CONFLICT,
@@ -20,6 +22,8 @@ from tests.fakes.fake_einvoice_provider import (
 )
 from tests.integration.worker.world import vn
 
+from invoice_module.adapters.sqlalchemy.repositories.documents import DocumentRepository
+from invoice_module.application import issue_queued as issue_module
 from invoice_module.application.hold_draft_invoice import HoldNotAllowed
 from invoice_module.domain.enums import DeliveryMode
 from invoice_module.domain.errors import ResolutionNotAllowed
@@ -460,3 +464,72 @@ async def test_manual_never_calls_issue_endpoint(world):
         world.provider.ops()
     )
     assert not hasattr(world.provider, "issue_draft") and not hasattr(world.provider, "check_issue")
+
+
+async def test_approval_invalidation_logs_full_entry_and_only_writes_open_case(world, caplog):
+    settled = await awaiting(world)
+    await world.module.hold_draft_invoice.execute(
+        settled.document_id, "accountant-a", "Wrong buyer"
+    )
+    await world.resolve(settled.document_id, "retry")
+    [closed] = await world.cases(settled.document_id)
+    assert closed.status == "resolved"
+    await world.approve(settled)
+    await world.set_columns(settled.document_id, approved_snapshot_sha256="0" * 64)
+    approved_doc = await world.doc(settled.document_id)
+    with caplog.at_level(logging.WARNING, logger=issue_module.__name__):
+        await world.issue()
+    assert await status(world, settled) == "awaiting_approval"
+    # No case is open: the unrelated closed case is left as it was, and the log keeps the
+    # whole approval that was dropped.
+    assert await world.cases(settled.document_id) == [closed]
+    [record] = [r for r in caplog.records if r.message == "invoice_approval_invalidated"]
+    assert (
+        record.document_id,
+        record.approved_by,
+        record.approved_at,
+        record.approved_snapshot_sha256,
+        record.approved_reference_code,
+        record.reason,
+    ) == (
+        str(settled.document_id),
+        "accountant-a",
+        approved_doc.approved_at.isoformat(),
+        "0" * 64,
+        settled.reference,
+        "snapshot_changed",
+    )
+    assert not hasattr(record, "buyer")
+
+
+async def test_move_to_awaiting_approval_requires_matching_generation(world):
+    settled = await world.settle(mode=MANUAL)
+    now = world.clock.now()
+    await world.set_columns(
+        settled.document_id,
+        lease_generation=5,
+        lease_owner="worker-a",
+        lease_until=now + timedelta(seconds=60),
+        next_attempt_at=now,
+    )
+    sessions = async_sessionmaker(world.engine, expire_on_commit=False)
+    async with sessions() as session:
+        documents = DocumentRepository(session, world.tables)
+        assert await documents.freeze_request(
+            settled.document_id, 5, {"reference_code": settled.reference}, date(2026, 10, 21), now
+        )
+        assert await documents.move_to_awaiting_approval(settled.document_id, 4, now) is False
+        await session.commit()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.lease_owner, doc.next_attempt_at) == ("queued", "worker-a", now)
+    async with sessions() as session:
+        documents = DocumentRepository(session, world.tables)
+        assert await documents.move_to_awaiting_approval(settled.document_id, 5, now) is True
+        await session.commit()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.next_attempt_at, doc.lease_owner, doc.lease_until) == (
+        "awaiting_approval",
+        None,
+        None,
+        None,
+    )

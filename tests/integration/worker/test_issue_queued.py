@@ -591,7 +591,9 @@ async def test_second_issued_date_invalid_opens_review(world):
     assert details["after_date_resend"] is True
 
 
-@pytest.mark.parametrize("lookup_state", ["success", "pending", "failed", "none"])
+@pytest.mark.parametrize(
+    "lookup_state", ["success", "pending", "failed", "none", "transient_error", "auth_error"]
+)
 async def test_date_resend_409_always_reviews_with_lookup_evidence(world, lookup_state):
     settled = await world.settle()
     world.provider.script_create(settled.reference, rejected("issued_date_invalid"), CONFLICT)
@@ -602,18 +604,28 @@ async def test_date_resend_409_always_reviews_with_lookup_evidence(world, lookup
         "pending": ProviderInvoice(settled.reference, "pending"),
         "failed": failed_invoice(settled.reference, "Synthetic refusal"),
         "none": None,
+        "transient_error": TRANSIENT,
+        "auth_error": AUTH_FAILED,
     }[lookup_state]
     world.provider.script_lookup(settled.reference, None, evidence)
     await world.issue()
     doc = await world.doc(settled.document_id)
-    assert (doc.status, doc.reference_code, doc.invoice_number) == (
+    assert (doc.status, doc.reference_code, doc.invoice_number, doc.last_error_code) == (
         "failed",
         settled.reference,
         None,
+        "document_existed_unresolved",
     )
     details = await world.reason_details(settled.document_id, "DOCUMENT_EXISTED_UNRESOLVED")
-    assert details["lookup_state"] == lookup_state and details["after_date_resend"] is True
+    recorded = "error" if lookup_state.endswith("_error") else lookup_state
+    assert details["lookup_state"] == recorded and details["after_date_resend"] is True
     assert ("provider_message" in details) == (lookup_state == "failed")
+    # The review holds: a later claim never finalizes or sends from here.
+    world.provider.seed_invoice(FakeInvoice(settled.reference, date(2026, 10, 21), 100))
+    world.past_lease()
+    await world.issue()
+    assert (await world.doc(settled.document_id)).status == "failed"
+    assert len(world.provider.posts()) == 2
 
 
 @pytest.mark.parametrize("message", ["Hóa đơn bị từ chối (tổng hợp)", None])
@@ -716,3 +728,146 @@ async def test_manual_finalize_without_valid_approval_opens_review(world):
     assert details["provider_state"] == "issued_without_approval"
 
     assert len(world.provider.posts()) == 1
+
+
+@pytest.mark.parametrize("action", ["review", "issue"])
+async def test_date_resend_follows_cross_day_review_policy(world, action):
+    await world.set_cross_day(action)
+    world.clock.set(vn(2026, 10, 21, 23, 59, 59, 900_000))
+    settled = await world.settle()
+    world.provider.receive_delay(settled.reference, timedelta(milliseconds=200))
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    posts = world.provider.posts(settled.reference)
+    if action == "issue":
+        assert [issued(post) for post in posts] == [date(2026, 10, 21), date(2026, 10, 22)]
+        assert (doc.status, doc.post_count, doc.date_resend_at is not None) == (
+            "pending_provider",
+            2,
+            True,
+        )
+        return
+    # The date refusal answered the first POST; the accountant decides on the new date.
+    assert [issued(post) for post in posts] == [date(2026, 10, 21)]
+    assert (doc.status, doc.post_count, doc.date_resend_at) == ("blocked", 1, None)
+    assert await world.open_reasons(settled.document_id) == ["ISSUE_DATE_CROSSED_DAY"]
+    details = await world.reason_details(settled.document_id, "ISSUE_DATE_CROSSED_DAY")
+    assert (details["settled_date"], details["issue_date"]) == ("2026-10-21", "2026-10-22")
+    assert world.provider.ops() == ["create", "find_by_reference"]
+    # The operator confirms the new date; one more POST goes out with the default budget.
+    await world.resolve(settled.document_id, "retry")
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    posts = world.provider.posts(settled.reference)
+    assert [issued(post) for post in posts] == [date(2026, 10, 21), date(2026, 10, 22)]
+    assert (doc.status, doc.post_count, doc.date_resend_at) == ("pending_provider", 2, None)
+
+
+async def test_mark_post_contract_refuses_without_budget_and_keeps_first_send_started_at(world):
+    settled = await world.settle()
+    sessions = async_sessionmaker(world.engine, expire_on_commit=False)
+    first_send = world.clock.now() - timedelta(minutes=5)
+
+    async def mark(now, **kwargs):
+        async with sessions() as session:
+            granted = await DocumentRepository(session, world.tables).mark_post(
+                settled.document_id, 7, now, now + timedelta(seconds=20), **kwargs
+            )
+            await session.commit()
+        return granted
+
+    async def lease(**values):
+        now = world.clock.now()
+        await world.set_columns(
+            settled.document_id, lease_generation=7, lease_until=now + timedelta(seconds=60),
+            **values,
+        )  # fmt: skip
+        return now
+
+    # No budget left: refused, nothing written.
+    now = await lease(post_count=2, post_limit=2, send_started_at=first_send)
+    assert await mark(now) is False
+    doc = await world.doc(settled.document_id)
+    assert (doc.post_count, doc.send_started_at) == (2, first_send)
+    # A date resend only ever answers the first POST, even with budget left.
+    now = await lease(post_count=2, post_limit=3, date_resend_at=None)
+    assert await mark(now, date_resend=True) is False
+    doc = await world.doc(settled.document_id)
+    assert (doc.post_count, doc.date_resend_at) == (2, None)
+    # After the first POST: granted once, marked, and the first send moment is kept.
+    now = await lease(post_count=1, post_limit=2)
+    world.advance(timedelta(seconds=1))
+    assert await mark(world.clock.now(), date_resend=True) is True
+    doc = await world.doc(settled.document_id)
+    assert (doc.post_count, doc.date_resend_at, doc.send_started_at) == (
+        2,
+        world.clock.now(),
+        first_send,
+    )
+
+
+async def test_null_cross_day_action_blocks_to_review_without_network(world):
+    settled = await world.settle()
+    table = world.tables.issuer_accounts
+    async with world.engine.begin() as conn:
+        await conn.execute(
+            table.update()
+            .where(table.c.id == world.account_id)
+            .values(status="disabled", issue_date_cross_day_action=None)
+        )
+    world.clock.set(vn(2026, 10, 22, 9))
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.request) == ("blocked", None)
+    assert await world.open_reasons(settled.document_id) == ["ISSUE_DATE_CROSSED_DAY"]
+    assert world.provider.calls == []
+
+
+async def held_then_corrected_and_approved(world):
+    """A held manual draft repaired by the operator: its first claim freezes the request with
+    the operator's permission to resend, then the accountant approves it again."""
+    settled = await world.settle(mode=MANUAL)
+    await world.issue()
+    await world.module.hold_draft_invoice.execute(
+        settled.document_id, "accountant-a", "Wrong buyer"
+    )
+    await world.resolve(
+        settled.document_id,
+        "attach_draft",
+        draft=world.draft_command(settled.host_ref_id, settled.intent_id, mode=MANUAL),
+    )
+    await world.issue()
+    await world.approve(settled)
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.post_count, doc.request_authorized_resend) == ("approved", 0, True)
+    return settled
+
+
+@pytest.mark.parametrize("lookup", ["none", "failed"])
+async def test_date_rejection_clears_operator_resend_permission(world, lookup):
+    settled = await held_then_corrected_and_approved(world)
+    if lookup == "none":
+        world.provider.script_create(settled.reference, rejected("issued_date_invalid"), TRANSIENT)
+    else:
+        world.provider.script_create(settled.reference, rejected("issued_date_invalid"))
+        world.provider.script_lookup(
+            settled.reference, None, failed_invoice(settled.reference, "Synthetic refusal")
+        )
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    # The 400 answered the POST the operator allowed: the permission is spent either way.
+    assert doc.request_authorized_resend is False
+    if lookup == "none":
+        assert (doc.status, doc.post_count, doc.date_resend_at is not None) == (
+            "approved",
+            2,
+            True,
+        )
+    else:
+        assert (doc.status, doc.last_error_code, doc.post_count) == (
+            "failed",
+            "provider_failed",
+            1,
+        )
+        details = await world.reason_details(settled.document_id, "PROVIDER_REJECTED")
+        assert details == {"provider_job_state": "Failed", "provider_message": "Synthetic refusal"}
