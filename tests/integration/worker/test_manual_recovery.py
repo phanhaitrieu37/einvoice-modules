@@ -58,7 +58,7 @@ async def status(world, settled):
     return (await world.doc(settled.document_id)).status
 
 
-async def row_m1(world):
+async def queued_unapproved_waits_offline(world):
     settled = await world.settle(mode=MANUAL)
     calls = len(world.provider.calls)
     await world.issue()
@@ -67,7 +67,7 @@ async def row_m1(world):
     assert world.provider.calls[calls:] == []
 
 
-async def row_m2(world):
+async def awaiting_approve_hold_or_alert(world):
     first = await awaiting(world)
     await world.approve(first)
     assert await status(world, first) == "approved"
@@ -80,7 +80,7 @@ async def row_m2(world):
     assert await status(world, third) == "awaiting_approval"
 
 
-async def row_m3(world):
+async def changed_content_drops_approval(world):
     settled = await approved(world)
     doc = await world.doc(settled.document_id)
     changed = dict(doc.document) | {"notes": "changed"}
@@ -96,7 +96,7 @@ async def row_m3(world):
     assert world.provider.calls[calls:] == []
 
 
-async def row_m4(world):
+async def approved_looks_up_then_sends_once(world):
     settled = await awaiting(world)
     world.advance(timedelta(days=1))
     await world.approve(settled)
@@ -106,7 +106,7 @@ async def row_m4(world):
     assert world.provider.ops()[-2:] == ["find_by_reference", "create"]
 
 
-async def row_m5(world):
+async def approved_lookup_outcomes(world):
     expected = {
         "success": ("issued", None),
         "pending": ("pending_provider", None),
@@ -131,7 +131,7 @@ async def row_m5(world):
             assert await world.open_reasons(settled.document_id) == [reason]
 
 
-async def row_m6(world):
+async def approved_create_outcomes(world):
     expected = [
         (None, "pending_provider", []),
         (CONFLICT, "failed", ["DOCUMENT_EXISTED_UNRESOLVED"]),
@@ -159,7 +159,7 @@ async def row_m6(world):
     ] == ["find_by_reference", "create"]
 
 
-async def row_m7(world):
+async def pending_check_outcomes(world):
     for progress, final in (
         (None, "issued"),
         (ProviderProgress(state="failed", provider_message="Synthetic"), "failed"),
@@ -180,7 +180,7 @@ async def row_m7(world):
     assert timeout.document_id in report.timed_out
 
 
-async def row_m8(world):
+async def held_draft_resolutions(world):
     for resolution, final in (
         ("retry", "awaiting_approval"),
         ("attach_draft", "queued"),
@@ -201,7 +201,7 @@ async def row_m8(world):
             assert await status(world, settled) == "awaiting_approval"
 
 
-async def row_m9(world):
+async def failed_retry_outcomes(world):
     async def failed_manual():
         settled = await approved(world)
         world.provider.script_create(settled.reference, rejected("validation_error"))
@@ -233,7 +233,7 @@ async def row_m9(world):
     assert (doc.status, doc.approved_at) == ("queued", None)
 
 
-async def row_m10(world):
+async def failed_marked_external(world):
     settled = await approved(world)
     world.provider.script_create(settled.reference, CONFLICT)
     await world.issue()
@@ -260,7 +260,7 @@ async def row_m10(world):
     )
 
 
-async def row_m11(world):
+async def hold_only_before_send(world):
     unsent = await approved(world)
     await world.module.hold_draft_invoice.execute(unsent.document_id, "accountant-a", "Wrong")
     assert await status(world, unsent) == "blocked"
@@ -277,21 +277,21 @@ async def row_m11(world):
 
 
 ROWS = {
-    "M1": row_m1,
-    "M2": row_m2,
-    "M3": row_m3,
-    "M4": row_m4,
-    "M5": row_m5,
-    "M6": row_m6,
-    "M7": row_m7,
-    "M8": row_m8,
-    "M9": row_m9,
-    "M10": row_m10,
-    "M11": row_m11,
+    "queued_unapproved_waits_offline": queued_unapproved_waits_offline,
+    "awaiting_approve_hold_or_alert": awaiting_approve_hold_or_alert,
+    "changed_content_drops_approval": changed_content_drops_approval,
+    "approved_looks_up_then_sends_once": approved_looks_up_then_sends_once,
+    "approved_lookup_outcomes": approved_lookup_outcomes,
+    "approved_create_outcomes": approved_create_outcomes,
+    "pending_check_outcomes": pending_check_outcomes,
+    "held_draft_resolutions": held_draft_resolutions,
+    "failed_retry_outcomes": failed_retry_outcomes,
+    "failed_marked_external": failed_marked_external,
+    "hold_only_before_send": hold_only_before_send,
 }
 
 
-@pytest.mark.parametrize("row", sorted(ROWS, key=lambda name: int(name[1:])))
+@pytest.mark.parametrize("row", list(ROWS))
 async def test_matrix_manual_rows(world, row):
     await ROWS[row](world)
     assert all(post.payload.get("is_draft", False) is False for post in world.provider.posts())
@@ -411,7 +411,7 @@ async def test_lost_create_response_after_approval_recovers_by_lookup_one_post(w
 
 
 async def test_no_path_uses_removed_edges(world, transitions):
-    for name in sorted(ROWS, key=lambda key: int(key[1:])):
+    for name in ROWS:
         await ROWS[name](world)
     used = set(transitions.edges)
     assert used & REMOVED_EDGES == set()
@@ -442,7 +442,12 @@ async def test_document_row_delivery_mode_is_enum(world):
 
 
 async def test_manual_never_calls_issue_endpoint(world):
-    for name in ("M4", "M6", "M7", "M9"):
+    for name in (
+        "approved_looks_up_then_sends_once",
+        "approved_create_outcomes",
+        "pending_check_outcomes",
+        "failed_retry_outcomes",
+    ):
         await ROWS[name](world)
     await world.artifacts()
     assert set(world.provider.ops()) <= {

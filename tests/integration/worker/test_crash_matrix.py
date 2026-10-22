@@ -498,7 +498,13 @@ async def test_date_resend_across_midnight_resends_once(world):
     world.clock.set(vn(2026, 10, 21, 23, 59, 59, 900_000))
     settled = await world.settle()
     world.provider.receive_delay(settled.reference, timedelta(milliseconds=200))
-    await world.issue()
+    [result] = await world.issue()
+    # The resend happens in the same claim, frozen with the new day; the send-boundary
+    # guard never has to step in.
+    sent = await world.doc(settled.document_id)
+    assert result.outcome == "pending_provider"
+    assert (sent.post_count, sent.date_resend_at is not None) == (2, True)
+    assert world.metrics.count("invoice_post_skipped_total") == 0
     await converge(world, rounds=3)
     doc = await assert_converged(world, settled)
     first, second = posts(world, settled)
@@ -532,6 +538,8 @@ async def test_date_resend_crash_after_lookup_before_mark_commit_caps_posts_at_t
     await converge(world, rounds=4)
     doc = await assert_converged(world, settled)
     assert len(posts(world, settled)) == 2 and doc.status == "failed"
+    details = await world.reason_details(settled.document_id, "PROVIDER_REJECTED")
+    assert (details["date_resend_skipped"], doc.date_resend_at) == ("earlier_post_unrecorded", None)
 
 
 async def test_date_resend_crash_window_across_midnight_caps_posts_at_two(world):
@@ -547,6 +555,8 @@ async def test_date_resend_crash_window_across_midnight_caps_posts_at_two(world)
     first, second = posts(world, settled)
     assert (issued(first), issued(second)) == (date(2026, 10, 21), date(2026, 10, 22))
     assert doc.status == "failed" and doc.post_count == 2
+    details = await world.reason_details(settled.document_id, "PROVIDER_REJECTED")
+    assert (details["date_resend_skipped"], doc.date_resend_at) == ("earlier_post_unrecorded", None)
 
 
 async def test_operator_grant_crash_before_post_reviews_without_post(world):
