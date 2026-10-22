@@ -23,7 +23,7 @@ async def test_put_writes_and_returns_uri(tmp_path):
         hashlib.sha256(path.read_bytes()).hexdigest()
         == hashlib.sha256(b"%PDF-1.4 synthetic").hexdigest()
     )
-    # The temporary file was renamed into place; nothing else is left behind.
+    # The temporary file is gone once the artifact is published; nothing else is left behind.
     assert sorted(item.name for item in path.parent.iterdir()) == ["doc.pdf"]
 
 
@@ -42,6 +42,7 @@ async def test_put_different_bytes_conflict(tmp_path):
     with pytest.raises(ArtifactConflict):
         await store.put("t/doc.xml", b"<other/>", "application/xml")
     assert _path(uri).read_bytes() == b"<invoice/>"
+    assert sorted(item.name for item in _path(uri).parent.iterdir()) == ["doc.xml"]
 
 
 @pytest.mark.parametrize(

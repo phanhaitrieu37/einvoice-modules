@@ -28,10 +28,6 @@ class FileArtifactStore:
 
     def _put(self, key: str, data: bytes) -> str:
         path = self._path(key)
-        if path.exists():
-            if path.read_bytes() != data:
-                raise ArtifactConflict(key)
-            return path.as_uri()
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
         try:
@@ -39,8 +35,23 @@ class FileArtifactStore:
                 handle.write(data)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, path)
-        except BaseException:
+            # A hard link publishes the complete file and never replaces one that exists, so two
+            # writers cannot overwrite each other.
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                if path.read_bytes() != data:
+                    raise ArtifactConflict(key) from None
+                return path.as_uri()
+            _fsync_directory(path.parent)
+        finally:
             Path(temporary).unlink(missing_ok=True)
-            raise
         return path.as_uri()
+
+
+def _fsync_directory(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
