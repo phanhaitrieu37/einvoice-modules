@@ -119,7 +119,12 @@ async def test_hold_needs_no_provider(engine, inv_tables, tmp_path):
     await world.seed_account()
     settled = await awaiting(world)
     offline = build_invoice_module(world.crash, world.clock, world.metrics)
-    assert offline.issue_queued is None and offline.poll_pending is None
+    assert (offline.issue_queued, offline.poll_pending, offline.resolve_review) == (
+        None,
+        None,
+        None,
+    )
+    assert offline.escalate_overdue is None and offline.approve_draft_invoice is not None
     await offline.hold_draft_invoice.execute(settled.document_id, "accountant-a", "Wrong")
     assert (await world.doc(settled.document_id)).status == "blocked"
     assert world.provider.calls == []

@@ -427,6 +427,10 @@ class ResolveReview:
             return S.PENDING_PROVIDER
         if lookup is not None and lookup.state == "draft":
             raise ResolutionNotAllowed("provider_record_draft")
+        if await duplicate_hold_active(uow, document.id):
+            # A failed document cannot go back to ``blocked``; nothing changes until the
+            # duplicate is decided.
+            raise ResolutionNotAllowed("duplicate_hold_active")
         await self._clear(uow, document, request)
         await self._audit_attempts(uow, document, request, now)
         if lookup is None:

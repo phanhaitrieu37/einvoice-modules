@@ -39,8 +39,8 @@ class InvoiceModule:
     issue_queued: IssueQueued | None
     poll_pending: PollPending | None
     fetch_artifacts: FetchArtifacts | None
-    escalate_overdue: EscalateOverdue
-    resolve_review: ResolveReview
+    escalate_overdue: EscalateOverdue | None
+    resolve_review: ResolveReview | None
     approve_draft_invoice: ApproveDraftInvoice
     hold_draft_invoice: HoldDraftInvoice
     mark_cancelled_externally: MarkCancelledExternally
@@ -89,11 +89,15 @@ def build_invoice_module(
             if networked and artifact_store is not None
             else None
         ),
-        escalate_overdue=EscalateOverdue(
-            uow_factory, provider, credentials, clock, metric_sink, settings
+        escalate_overdue=(
+            EscalateOverdue(uow_factory, provider, credentials, clock, metric_sink, settings)
+            if networked
+            else None
         ),
-        resolve_review=ResolveReview(
-            uow_factory, provider, credentials, clock, metric_sink, submit_draft
+        resolve_review=(
+            ResolveReview(uow_factory, provider, credentials, clock, metric_sink, submit_draft)
+            if networked
+            else None
         ),
         approve_draft_invoice=ApproveDraftInvoice(uow_factory, clock, metric_sink),
         hold_draft_invoice=HoldDraftInvoice(uow_factory, clock, metric_sink),

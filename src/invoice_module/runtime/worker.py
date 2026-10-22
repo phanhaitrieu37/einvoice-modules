@@ -43,11 +43,11 @@ class InvoiceWorker:
         loops: dict[str, tuple[Step, float]] = {}
         if module.issue_queued is not None:
             loops["issue"] = (module.issue_queued.run_batch, intervals.issue_s)
-        if module.poll_pending is not None:
-            poll_pending = module.poll_pending
+        if module.poll_pending is not None and module.escalate_overdue is not None:
+            poll_pending, escalate_overdue = module.poll_pending, module.escalate_overdue
 
             async def poll() -> None:
-                await module.escalate_overdue.run(module.clock.now())
+                await escalate_overdue.run(module.clock.now())
                 await poll_pending.run_batch()
 
             loops["poll"] = (poll, intervals.poll_s)

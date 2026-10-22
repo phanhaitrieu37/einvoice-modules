@@ -1261,3 +1261,20 @@ async def test_repair_validates_money_edges_before_db(world, line, error):
         with pytest.raises(error):
             await world.resolve(settled.document_id, "attach_draft", draft=cmd)
         assert await world.doc(settled.document_id) == before
+
+
+async def test_retry_failed_refused_while_duplicate_hold_active(world):
+    settled = await failed_by(world, rejected("validation_error"))
+    async with world.crash() as uow:
+        await uow.review_cases.open_once(
+            TENANT, settled.document_id, "DUPLICATE_SETTLEMENT", {}, world.clock.now()
+        )
+        await uow.commit()
+    before = await world.doc(settled.document_id)
+    with pytest.raises(ResolutionNotAllowed, match="duplicate_hold_active"):
+        await world.resolve(settled.document_id, "retry", reason="PROVIDER_REJECTED")
+    assert await world.doc(settled.document_id) == before
+    assert sorted(await world.open_reasons(settled.document_id)) == [
+        "DUPLICATE_SETTLEMENT",
+        "PROVIDER_REJECTED",
+    ]
