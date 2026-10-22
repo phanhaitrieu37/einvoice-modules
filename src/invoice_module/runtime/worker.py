@@ -1,4 +1,4 @@
-"""Background loops of the invoice module: issue, poll (with the overdue sweep) and artifacts.
+"""Background loops of the invoice module: issue, poll, the overdue sweep and artifacts.
 
 Nothing starts on import. The host runs ``await InvoiceWorker(module).run(stop_event)`` and sets
 ``stop_event`` to stop; each loop finishes its current step and exits within one interval. A
@@ -29,6 +29,7 @@ class WorkerIntervals:
 
     issue_s: float = 1.0
     poll_s: float = 3.0
+    sweep_s: float = 30.0
     artifacts_s: float = 5.0
 
 
@@ -43,14 +44,16 @@ class InvoiceWorker:
         loops: dict[str, tuple[Step, float]] = {}
         if module.issue_queued is not None:
             loops["issue"] = (module.issue_queued.run_batch, intervals.issue_s)
-        if module.poll_pending is not None and module.escalate_overdue is not None:
-            poll_pending, escalate_overdue = module.poll_pending, module.escalate_overdue
+        if module.poll_pending is not None:
+            loops["poll"] = (module.poll_pending.run_batch, intervals.poll_s)
+        if module.escalate_overdue is not None:
+            # Its own loop: a sweep that fails must never hold back polling.
+            escalate_overdue = module.escalate_overdue
 
-            async def poll() -> None:
+            async def sweep() -> None:
                 await escalate_overdue.run(module.clock.now())
-                await poll_pending.run_batch()
 
-            loops["poll"] = (poll, intervals.poll_s)
+            loops["sweep"] = (sweep, intervals.sweep_s)
         if module.fetch_artifacts is not None:
             loops["artifacts"] = (module.fetch_artifacts.run_batch, intervals.artifacts_s)
         return loops

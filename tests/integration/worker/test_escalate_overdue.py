@@ -1,3 +1,4 @@
+import logging
 from datetime import date, timedelta
 from uuid import uuid4
 
@@ -6,6 +7,8 @@ import sqlalchemy as sa
 from tests.fakes.fake_einvoice_provider import CONFLICT, FakeInvoice
 from tests.integration.worker.world import TENANT, vn
 
+from invoice_module.adapters.sqlalchemy.repositories.documents import DocumentRepository
+from invoice_module.application import escalate_overdue as escalate_module
 from invoice_module.application.config import InvoiceModuleConfig
 from invoice_module.domain.enums import DeliveryMode
 
@@ -30,19 +33,21 @@ def items(amount):
     ]
 
 
-async def insert_draft(world, settled, *, intent_id, amount=100):
+async def insert_draft(
+    world, settled=None, *, intent_id, amount=100, host_ref_id=None, merchant_id=None, lines=None
+):
     draft_id = uuid4()
     async with world.engine.begin() as conn:
         await conn.execute(
             world.tables.invoice_drafts.insert().values(
                 id=draft_id,
                 tenant_id=TENANT,
-                merchant_id=world.merchant_id,
+                merchant_id=merchant_id or world.merchant_id,
                 host_ref_type="order",
-                host_ref_id=settled.host_ref_id,
+                host_ref_id=host_ref_id or settled.host_ref_id,
                 intent_id=intent_id,
                 buyer=None,
-                items=items(amount),
+                items=items(amount) if lines is None else lines,
                 delivery_mode="auto",
                 declared_total_vnd=amount,
                 computed_total_vnd=amount,
@@ -338,3 +343,236 @@ async def test_overdue_approval_alert_does_not_transition(world, transitions):
     assert report.approvals_overdue == [settled.document_id]
     assert all("awaiting_approval" not in edge for edge in transitions.edges)
     assert (await world.doc(settled.document_id)).status == "awaiting_approval"
+
+
+def sweep_errors(world, step):
+    return world.metrics.count("invoice_sweep_step_errors_total", step=step)
+
+
+async def settle_pending(world):
+    settled = await world.settle()
+    world.provider.new_invoice(settled.reference, pending_polls=10_000)
+    await world.issue()
+    assert (await world.doc(settled.document_id)).status == "pending_provider"
+    return settled
+
+
+async def test_poison_candidate_does_not_stop_the_sweep(world):
+    pending = await settle_pending(world)
+    poison = await world.settle(draft=False)
+    # A draft row the sweep cannot read (its line has no unit) stands for any persistent error
+    # on one candidate; it sorts before the attachable document.
+    broken = [{key: value for key, value in items(100)[0].items() if key != "unit"}]
+    await insert_draft(world, poison, intent_id=poison.intent_id, lines=broken)
+    world.advance(timedelta(seconds=1))
+    late = await world.settle(draft=False)
+    await insert_draft(world, late, intent_id=late.intent_id)
+    world.advance(timedelta(hours=3, minutes=1))
+    report = await escalate(world)
+    assert report.errors == [("attach_draft", "KeyError")]
+    assert sweep_errors(world, "attach_draft") == 1
+    assert report.drafts_attached == [late.document_id]
+    assert (await world.doc(late.document_id)).status == "queued"
+    assert (await world.doc(poison.document_id)).status == "needs_draft"
+    assert report.timed_out == [pending.document_id]
+    assert (await world.doc(pending.document_id)).status == "failed"
+
+
+async def test_failing_sub_sweep_does_not_stop_the_others(world, monkeypatch):
+    pending = await settle_pending(world)
+
+    async def broken(self, limit):
+        raise RuntimeError("query failed")
+
+    monkeypatch.setattr(DocumentRepository, "list_awaiting_draft", broken)
+    world.advance(timedelta(hours=3, minutes=1))
+    report = await escalate(world)
+    assert report.errors == [("attach_drafts", "RuntimeError")]
+    assert sweep_errors(world, "attach_drafts") == 1
+    assert report.timed_out == [pending.document_id]
+
+
+async def test_draft_sweep_reaches_document_beyond_batch_of_stuck_documents(world):
+    world.config = InvoiceModuleConfig(batch_size=2)
+    world.restart()
+    stuck = []
+    for _ in range(2):  # orders whose host never sends a draft
+        stuck.append(await world.settle(draft=False))
+        world.advance(timedelta(seconds=1))
+    late = await world.settle(draft=False)
+    draft_id = await insert_draft(world, late, intent_id=late.intent_id)  # the wake-up was missed
+    report = await escalate(world)
+    doc = await world.doc(late.document_id)
+    assert (doc.status, doc.draft_id) == ("queued", draft_id)
+    assert report.drafts_attached == [late.document_id]
+    assert [(await world.doc(s.document_id)).status for s in stuck] == ["needs_draft"] * 2
+
+
+async def test_draft_missing_reaches_newest_document_behind_waived_ones(world, monkeypatch):
+    monkeypatch.setattr(escalate_module, "_ALERT_SCAN_LIMIT", 2)
+    waived = []
+    for _ in range(2):
+        waived.append(await world.settle(draft=False))
+        world.advance(timedelta(seconds=1))
+    world.advance(timedelta(minutes=61))
+    await escalate(world)
+    for settled in waived:
+        await world.resolve(settled.document_id, "waive", note="Invoiced by hand at the portal")
+    newest = await world.settle(draft=False)
+    world.advance(timedelta(minutes=61))
+    report = await escalate(world)
+    assert report.draft_missing_opened == [newest.document_id]
+    assert await world.open_reasons(newest.document_id) == ["DRAFT_MISSING"]
+
+
+async def test_sweep_does_not_reopen_waived_draft_missing(world):
+    settled = await world.settle(draft=False)
+    world.advance(timedelta(minutes=61))
+    await escalate(world)
+    await world.resolve(settled.document_id, "waive", note="Invoiced by hand at the portal")
+    for _ in range(3):
+        world.advance(timedelta(minutes=5))
+        assert (await escalate(world)).draft_missing_opened == []
+    [case] = await world.cases(settled.document_id)
+    assert case.status == "resolved"
+    assert await world.open_reasons(settled.document_id) == []
+    assert (await world.doc(settled.document_id)).status == "needs_draft"
+
+
+async def test_artifacts_missing_alert_reaches_newest_issued_document(world, monkeypatch):
+    monkeypatch.setattr(escalate_module, "_ALERT_SCAN_LIMIT", 2)
+    documents = []
+    for _ in range(3):
+        settled = await world.settle()
+        await world.issue()
+        world.advance(timedelta(seconds=4))
+        await world.poll()
+        documents.append(settled)
+        world.advance(timedelta(minutes=1))
+    newest = documents[-1]
+    world.provider.fail_artifacts(newest.reference, times=1_000)
+    await world.artifacts()
+    complete = [await world.doc(s.document_id) for s in documents[:2]]
+    assert all(doc.pdf_uri is not None and doc.xml_uri is not None for doc in complete)
+    assert (await world.doc(newest.document_id)).pdf_uri is None
+    world.advance(timedelta(hours=2))
+    assert (await escalate(world)).artifacts_missing == [newest.document_id]
+
+
+async def test_stale_alert_reaches_newest_queued_document(world, monkeypatch):
+    monkeypatch.setattr(escalate_module, "_ALERT_SCAN_LIMIT", 2)
+    late_drafts = []
+    for _ in range(2):  # settled first, queued only when their draft arrives later
+        late_drafts.append(await world.settle(draft=False))
+        world.advance(timedelta(seconds=1))
+    newest = await world.settle()
+    world.advance(timedelta(minutes=20))
+    for settled in late_drafts:
+        await world.module.submit_draft.execute(
+            world.draft_command(settled.host_ref_id, settled.intent_id)
+        )
+        assert (await world.doc(settled.document_id)).status == "queued"
+    world.advance(timedelta(minutes=1))
+    assert (await escalate(world)).stale == [(newest.document_id, "queued")]
+
+
+async def test_previous_reference_recheck_throttled_within_interval(world):
+    assert InvoiceModuleConfig().previous_reference_recheck_interval == timedelta(minutes=10)
+    settled = await rotated(world)
+
+    def rechecks():
+        return [
+            call
+            for call in world.provider.calls
+            if call.op == "find_by_reference" and call.reference_code == settled.reference
+        ]
+
+    before = len(rechecks())
+    await escalate(world)
+    world.advance(timedelta(minutes=1))
+    await escalate(world)
+    assert len(rechecks()) == before + 1
+    world.advance(timedelta(minutes=10))
+    await escalate(world)
+    assert len(rechecks()) == before + 2
+
+
+async def test_stale_alert_logs_once_per_entry_but_counts_every_sweep(world, caplog):
+    settled = await world.settle()
+    world.advance(timedelta(minutes=16))
+    with caplog.at_level(logging.ERROR, logger=escalate_module.__name__):
+        for _ in range(3):
+            assert (await escalate(world)).stale == [(settled.document_id, "queued")]
+            world.advance(timedelta(seconds=30))
+    logged = [record for record in caplog.records if record.message == "invoice_document_stale"]
+    assert len(logged) == 1 and logged[0].document_id == str(settled.document_id)
+    assert world.metrics.count("invoice_documents_stale_total", status="queued") == 3
+
+
+async def test_approval_overdue_logs_once_per_entry_but_counts_every_sweep(world, caplog):
+    world.clock.set(FRIDAY_10)
+    settled = await world.settle(mode=DeliveryMode.MANUAL)
+    await world.issue()
+    with caplog.at_level(logging.ERROR, logger=escalate_module.__name__):
+        for minute in range(3):
+            report = await escalate(world, MONDAY_10 + timedelta(minutes=minute))
+            assert report.approvals_overdue == [settled.document_id]
+    logged = [record for record in caplog.records if record.message == "invoice_approval_overdue"]
+    assert len(logged) == 1
+    assert world.metrics.count("invoice_approval_overdue_total") == 3
+
+
+async def test_timeout_sweep_skips_pending_document_with_live_poll_lease(world):
+    settled = await settle_pending(world)
+    world.advance(timedelta(hours=3, minutes=1))
+    await world.set_columns(
+        settled.document_id,
+        lease_owner="poller",
+        lease_until=world.clock.now() + timedelta(seconds=30),
+    )
+    assert (await escalate(world)).timed_out == []
+    assert (await world.doc(settled.document_id)).status == "pending_provider"
+    world.advance(timedelta(seconds=31))
+    assert (await escalate(world)).timed_out == [settled.document_id]
+    assert (await world.doc(settled.document_id)).status == "failed"
+
+
+async def test_approved_stale_alert_anchored_on_approved_at(world):
+    settled = await world.settle(mode=DeliveryMode.MANUAL)
+    await world.issue()
+    world.advance(timedelta(hours=2))
+    await world.approve(settled)
+    world.advance(timedelta(minutes=1))
+    assert (await escalate(world)).stale == []
+    world.advance(timedelta(minutes=15))
+    assert (await escalate(world)).stale == [(settled.document_id, "approved")]
+
+
+async def foreign_draft(world, host_ref_id):
+    """An open draft for the host reference, but of another merchant of the same tenant."""
+    return await insert_draft(world, intent_id=None, host_ref_id=host_ref_id, merchant_id=uuid4())
+
+
+async def test_intake_ignores_open_draft_of_another_merchant(world):
+    host_ref_id = f"order-{uuid4()}"
+    draft_id = await foreign_draft(world, host_ref_id)
+    settled = await world.settle(draft=False, host_ref_id=host_ref_id)
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.draft_id) == ("needs_draft", None)
+    receipts = world.tables.settlement_receipts
+    async with world.engine.connect() as conn:
+        stored = await conn.scalar(
+            sa.select(sa.func.count()).where(receipts.c.settlement_id == settled.settlement_id)
+        )
+    assert stored == 1
+    assert (await draft_row(world, draft_id)).status == "open"
+
+
+async def test_sweep_ignores_open_draft_of_another_merchant(world):
+    settled = await world.settle(draft=False)
+    draft_id = await foreign_draft(world, settled.host_ref_id)
+    report = await escalate(world)
+    assert (report.drafts_attached, report.errors) == ([], [])
+    assert sweep_errors(world, "attach_draft") == 0
+    assert (await world.doc(settled.document_id)).status == "needs_draft"
+    assert (await draft_row(world, draft_id)).status == "open"

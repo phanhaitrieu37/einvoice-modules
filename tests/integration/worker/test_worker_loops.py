@@ -7,7 +7,7 @@ from invoice_module.runtime import InvoiceWorker, WorkerIntervals
 
 pytestmark = pytest.mark.integration
 
-FAST = WorkerIntervals(issue_s=0.01, poll_s=0.01, artifacts_s=0.01)
+FAST = WorkerIntervals(issue_s=0.01, poll_s=0.01, sweep_s=0.01, artifacts_s=0.01)
 
 
 async def run_until(world, worker, done, timeout=20.0):
@@ -27,7 +27,7 @@ async def run_until(world, worker, done, timeout=20.0):
 async def test_worker_issues_polls_and_fetches_until_stop(world):
     settled = await world.settle()
     worker = InvoiceWorker(world.module, FAST)
-    assert set(worker.loops()) == {"issue", "poll", "artifacts"}
+    assert set(worker.loops()) == {"issue", "poll", "sweep", "artifacts"}
 
     async def stored():
         doc = await world.doc(settled.document_id)
@@ -60,3 +60,26 @@ async def test_failing_step_is_counted_and_loop_continues(world, monkeypatch):
     assert failures == [1]
     assert world.metrics.count("worker_loop_errors_total", loop="issue") == 1
     assert len(world.provider.posts()) == 1
+
+
+async def test_sweep_failure_does_not_block_polling(world, monkeypatch):
+    settled = await world.settle()
+    world.provider.new_invoice(settled.reference, pending_polls=10_000)
+    await world.issue()
+    assert (await world.doc(settled.document_id)).status == "pending_provider"
+    sweeps = []
+
+    async def broken(now=None):
+        sweeps.append(now)
+        raise RuntimeError("sweep query failed")
+
+    monkeypatch.setattr(world.module.escalate_overdue, "run", broken)
+    worker = InvoiceWorker(world.module, FAST)
+
+    async def polled_while_sweep_fails():
+        checks = [call for call in world.provider.calls if call.op == "check_create"]
+        return len(sweeps) >= 2 and len(checks) >= 2
+
+    await run_until(world, worker, polled_while_sweep_fails)
+    assert world.metrics.count("worker_loop_errors_total", loop="sweep") >= 2
+    assert world.metrics.count("worker_loop_errors_total", loop="poll") == 0

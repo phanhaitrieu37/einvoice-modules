@@ -20,7 +20,11 @@ class AttachOutcome:
 
 
 def draft_eligible_for(draft: DraftRow, document: DocumentRow) -> bool:
-    return draft.intent_id is None or draft.intent_id == document.intent_id
+    # A draft of another merchant is never a candidate: attaching it would break the draft
+    # foreign key, and at intake that would fail the settlement event on every delivery.
+    return draft.merchant_id == document.merchant_id and (
+        draft.intent_id is None or draft.intent_id == document.intent_id
+    )
 
 
 def _draft_data(draft: DraftRow) -> DraftData:

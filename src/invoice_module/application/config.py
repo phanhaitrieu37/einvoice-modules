@@ -24,6 +24,7 @@ class InvoiceModuleConfig:
     artifacts_missing_alert_after: timedelta = timedelta(hours=1)
     review_overdue_business_days: int = 1
     previous_reference_recheck_window: timedelta = timedelta(hours=24)
+    previous_reference_recheck_interval: timedelta = timedelta(minutes=10)
     approval_overdue_business_days: int = 1
     batch_size: int = 20
 

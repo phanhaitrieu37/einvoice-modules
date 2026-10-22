@@ -10,7 +10,13 @@ from sqlalchemy.dialects import postgresql
 
 from invoice_module.adapters.sqlalchemy.repositories.base import SqlAlchemyRepository
 from invoice_module.domain.document import InvoiceDocument
-from invoice_module.domain.enums import DeliveryMode, DocumentStatus, ReviewReason
+from invoice_module.domain.enums import (
+    DeliveryMode,
+    DocumentStatus,
+    DraftStatus,
+    ReviewReason,
+    ReviewResolution,
+)
 
 DEFAULT_POST_LIMIT = 2
 
@@ -177,6 +183,27 @@ class DocumentRepository(SqlAlchemyRepository):
             )
         )
 
+    def _reason_cleared(
+        self, reason: ReviewReason, resolution: ReviewResolution
+    ) -> sa.ColumnElement[bool]:
+        table, reviews = self.tables.documents, self.tables.review_cases
+        return sa.exists(
+            sa.select(1).where(
+                reviews.c.document_id == table.c.id,
+                sa.cast(reviews.c.details, postgresql.JSONB).contains(
+                    {
+                        "reasons": [
+                            {
+                                "reason": reason.value,
+                                "status": "cleared",
+                                "resolution": resolution.value,
+                            }
+                        ]
+                    }
+                ),
+            )
+        )
+
     def _awaiting_draft(self) -> sa.ColumnElement[bool]:
         table = self.tables.documents
         return sa.or_(
@@ -204,12 +231,81 @@ class DocumentRepository(SqlAlchemyRepository):
         return [_document_row(row) for row in result.mappings()]
 
     async def list_awaiting_draft(self, limit: int) -> list[DocumentRow]:
-        """Every document still waiting for a draft, across hosts, oldest first."""
+        """Documents still waiting for a draft that have an open draft of their merchant they
+        may take, across hosts, oldest first. A document with nothing to attach never takes a
+        place in the batch, so it cannot hold newer documents back."""
+        table, drafts = self.tables.documents, self.tables.invoice_drafts
+        attachable = sa.exists(
+            sa.select(1).where(
+                drafts.c.status == DraftStatus.OPEN.value,
+                drafts.c.tenant_id == table.c.tenant_id,
+                drafts.c.merchant_id == table.c.merchant_id,
+                sa.or_(
+                    drafts.c.intent_id == table.c.intent_id,
+                    sa.and_(
+                        drafts.c.intent_id.is_(None),
+                        drafts.c.host_ref_type == table.c.host_ref_type,
+                        drafts.c.host_ref_id == table.c.host_ref_id,
+                    ),
+                ),
+            )
+        )
+        result = await self.session.execute(
+            sa.select(table)
+            .where(self._awaiting_draft(), attachable)
+            .order_by(table.c.created_at, table.c.id)
+            .limit(limit)
+        )
+        return [_document_row(row) for row in result.mappings()]
+
+    async def list_draft_missing_due(
+        self, created_before: datetime, limit: int
+    ) -> list[DocumentRow]:
+        """``needs_draft`` documents created before ``created_before`` with no open
+        ``DRAFT_MISSING`` and no waived one, oldest first."""
         table = self.tables.documents
         result = await self.session.execute(
             sa.select(table)
-            .where(self._awaiting_draft())
+            .where(
+                table.c.status == DocumentStatus.NEEDS_DRAFT.value,
+                table.c.created_at < created_before,
+                sa.not_(self._open_reason(ReviewReason.DRAFT_MISSING)),
+                sa.not_(self._reason_cleared(ReviewReason.DRAFT_MISSING, ReviewResolution.WAIVE)),
+            )
             .order_by(table.c.created_at, table.c.id)
+            .limit(limit)
+        )
+        return [_document_row(row) for row in result.mappings()]
+
+    async def list_entered_before(
+        self, status: DocumentStatus, entered: str, before: datetime, limit: int
+    ) -> list[DocumentRow]:
+        """Documents in ``status`` whose ``entered`` column is earlier than ``before``, oldest
+        first."""
+        table = self.tables.documents
+        column = table.c[entered]
+        result = await self.session.execute(
+            sa.select(table)
+            .where(table.c.status == status.value, column < before)
+            .order_by(column, table.c.id)
+            .limit(limit)
+        )
+        return [_document_row(row) for row in result.mappings()]
+
+    async def list_missing_artifacts(
+        self, issued_before: datetime, limit: int
+    ) -> list[DocumentRow]:
+        """Issued documents still missing the PDF or the XML, issued before ``issued_before``,
+        oldest first."""
+        table = self.tables.documents
+        result = await self.session.execute(
+            sa.select(table)
+            .where(
+                table.c.status == DocumentStatus.ISSUED.value,
+                sa.or_(table.c.pdf_uri.is_(None), table.c.xml_uri.is_(None)),
+                table.c.issued_at < issued_before,
+            )
+            .order_by(table.c.issued_at, table.c.id)
             .limit(limit)
         )
         return [_document_row(row) for row in result.mappings()]
