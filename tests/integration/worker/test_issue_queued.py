@@ -4,6 +4,7 @@ from datetime import date, timedelta
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from tests.fakes.fake_einvoice_provider import (
+    ACCEPTED_WITHOUT_TRACKING,
     AUTH_FAILED,
     CONFLICT,
     CRASH_BEFORE_SEND,
@@ -464,6 +465,23 @@ async def test_issued_date_code_letter_case_decides_the_resend(world, answer):
         assert world.provider.ops() == ["create", "find_by_reference", "create"]
         assert (doc.status, doc.post_count) == ("pending_provider", 2)
         assert doc.date_resend_at is not None
+
+
+async def test_create_2xx_without_tracking_goes_lookup_first(world):
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, ACCEPTED_WITHOUT_TRACKING)
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert result.outcome == "backoff"
+    assert (doc.status, doc.post_count, doc.tracking_code) == ("queued", 1, None)
+    assert doc.request is not None
+    world.provider.calls.clear()
+    world.past_lease()
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert world.provider.ops() == ["find_by_reference"]
+    assert (doc.status, doc.post_count) == ("issued", 1)
+    assert world.provider.effective_creates[settled.reference] == 1
 
 
 async def test_auth_failed_opens_review(world):

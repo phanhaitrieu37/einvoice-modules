@@ -53,6 +53,8 @@ AUTH_FAILED_BEFORE_SEND = "auth_failed_before_send"  # token request fails; no P
 CRASH_BEFORE_SEND = "crash_before_send"  # process dies before the send-boundary hook
 CRASH_AFTER_MARK = "crash_after_mark"  # hook granted the POST; process dies before transport
 CONFLICT = "conflict"  # forced 409
+# Created at the provider, but the 2xx carries no tracking code: the adapter raises transient.
+ACCEPTED_WITHOUT_TRACKING = "accepted_without_tracking"
 BLOCK = "block"  # the POST waits until the test releases it
 
 # The provider's quota code, spelled exactly as the API returns it.
@@ -288,7 +290,7 @@ class FakeEInvoiceProvider:
         try:
             self._receive(reference_code, request)
         except (DocumentExists, ProviderRejected):
-            if outcome in (LOST_RESPONSE, CRASH_AFTER_RECEIVE):
+            if outcome in (LOST_RESPONSE, ACCEPTED_WITHOUT_TRACKING, CRASH_AFTER_RECEIVE):
                 await self._fire("create")
                 if outcome == CRASH_AFTER_RECEIVE:
                     raise Crash("crash after the provider answered") from None
@@ -296,7 +298,7 @@ class FakeEInvoiceProvider:
             await self._fire("create")
             raise
         await self._fire("create")
-        if outcome == LOST_RESPONSE:
+        if outcome in (LOST_RESPONSE, ACCEPTED_WITHOUT_TRACKING):
             raise ProviderTransient()
         if outcome == CRASH_AFTER_RECEIVE:
             raise Crash("crash after the provider received the request")
