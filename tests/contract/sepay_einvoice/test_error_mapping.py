@@ -32,6 +32,8 @@ def test_409_maps_to_document_exists(recorded: Loader) -> None:
     assert str(existed) == "EINVOICE_DOCUMENT_EXISTED"
     other = map_error(409, _error("OTHER"))
     assert isinstance(other, DocumentExists) and str(other) == "OTHER"
+    quota = map_error(409, _error("QUOTA_HAS_BEEN_USERD_UP"))
+    assert type(quota) is DocumentExists and str(quota) == "QUOTA_HAS_BEEN_USERD_UP"
     for body in (None, {}, "<html>conflict</html>", _error(None)):
         bare = map_error(409, body)
         assert isinstance(bare, DocumentExists) and str(bare) == "http_409"
@@ -45,6 +47,8 @@ def test_409_maps_to_document_exists(recorded: Loader) -> None:
         (500, "QUOTA_HAS_BEEN_USERD_UP", QuotaExhausted),
         (400, "QUOTA_HAS_BEEN_USERD_UP", QuotaExhausted),
         (429, "QUOTA_HAS_BEEN_USERD_UP", QuotaExhausted),
+        (401, "QUOTA_HAS_BEEN_USERD_UP", QuotaExhausted),
+        (403, "QUOTA_HAS_BEEN_USERD_UP", QuotaExhausted),
         (500, "REGISTRATION_NOT_COMPLETE", ProviderRejected),
         (500, None, ProviderTransient),
         (500, "INTERNAL_SERVER_ERROR", ProviderTransient),
@@ -165,6 +169,7 @@ def test_retry_after_parsed() -> None:
         ("9" * 5000, timedelta(days=1)),
         ("86400", timedelta(days=1)),
         ("86401", timedelta(days=1)),
+        ("10000", timedelta(seconds=10000)),
         ("-5", None),
         (" 12 ", timedelta(seconds=12)),
         ("1.5", None),
@@ -173,6 +178,7 @@ def test_retry_after_parsed() -> None:
         ("Fri, 31 Dec 9999 23:59:59 GMT", timedelta(days=1)),
         ("Tue, 20 Oct 2026 03:01:30", None),
         ("Tue, 99 Oct 2026 03:01:30 GMT", None),
+        ("Tue, 20 Oct 99999999999999 03:01:30 GMT", None),
         ("", None),
     ],
 )

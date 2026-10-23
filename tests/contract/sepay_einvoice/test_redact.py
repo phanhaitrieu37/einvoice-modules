@@ -7,6 +7,8 @@ from typing import Any
 import httpx
 import pytest
 
+from invoice_module.adapters.sepay import client
+from invoice_module.adapters.sepay.client import Response
 from invoice_module.adapters.sepay.redact import normalise_key, redact
 from invoice_module.ports.provider import IssuerAccountView, ProviderRejected, ProviderTransient
 
@@ -152,8 +154,11 @@ def test_redact_masks_buyer_national_id_all_forms(
     for empty in ("", None):
         blank = _substitute(body, empty)
         assert redact(blank) == blank
-    caplog.set_level(logging.INFO)
-    logging.getLogger("invoice_module.adapters.sepay.client").info("%s", redact(body))
+    caplog.set_level(logging.DEBUG)
+    for status in (200, 400):
+        response = Response(status, {"success": False, "error": body, "data": body}, {})
+        client._log("GET", "/v1/invoices/x", response)
+    assert caplog.records
     assert "SYNTHETIC-ID" not in caplog.text
 
 
@@ -289,3 +294,22 @@ async def test_adapter_logs_pass_through_redactor(
     levels = {record.getMessage().split(" -> ")[0]: record.levelno for record in adapter}
     assert levels["sepay einvoice POST /v1/invoices/create"] == logging.WARNING
     assert levels[f"sepay einvoice GET /v1/invoices/{REFERENCE}"] == logging.WARNING
+
+
+@pytest.mark.parametrize("status", [{"text": "SYNTHETIC-STATUS"}, ["SYNTHETIC-STATUS"], 7])
+async def test_job_status_that_is_not_text_is_not_logged(
+    status: object,
+    harness: Callable[..., Any],
+    account: IssuerAccountView,
+    creds: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    body = {"success": True, "data": {"reference_code": REFERENCE, "status": status}}
+    h = harness(lambda request: httpx.Response(200, json=body))
+    assert (await h.provider.check_create(account, creds, REFERENCE)).state == "pending"
+    lines = [r.getMessage() for r in caplog.records if r.name.startswith("invoice_module")]
+    assert lines == [
+        f"sepay einvoice GET /v1/invoices/create/check/{REFERENCE} -> HTTP 200 code=None"
+        " status=None message_length=None"
+    ]
