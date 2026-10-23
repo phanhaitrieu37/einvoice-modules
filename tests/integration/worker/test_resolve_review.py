@@ -1210,35 +1210,40 @@ async def test_list_open_reviews_ordered_with_reasons(world):
 
 async def test_quota_retry_after_topup_grants_exactly_one_post(world):
     settled = await world.settle()
-    world.provider.script_create(settled.reference, QUOTA, QUOTA)
+    world.provider.script_create(settled.reference, QUOTA, QUOTA, QUOTA)
     await world.issue()
     assert len(world.provider.posts()) == 1
-    await world.resolve(settled.document_id, "retry", reason="QUOTA_EXHAUSTED")
-    doc = await world.doc(settled.document_id)
-    assert (doc.status, doc.next_attempt_at, doc.post_count, doc.post_limit) == (
-        "queued",
-        world.clock.now(),
-        1,
-        2,
-    )
-    world.provider.calls.clear()
-    await world.issue()
-    # The quota answer created nothing, so the lookup finds nothing and one POST follows.
-    assert world.provider.ops() == ["find_by_reference", "create"]
+    # Each retry is one more POST from the current count, also once the default budget is spent.
+    for posts_before in (1, 2):
+        await world.resolve(settled.document_id, "retry", reason="QUOTA_EXHAUSTED")
+        doc = await world.doc(settled.document_id)
+        assert (doc.status, doc.next_attempt_at, doc.post_count, doc.post_limit) == (
+            "queued",
+            world.clock.now(),
+            posts_before,
+            posts_before + 1,
+        )
+        before = len(world.provider.calls)
+        await world.issue()
+        # The quota answer created nothing, so the lookup finds nothing and one POST follows.
+        assert world.provider.ops()[before:] == ["find_by_reference", "create"]
+    before = len(world.provider.calls)
     for _ in range(12):
         world.advance(timedelta(hours=2))
         await world.drive(rounds=1)
     doc = await world.doc(settled.document_id)
-    assert world.provider.ops() == ["find_by_reference", "create"]
+    assert world.provider.calls[before:] == []
+    assert len(world.provider.posts()) == 3
     assert (doc.status, doc.next_attempt_at, doc.post_count, doc.post_limit) == (
         "queued",
         None,
-        2,
-        2,
+        3,
+        3,
     )
     assert await world.open_reasons(settled.document_id) == ["QUOTA_EXHAUSTED"]
     assert sorted(case.status for case in await world.cases(settled.document_id)) == [
         "open",
+        "resolved",
         "resolved",
     ]
 
