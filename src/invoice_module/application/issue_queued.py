@@ -360,8 +360,8 @@ class IssueQueued:
             return await self._conflict(document, account, creds)
         except ProviderTransient as exc:
             return await self._transient(document, exc.retry_after)
-        except QuotaExhausted:
-            return await self._quota(document)
+        except QuotaExhausted as exc:
+            return await self._quota(document, str(exc), document.post_count + guard.granted)
         except ProviderRejected as exc:
             if exc.code == ISSUED_DATE_INVALID:
                 if date_resend:
@@ -592,21 +592,31 @@ class IssueQueued:
             await uow.commit()
         return IssueResult(document.id, "backoff")
 
-    async def _quota(self, document: DocumentRow) -> IssueResult:
+    async def _quota(self, document: DocumentRow, code: str, post_count: int) -> IssueResult:
+        """The quota does not come back by itself: the document keeps its status (and a manual
+        approval) but is never claimed again until an operator retries after a top-up."""
         now = self._clock.now()
         async with self._uow_factory() as uow:
             if not await uow.documents.finalize(
                 document.id,
                 document.lease_generation,
-                next_attempt_at=now + self._config.quota_backoff,
-                attempts=max(document.attempts - 1, 0),
+                next_attempt_at=None,
                 last_error_code=IssueErrorCode.QUOTA_EXHAUSTED.value,
                 updated_at=now,
             ):
                 return self._lease_lost(document)
-            await open_review(uow, document, ReviewReason.QUOTA_EXHAUSTED, {}, now)
+            await open_review(
+                uow,
+                document,
+                ReviewReason.QUOTA_EXHAUSTED,
+                {"code": code, "post_count": post_count, "post_limit": document.post_limit},
+                now,
+            )
             await uow.commit()
-        logger.error("invoice_quota_exhausted", extra={"document_id": str(document.id)})
+        logger.error(
+            "invoice_quota_exhausted",
+            extra={"document_id": str(document.id), "post_count": post_count},
+        )
         self._count("invoice_quota_exhausted_total")
         return IssueResult(document.id, "quota")
 

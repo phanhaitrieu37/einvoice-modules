@@ -47,13 +47,16 @@ ACCEPT = "accept"
 TRANSIENT = "transient"  # the provider answers 5xx; nothing is created
 LOST_RESPONSE = "lost_response"  # created at the provider; the client times out
 CRASH_AFTER_RECEIVE = "crash_after_receive"  # created; the worker process dies
-QUOTA = "quota"
+QUOTA = "quota"  # 500 QUOTA_HAS_BEEN_USERD_UP: the POST counts, nothing is created
 AUTH_FAILED = "auth_failed"  # 403 on the POST
 AUTH_FAILED_BEFORE_SEND = "auth_failed_before_send"  # token request fails; no POST
 CRASH_BEFORE_SEND = "crash_before_send"  # process dies before the send-boundary hook
 CRASH_AFTER_MARK = "crash_after_mark"  # hook granted the POST; process dies before transport
 CONFLICT = "conflict"  # forced 409
 BLOCK = "block"  # the POST waits until the test releases it
+
+# The provider's quota code, spelled exactly as the API returns it.
+QUOTA_CODE = "QUOTA_HAS_BEEN_USERD_UP"
 
 
 def rejected(code: str) -> tuple[str, str]:
@@ -257,7 +260,7 @@ class FakeEInvoiceProvider:
             raise ProviderTransient()
         if outcome == QUOTA:
             await self._fire("create")
-            raise QuotaExhausted("quota exhausted")
+            raise QuotaExhausted(QUOTA_CODE)
         if outcome == AUTH_FAILED:
             await self._fire("create")
             raise ProviderAuthFailed("forbidden")

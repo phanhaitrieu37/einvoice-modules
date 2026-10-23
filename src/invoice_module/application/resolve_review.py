@@ -86,7 +86,7 @@ def _rules() -> dict[tuple[ReviewReason, DocumentStatus], frozenset[ReviewResolu
             {A.RETRY, A.WAIVE},
         ),
         ({R.DRAFT_HELD}, {S.BLOCKED}, {A.RETRY, A.ATTACH_DRAFT, A.WAIVE}),
-        ({R.QUOTA_EXHAUSTED}, {S.QUEUED, S.APPROVED}, {A.ACKNOWLEDGE, A.RETRY}),
+        ({R.QUOTA_EXHAUSTED}, {S.QUEUED, S.APPROVED}, {A.RETRY}),
         (
             {R.PROVIDER_REJECTED, R.PROVIDER_FAILED, R.LOOKUP_MISMATCH},
             {S.FAILED},
@@ -355,12 +355,12 @@ class ResolveReview:
         lookup: ProviderInvoice | None,
     ) -> DocumentStatus:
         resolution = request.resolution
-        if resolution in (A.WAIVE, A.ACKNOWLEDGE) or (
-            resolution == A.RETRY and request.reason == R.QUOTA_EXHAUSTED
-        ):
+        if resolution in (A.WAIVE, A.ACKNOWLEDGE):
             await self._clear(uow, document, request)
             await uow.documents.bump_generation(document.id)
             return document.status
+        if resolution == A.RETRY and request.reason == R.QUOTA_EXHAUSTED:
+            return await self._retry_quota(uow, document, request)
         if resolution == A.MARK_EXTERNAL:
             return await self._mark_external(uow, document, request)
         if resolution == A.RETRY_WITH_NEW_REFERENCE:
@@ -370,6 +370,17 @@ class ResolveReview:
         if document.status == S.FAILED:
             return await self._retry_failed(uow, document, request, lookup)
         return await self._retry_blocked(uow, document, request)
+
+    async def _retry_quota(
+        self, uow: InvoiceUnitOfWork, document: DocumentRow, request: _Request
+    ) -> DocumentStatus:
+        """The quota was topped up: the document is claimable again with exactly one more POST.
+        Its status and approval stay; the next claim looks the reference up before it sends."""
+        now = self._clock.now()
+        await self._clear(uow, document, request)
+        await uow.documents.operator_update(document.id, now, next_attempt_at=now, attempts=0)
+        await uow.documents.grant_post(document.id)
+        return document.status
 
     async def _retry_failed(
         self,

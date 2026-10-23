@@ -280,11 +280,24 @@ async def test_authorized_resend_gets_one_granted_post_across_quota_and_transien
     for _ in range(3):
         world.advance(timedelta(hours=2))
         await world.issue()
+    expected_posts = 2
+    if outcome == QUOTA:
+        # Nothing is sent again until the operator retries after a top-up; that retry is a
+        # new grant of exactly one POST.
+        doc = await world.doc(settled.document_id)
+        assert len(world.provider.posts(settled.reference)) == 2
+        assert (doc.status, doc.next_attempt_at) == ("queued", None)
+        await world.resolve(settled.document_id, "retry", reason="QUOTA_EXHAUSTED")
+        world.provider.script_create(settled.reference, TRANSIENT)
+        for _ in range(3):
+            await world.issue()
+            world.advance(timedelta(hours=2))
+        expected_posts = 3
     doc = await world.doc(settled.document_id)
-    assert len(world.provider.posts(settled.reference)) == 2
+    assert len(world.provider.posts(settled.reference)) == expected_posts
     assert (doc.status, doc.last_error_code) == ("failed", "max_attempts_exceeded")
     details = await world.reason_details(settled.document_id, "MAX_ATTEMPTS_EXCEEDED")
-    assert details["lookup_state"] == "failed" and details["post_count"] == 2
+    assert details["lookup_state"] == "failed" and details["post_count"] == expected_posts
 
 
 async def test_post_skipped_when_lease_would_expire_before_timeout(world):
@@ -340,27 +353,35 @@ async def test_transient_backs_off_then_reviews_when_post_budget_spent(world):
     }
 
 
-async def test_quota_backs_off_one_hour_and_opens_review_once(world):
+async def test_quota_opens_review_and_never_resends_automatically(world):
     settled = await world.settle()
-    world.provider.script_create(settled.reference, QUOTA, QUOTA)
+    world.provider.script_create(settled.reference, QUOTA)
     await world.issue()
     doc = await world.doc(settled.document_id)
-    assert (doc.status, doc.attempts, doc.next_attempt_at) == (
+    assert (doc.status, doc.attempts, doc.next_attempt_at, doc.last_error_code) == (
         "queued",
-        0,
-        world.clock.now() + timedelta(hours=1),
+        1,
+        None,
+        "quota_exhausted",
     )
-    world.advance(timedelta(minutes=59))
-    assert await world.issue() == []
-    world.advance(timedelta(minutes=2))
-    await world.issue()
-    cases = await world.cases(settled.document_id)
-    assert len(cases) == 1
-    assert [r for r in await world.reasons(settled.document_id)] == [
-        ("QUOTA_EXHAUSTED", "open", None)
-    ]
-    assert world.metrics.count("invoice_quota_exhausted_total") == 2
-    assert len(world.provider.posts()) == 2
+    assert (doc.post_count, doc.lease_owner) == (1, None)
+    for _ in range(24):
+        world.advance(timedelta(hours=1))
+        assert await world.issue() == []
+        await world.poll()
+        await world.module.escalate_overdue.run(world.clock.now())
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.next_attempt_at, doc.post_count) == ("queued", None, 1)
+    assert len(world.provider.posts()) == 1
+    [case] = await world.cases(settled.document_id)
+    assert case.status == "open"
+    assert await world.reasons(settled.document_id) == [("QUOTA_EXHAUSTED", "open", None)]
+    assert await world.reason_details(settled.document_id, "QUOTA_EXHAUSTED") == {
+        "code": "QUOTA_HAS_BEEN_USERD_UP",
+        "post_count": 1,
+        "post_limit": 2,
+    }
+    assert world.metrics.count("invoice_quota_exhausted_total") == 1
 
 
 @pytest.mark.parametrize(
@@ -482,6 +503,7 @@ async def test_approved_sends_one_create_with_send_day_issued_date(world):
 
 async def test_approved_transient_and_quota_keep_approved(world):
     settled = await approved_manual(world)
+    approval = (await world.doc(settled.document_id)).approved_snapshot_sha256
     world.provider.script_create(settled.reference, TRANSIENT, QUOTA)
     await world.issue()
     doc = await world.doc(settled.document_id)
@@ -489,8 +511,16 @@ async def test_approved_transient_and_quota_keep_approved(world):
     world.past_lease()
     await world.issue()
     doc = await world.doc(settled.document_id)
-    assert (doc.status, doc.approved_by) == ("approved", "accountant-a")
+    assert (doc.status, doc.approved_by, doc.approved_snapshot_sha256) == (
+        "approved",
+        "accountant-a",
+        approval,
+    )
+    assert (doc.next_attempt_at, doc.last_error_code) == (None, "quota_exhausted")
     assert await world.open_reasons(settled.document_id) == ["QUOTA_EXHAUSTED"]
+    world.advance(timedelta(hours=6))
+    assert await world.issue() == []
+    assert len(world.provider.posts()) == 2
 
 
 async def test_approved_rejected_opens_review(world):

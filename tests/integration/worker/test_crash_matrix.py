@@ -487,6 +487,16 @@ async def test_date_resend_budget_not_restored_by_transient_quota_or_refreeze(wo
             await world.issue()
         doc = await assert_converged(world, settled)
         assert len(posts(world, settled)) == 2, outcome
+        assert doc.date_resend_at is not None and doc.post_count == doc.post_limit == 2
+        if outcome == QUOTA:
+            # The quota waits for the operator; no claim runs, so nothing can be resent.
+            assert (doc.status, doc.last_error_code, doc.request_revision) == (
+                "queued",
+                "quota_exhausted",
+                2,
+            )
+            assert doc.next_attempt_at is None
+            continue
         assert (doc.status, doc.last_error_code, doc.request_revision) == (
             "failed",
             "max_attempts_exceeded",
@@ -594,7 +604,10 @@ async def test_operator_grant_not_reused_after_transient_or_quota(world):
             world.advance(timedelta(hours=1, minutes=1))
         doc = await assert_converged(world, settled)
         assert len(posts(world, settled)) == 3, outcome
-        assert (doc.status, doc.post_count, doc.post_limit) == ("failed", 3, 3)
+        status = "queued" if outcome == QUOTA else "failed"
+        assert (doc.status, doc.post_count, doc.post_limit) == (status, 3, 3)
+        if outcome == QUOTA:
+            assert doc.next_attempt_at is None
 
 
 @pytest.mark.parametrize("mode", [AUTO, MANUAL])

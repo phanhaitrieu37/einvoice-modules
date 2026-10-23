@@ -270,11 +270,11 @@ async def test_retry_with_new_reference_refused_while_lease_active(world):
     settled = await world.settle()
     world.provider.script_create(settled.reference, QUOTA, BLOCK)
     await world.issue()
-    world.advance(timedelta(hours=1, seconds=1))
+    case = await world.open_case(settled.document_id)
+    await world.resolve(settled.document_id, "retry", reason="QUOTA_EXHAUSTED")
     worker = asyncio.create_task(world.issue())
     await asyncio.sleep(0.2)
     assert len(world.provider.posts()) == 2 and not worker.done()
-    case = await world.open_case(settled.document_id)
     for resolution, note in (("retry_with_new_reference", NOTE), ("retry", None)):
         with pytest.raises(DocumentInFlight):
             await world.module.resolve_review.execute(case.id, resolution, "operator-a", note)
@@ -341,13 +341,18 @@ async def test_rotation_after_reconciliation_total_creates_at_most_one(world):
 
 async def test_operator_change_invalidates_stale_worker_cas(world):
     settled = await world.settle()
-    world.provider.script_create(settled.reference, QUOTA, BLOCK)
-    await world.issue()
-    world.advance(timedelta(hours=1, seconds=1))
+    world.provider.script_create(settled.reference, BLOCK)
     worker = asyncio.create_task(world.issue())
     await asyncio.sleep(0.2)
+    assert len(world.provider.posts()) == 1 and not worker.done()
+    async with world.crash() as uow:
+        # The sweep opens this reason on a document in any status.
+        await uow.review_cases.open_once(
+            TENANT, settled.document_id, "STALE_REFERENCE_FOUND", {"previous_reference": "x"}
+        )
+        await uow.commit()
     world.past_lease()
-    await world.resolve(settled.document_id, "retry", reason="QUOTA_EXHAUSTED")
+    await world.resolve(settled.document_id, "acknowledge", note="Checked at the portal")
     world.provider.release(settled.reference, deliver=True, respond="accepted")
     [result] = await worker
     doc = await world.doc(settled.document_id)
@@ -889,6 +894,14 @@ async def test_retry_after_unrecorded_post_date_review_grants_exactly_one_post(
     expected_posts = 2 if outcome == CRASH_AFTER_MARK else 3
     assert len(world.provider.posts(settled.reference)) == expected_posts
     assert doc.post_count == doc.post_limit == 3
+    if outcome == QUOTA:
+        # The quota never clears by itself: the document waits for the operator, unclaimed.
+        assert (doc.status, doc.next_attempt_at) == (
+            "approved" if mode == MANUAL else "queued",
+            None,
+        )
+        assert await world.open_reasons(settled.document_id) == ["QUOTA_EXHAUSTED"]
+        return
     assert doc.status in ("failed", "pending_provider", "issued")
     if outcome != CRASH_AFTER_RECEIVE:
         assert doc.status == "failed" and await world.open_reasons(settled.document_id)
@@ -940,8 +953,15 @@ async def test_retry_before_first_post_grants_exactly_one_post(world, mode, outc
     if outcome == DATE_400:
         details = await world.reason_details(settled.document_id, "PROVIDER_REJECTED")
         assert details["date_resend_skipped"] == "operator_grant_used"
-    if outcome in (TRANSIENT, QUOTA, CRASH_AFTER_MARK):
+    if outcome in (TRANSIENT, CRASH_AFTER_MARK):
         assert (doc.status, doc.last_error_code) == ("failed", "max_attempts_exceeded")
+    if outcome == QUOTA:
+        assert (doc.status, doc.last_error_code, doc.next_attempt_at) == (
+            "approved" if mode == MANUAL else "queued",
+            "quota_exhausted",
+            None,
+        )
+        assert await world.open_reasons(settled.document_id) == ["QUOTA_EXHAUSTED"]
 
 
 async def test_attach_draft_on_failed_grants_exactly_one_post(world):
@@ -1187,6 +1207,41 @@ async def test_list_open_reviews_ordered_with_reasons(world):
     assert await world.module.list_open_reviews.execute(tenant_id="other-tenant") == []
 
 
+async def test_quota_retry_after_topup_grants_exactly_one_post(world):
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, QUOTA, QUOTA)
+    await world.issue()
+    assert len(world.provider.posts()) == 1
+    await world.resolve(settled.document_id, "retry", reason="QUOTA_EXHAUSTED")
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.next_attempt_at, doc.post_count, doc.post_limit) == (
+        "queued",
+        world.clock.now(),
+        1,
+        2,
+    )
+    world.provider.calls.clear()
+    await world.issue()
+    # The quota answer created nothing, so the lookup finds nothing and one POST follows.
+    assert world.provider.ops() == ["find_by_reference", "create"]
+    for _ in range(12):
+        world.advance(timedelta(hours=2))
+        await world.drive(rounds=1)
+    doc = await world.doc(settled.document_id)
+    assert world.provider.ops() == ["find_by_reference", "create"]
+    assert (doc.status, doc.next_attempt_at, doc.post_count, doc.post_limit) == (
+        "queued",
+        None,
+        2,
+        2,
+    )
+    assert await world.open_reasons(settled.document_id) == ["QUOTA_EXHAUSTED"]
+    assert sorted(case.status for case in await world.cases(settled.document_id)) == [
+        "open",
+        "resolved",
+    ]
+
+
 async def test_quota_review_on_approved_keeps_approval(world):
     settled = await settled_in(world, MANUAL)
     world.provider.script_create(settled.reference, QUOTA, QUOTA)
@@ -1198,12 +1253,18 @@ async def test_quota_review_on_approved_keeps_approval(world):
         before.approved_snapshot_sha256,
         before.approved_reference_code,
     )
-    await world.resolve(settled.document_id, "acknowledge", note="Quota topped up")
+    assert (before.status, before.next_attempt_at) == ("approved", None)
+    with pytest.raises(ResolutionNotAllowed):
+        await world.resolve(settled.document_id, "acknowledge", note="Quota topped up")
     world.advance(timedelta(hours=1, seconds=1))
-    await world.issue()
+    assert await world.issue() == []
     await world.resolve(settled.document_id, "retry")
     doc = await world.doc(settled.document_id)
-    assert doc.status == "approved"
+    assert (doc.status, doc.next_attempt_at, doc.post_limit) == (
+        "approved",
+        world.clock.now(),
+        doc.post_count + 1,
+    )
     assert (
         doc.approved_at,
         doc.approved_by,
@@ -1211,6 +1272,12 @@ async def test_quota_review_on_approved_keeps_approval(world):
         doc.approved_reference_code,
     ) == approval
     assert await world.open_reasons(settled.document_id) == []
+    world.provider.calls.clear()
+    await world.issue()
+    assert world.provider.ops() == ["find_by_reference", "create"]
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.approved_by) == ("approved", "accountant-a")
+    assert await world.open_reasons(settled.document_id) == ["QUOTA_EXHAUSTED"]
 
 
 def money_line(quantity=Decimal("1"), price=100, rate=0, **tax):

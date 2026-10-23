@@ -18,7 +18,6 @@ class InvoiceModuleConfig:
     issue_max_attempts: int = 10
     poll_schedule_s: tuple[int, ...] = (3, 5, 10, 20, 30, 60)
     pending_timeout: timedelta = timedelta(hours=3)
-    quota_backoff: timedelta = timedelta(hours=1)
     draft_missing_after: timedelta = timedelta(hours=1)
     stale_alert_after: timedelta = timedelta(minutes=15)
     artifacts_missing_alert_after: timedelta = timedelta(hours=1)
