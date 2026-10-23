@@ -228,18 +228,22 @@ class ResolveReview:
             A.RETRY_WITH_NEW_REFERENCE,
         ):
             lookup = await self._lookup(document)
+            found = lookup.state if lookup is not None else None
             if resolution == A.RETRY_WITH_NEW_REFERENCE and lookup is not None:
                 raise ReferenceStillExists(document.reference_code)
+            if resolution == A.ATTACH_DRAFT and found in ("success", "pending", "cancelled"):
+                raise ResolutionNotAllowed(f"provider_record_{found}")
             if (
-                resolution == A.ATTACH_DRAFT
-                and lookup is not None
-                and lookup.state
-                in (
-                    "success",
-                    "pending",
-                )
+                resolution in (A.RETRY, A.ATTACH_DRAFT)
+                and found not in ("success", "pending")
+                and _unconfirmed(case, target)
             ):
-                raise ResolutionNotAllowed(f"provider_record_{lookup.state}")
+                # The provider asked not to resend an outcome it could not confirm: only a
+                # lookup that shows the outcome settles the case.
+                raise ResolutionNotAllowed("provider_unconfirmed")
+            if resolution == A.RETRY and found == "cancelled":
+                # The same reference can only answer 409 now.
+                raise ResolutionNotAllowed("provider_record_cancelled")
 
         async with self._uow_factory() as uow:
             current = await self._lock(uow, document, case_id, request)
@@ -720,6 +724,16 @@ class ResolveReview:
 
 
 _NOTE_REQUIRED = frozenset({A.WAIVE, A.ACKNOWLEDGE, A.RETRY_WITH_NEW_REFERENCE})
+
+
+def _unconfirmed(case: ReviewCaseRow, reason: ReviewReason) -> bool:
+    """Whether the open ``reason`` records a provider outcome that could not be confirmed."""
+    return any(
+        item.get("reason") == reason.value
+        and item.get("status") == "open"
+        and (item.get("details") or {}).get("unconfirmed") is True
+        for item in case.details.get("reasons", [])
+    )
 
 
 async def repair_failed_document(

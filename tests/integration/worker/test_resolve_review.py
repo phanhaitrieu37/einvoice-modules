@@ -38,6 +38,7 @@ from invoice_module.domain.errors import (
     ResolutionNotAllowed,
     ScopeMismatch,
 )
+from invoice_module.ports.provider import ProviderInvoice
 
 pytestmark = pytest.mark.integration
 
@@ -1437,3 +1438,130 @@ async def test_operator_write_fenced_when_generation_moves_during_lookup(world):
         await first
     assert await world.doc(settled.document_id) == moved
     assert await world.open_reasons(settled.document_id) == ["PROVIDER_REJECTED"]
+
+
+async def failed_unconfirmed(world, state="failed"):
+    """An accepted create whose status check says the outcome could not be confirmed."""
+    settled = await world.settle()
+    await world.issue()
+    world.advance(timedelta(seconds=3))
+    world.provider.unconfirmed(settled.reference, state)
+    await world.poll()
+    details = await world.reason_details(settled.document_id, "PROVIDER_REJECTED")
+    assert details["unconfirmed"] is True
+    return settled
+
+
+async def assert_untouched(world, settled, before, reason):
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.lease_generation, doc.post_limit, doc.request) == (
+        before.status,
+        before.lease_generation,
+        before.post_limit,
+        before.request,
+    )
+    assert await world.open_reasons(settled.document_id) == [reason]
+    assert len(world.provider.posts()) == 1
+
+
+@pytest.mark.parametrize("lookup", ["none", "failed", "cancelled", "success", "pending"])
+async def test_retry_refused_while_provider_unconfirmed(world, lookup):
+    settled = await failed_unconfirmed(world)
+    before = await world.doc(settled.document_id)
+    if lookup == "none":
+        world.provider.script_lookup(settled.reference, None)
+    elif lookup == "failed":
+        world.provider.script_lookup(settled.reference, failed_invoice(settled.reference, None))
+    elif lookup == "cancelled":
+        world.provider.cancel_under_reference(settled.reference)
+    elif lookup == "pending":
+        world.provider.script_lookup(
+            settled.reference, ProviderInvoice(settled.reference, "pending", settled.reference)
+        )
+    if lookup in ("success", "pending"):
+        result = await world.resolve(settled.document_id, "retry")
+        expected = "issued" if lookup == "success" else "pending_provider"
+        assert (result.document_status, (await world.doc(settled.document_id)).status) == (
+            expected,
+            expected,
+        )
+        assert len(world.provider.posts()) == 1
+        return
+    with pytest.raises(ResolutionNotAllowed, match="provider_unconfirmed"):
+        await world.resolve(settled.document_id, "retry")
+    await assert_untouched(world, settled, before, "PROVIDER_REJECTED")
+    await world.drive(rounds=3, step=timedelta(hours=1))
+    assert len(world.provider.posts()) == 1
+
+
+@pytest.mark.parametrize("lookup", ["none", "failed"])
+async def test_attach_draft_refused_while_provider_unconfirmed(world, lookup):
+    settled = await failed_unconfirmed(world)
+    before = await world.doc(settled.document_id)
+    world.provider.script_lookup(
+        settled.reference,
+        None if lookup == "none" else failed_invoice(settled.reference, None),
+    )
+    with pytest.raises(ResolutionNotAllowed, match="provider_unconfirmed"):
+        await world.resolve(
+            settled.document_id,
+            "attach_draft",
+            draft=world.draft_command(settled.host_ref_id, settled.intent_id, name="Corrected"),
+        )
+    await assert_untouched(world, settled, before, "PROVIDER_REJECTED")
+    assert (await world.doc(settled.document_id)).document == before.document
+
+
+@pytest.mark.parametrize("resolution", ["mark_external", "waive"])
+async def test_unconfirmed_allows_mark_external_and_waive(world, resolution):
+    settled = await failed_unconfirmed(world, "pending")
+    if resolution == "mark_external":
+        result = await world.resolve(
+            settled.document_id,
+            "mark_external",
+            invoice_number="00000099",
+            issued_date=date(2026, 10, 21),
+        )
+        doc = await world.doc(settled.document_id)
+        assert (result.document_status, doc.status, doc.invoice_number) == (
+            "issued",
+            "issued",
+            "00000099",
+        )
+    else:
+        result = await world.resolve(settled.document_id, "waive", note="Confirmed with SePay")
+        doc = await world.doc(settled.document_id)
+        assert (result.document_status, doc.status) == ("failed", "failed")
+    assert result.case_resolved is True
+    assert world.provider.ops().count("find_by_reference") == 0
+    assert len(world.provider.posts()) == 1
+
+
+async def test_retry_refused_when_lookup_cancelled(world):
+    settled = await failed_by(world, rejected("validation_error"))
+    world.provider.cancel_under_reference(settled.reference)
+    before = await world.doc(settled.document_id)
+    with pytest.raises(ResolutionNotAllowed, match="provider_record_cancelled"):
+        await world.resolve(settled.document_id, "retry")
+    await assert_untouched(world, settled, before, "PROVIDER_REJECTED")
+    with pytest.raises(ReferenceStillExists):
+        await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    await assert_untouched(world, settled, before, "PROVIDER_REJECTED")
+    await world.drive(rounds=3, step=timedelta(hours=1))
+    assert len(world.provider.posts()) == 1
+
+
+async def test_attach_draft_refused_when_lookup_cancelled(world):
+    settled = await failed_by(world, rejected("validation_error"))
+    world.provider.cancel_under_reference(settled.reference)
+    before = await world.doc(settled.document_id)
+    with pytest.raises(ResolutionNotAllowed, match="provider_record_cancelled"):
+        await world.resolve(
+            settled.document_id,
+            "attach_draft",
+            draft=world.draft_command(settled.host_ref_id, settled.intent_id, name="Corrected"),
+        )
+    await assert_untouched(world, settled, before, "PROVIDER_REJECTED")
+    assert (await world.doc(settled.document_id)).document == before.document
+    await world.drive(rounds=3, step=timedelta(hours=1))
+    assert len(world.provider.posts()) == 1
