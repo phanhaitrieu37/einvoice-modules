@@ -233,6 +233,8 @@ def test_parse_invoice_cancelled_is_reported_as_cancelled(recorded: Loader) -> N
     assert invoice.state == "cancelled"
     assert invoice.invoice_number == "307614"
     assert invoice.provider_message is None
+    body["data"]["status"] = "canceled"
+    assert _lookup(body).state == "pending"
 
 
 def test_parse_invoice_refuses_another_reference(recorded: Loader) -> None:
@@ -241,6 +243,8 @@ def test_parse_invoice_refuses_another_reference(recorded: Loader) -> None:
     with pytest.raises(ProviderRejected) as raised:
         parse_invoice(body, REFERENCE)
     assert raised.value.code == "lookup_reference_mismatch"
+    with pytest.raises(ProviderRejected):
+        parse_invoice(body, body["data"]["reference_code"].upper())
     for missing in (None, ""):
         anonymous = copy.deepcopy(body)
         anonymous["data"]["reference_code"] = missing
@@ -488,7 +492,11 @@ async def test_provider_fetch_artifacts_returns_pdf_and_xml(
     assert (await wrapped.provider.fetch_artifacts(account, creds, REFERENCE, "u")).pdf == files[
         "pdf"
     ]
-    for content, code in (("PEhEb24+?!", "artifact_xml_invalid"), ("", "artifact_xml_missing")):
+    for content, code in (
+        ("PEhEb24+?!", "artifact_xml_invalid"),
+        ("", "artifact_xml_missing"),
+        ("\r\n", "artifact_xml_missing"),
+    ):
 
         def strict(request: httpx.Request, c: str = content) -> httpx.Response:
             data = c if request.url.params["type"] == "xml" else pdf

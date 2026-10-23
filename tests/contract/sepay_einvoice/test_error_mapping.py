@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -111,6 +112,24 @@ async def test_network_errors_map_to_transient(
     with pytest.raises(ProviderTransient) as raised:
         await h.provider.check_create(account, creds, REFERENCE)
     assert raised.value.retry_after is None
+
+
+async def test_transport_failure_log_names_the_error_type_only(
+    harness: Callable[..., Any],
+    account: IssuerAccountView,
+    creds: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("synthetic transport detail")
+
+    h = harness(handler)
+    with pytest.raises(ProviderTransient):
+        await h.provider.check_create(account, creds, REFERENCE)
+    assert "sepay einvoice GET request failed: ConnectError" in caplog.text
+    assert "synthetic transport detail" not in caplog.text
 
 
 def test_422_maps_to_rejected_with_code(recorded: Loader) -> None:
