@@ -43,6 +43,6 @@ Muốn đổi một dòng ở trên: trình bày quyết định gốc, lý do, 
 | Worker | Claude qua orca, model `claude-opus-5-5` effort `high` (người dùng chốt 07/10/2026; trước đó là codex `gpt-6-luna`) | chỉ các file được giao trong phase, trong worktree riêng | Thực thi plan: code và test một phase, ghi report phase vào `plans/reports/`. Không merge, không sửa file ngoài ownership, không sửa plan. Copy `.claude/settings.json` vào worktree; brief vẫn phải ghi lại đủ các ràng buộc ở mục "SePay và secret" và "Git". |
 | Reviewer | agent Claude `code-reviewer` độc lập, không phải worker vừa code | không sửa code | Review khắt khe theo plan: chạy lại mọi Verify, đối chiếu từng dòng với spec và ý định của spec, thử làm hỏng code để chứng minh test bắt được lỗi, kiểm bất biến trên Postgres thật, kiểm hard rule. Trả PASS hoặc CHANGES_REQUESTED kèm bằng chứng. Bắt buộc sau mỗi phase và sau mỗi vòng sửa. |
 | Kongming gate | agent `kongming` | không sửa code | Tư vấn go/no-go sau reviewer ở mỗi phase và khi bế tắc. |
-| Codex review | `codex exec --sandbox read-only` | không sửa gì | Review khắt khe trước release hoặc khi người dùng yêu cầu. |
+| Review trước release | agent Claude `code-reviewer` độc lập rồi `kongming` go/no-go (người dùng chốt 23/10/2026; trước đó là codex) | không sửa gì | Review khắt khe toàn nhánh trước release hoặc khi người dùng yêu cầu. Không dùng codex. |
 
 Một phase chỉ xong khi reviewer PASS, kongming không chặn, và coordinator đã đối chiếu với tiêu chí chấp nhận trong plan.
