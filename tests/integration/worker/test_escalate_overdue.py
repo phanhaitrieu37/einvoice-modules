@@ -527,6 +527,20 @@ async def test_previous_reference_recheck_throttled_within_interval(world):
     assert len(rechecks()) == before + 2
 
 
+async def test_recheck_memo_forgets_references_past_their_window(world):
+    settled = await rotated(world)
+    sweep = world.module.escalate_overdue
+    await escalate(world)
+    key = (settled.document_id, settled.reference)
+    assert set(sweep._rechecked_at) == {key}
+    world.advance(timedelta(hours=23, minutes=59))
+    await escalate(world)
+    assert set(sweep._rechecked_at) == {key}
+    world.advance(timedelta(minutes=2))
+    await escalate(world)
+    assert sweep._rechecked_at == {}
+
+
 async def test_stale_alert_logs_once_per_entry_but_counts_every_sweep(world, caplog):
     settled = await world.settle()
     world.advance(timedelta(minutes=16))

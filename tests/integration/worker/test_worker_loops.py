@@ -39,6 +39,26 @@ async def test_worker_issues_polls_and_fetches_until_stop(world):
     assert len(world.provider.posts()) == 1
 
 
+async def test_each_loop_runs_on_its_own_interval(world, monkeypatch):
+    intervals = WorkerIntervals(issue_s=1.5, poll_s=2.5, sweep_s=31.5, artifacts_s=4.5)
+    loops = InvoiceWorker(world.module, intervals).loops()
+    assert {name: interval for name, (_, interval) in loops.items()} == {
+        "issue": 1.5,
+        "poll": 2.5,
+        "sweep": 31.5,
+        "artifacts": 4.5,
+    }
+    assert InvoiceWorker(world.module).loops()["sweep"][1] == WorkerIntervals().sweep_s == 30.0
+    swept = []
+
+    async def recording(now=None):
+        swept.append(now)
+
+    monkeypatch.setattr(world.module.escalate_overdue, "run", recording)
+    await loops["sweep"][0]()
+    assert swept == [world.clock.now()]
+
+
 async def test_failing_step_is_counted_and_loop_continues(world, monkeypatch):
     settled = await world.settle()
     issue_queued = world.module.issue_queued
