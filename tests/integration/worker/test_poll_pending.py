@@ -221,16 +221,42 @@ async def test_finalize_issued_clears_open_provider_reasons(world):
 
 
 @pytest.mark.parametrize(
-    "case", ["success", "pending", "failed", "cancelled", "none", "check_auth_failed"]
+    "case",
+    [
+        "success",
+        "success_total_mismatch",
+        "pending",
+        "failed",
+        "cancelled",
+        "none",
+        "check_auth_failed",
+        "lookup_auth_failed",
+    ],
 )
 async def test_check_rejected_looks_up_before_review(world, case):
     settled = await accepted(world)
     now = world.clock.now()
+    total = (await world.doc(settled.document_id)).total_vnd
     if case == "check_auth_failed":
         world.provider.script_check(settled.reference, AUTH_FAILED)
     else:
         world.provider.script_check(settled.reference, check_rejected("NOT_FOUND"))
-    if case == "pending":
+    if case == "success_total_mismatch":
+        world.provider.script_lookup(
+            settled.reference,
+            ProviderInvoice(
+                settled.reference,
+                "success",
+                settled.reference,
+                provider_invoice_id="inv-other",
+                invoice_number="00000077",
+                total_amount_vnd=total + 1,
+                issued_date=date(2026, 10, 21),
+            ),
+        )
+    elif case == "lookup_auth_failed":
+        world.provider.script_lookup(settled.reference, AUTH_FAILED)
+    elif case == "pending":
         world.provider.script_lookup(
             settled.reference, ProviderInvoice(settled.reference, "pending", settled.reference)
         )
@@ -246,8 +272,13 @@ async def test_check_rejected_looks_up_before_review(world, case):
     doc = await world.doc(settled.document_id)
     ops = world.provider.ops()
     assert len(world.provider.posts()) == 1
-    if case == "check_auth_failed":
-        assert ops == ["create", "check_create"]
+    if case in ("check_auth_failed", "lookup_auth_failed"):
+        # Both are reads: retried shortly, without a review.
+        assert ops == (
+            ["create", "check_create"]
+            if case == "check_auth_failed"
+            else ["create", "check_create", "find_by_reference"]
+        )
         assert (result.outcome, doc.status, doc.tracking_code) == (
             "backoff",
             "pending_provider",
@@ -271,6 +302,18 @@ async def test_check_rejected_looks_up_before_review(world, case):
         await world.poll()
         assert world.provider.ops()[-1] == "find_by_reference"
         assert (await world.doc(settled.document_id)).status == "issued"
+        return
+    if case == "success_total_mismatch":
+        # The lookup is ours only if its total matches: a different invoice is never issued.
+        assert (doc.status, doc.last_error_code, doc.invoice_number, doc.issued_at) == (
+            "failed",
+            "lookup_mismatch",
+            None,
+            None,
+        )
+        assert await world.open_reasons(settled.document_id) == ["LOOKUP_MISMATCH"]
+        details = await world.reason_details(settled.document_id, "LOOKUP_MISMATCH")
+        assert details == {"provider_total": total + 1, "document_total": total}
         return
     expected = {
         "failed": ("provider_failed", "PROVIDER_REJECTED"),
