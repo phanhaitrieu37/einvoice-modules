@@ -1,0 +1,19 @@
+{
+  "_recorded": "Sandbox lookup of a random uuid4 reference that was never sent, 2026-10-23 (one GET).",
+  "body": {
+    "error": {
+      "code": "EINVOICE_DOCUMENT_NOT_FOUND",
+      "message": "Không tìm thấy hóa đơn"
+    },
+    "success": false
+  },
+  "headers": {
+    "content-length": null,
+    "content-type": "application/json; charset=UTF-8"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/v1/invoices/{reference_code}"
+  },
+  "status": 404
+}

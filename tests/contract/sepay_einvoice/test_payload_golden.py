@@ -322,3 +322,27 @@ def test_quantity_wire_form(account: IssuerAccountView, quantity: object, sent: 
     item = build_create_payload(account, _document(_line(quantity=quantity)), REFERENCE, ISSUED)
     assert item["items"][0]["quantity"] == sent
     assert type(item["items"][0]["quantity"]) is type(sent)
+
+
+def test_fractional_quantity_wire_form_was_issued_by_the_sandbox(
+    account: IssuerAccountView, recorded: Callable[[str], dict[str, Any]]
+) -> None:
+    """The sandbox issued a line whose quantity was sent as the decimal string "1.5"."""
+    record = recorded("create_fractional_quantity.json")
+    sent = record["request_item"]
+    line = LineInput(
+        name=sent["item_name"],
+        unit=sent["unit"],
+        quantity=Decimal("1.5"),
+        unit_price_vnd=sent["unit_price"],
+        tax_rate=sent["tax_rate"],
+        item_code=sent["item_code"],
+    )
+    doc = freeze_document(DraftData(None, (line,), record["request_total_amount"]), account)
+    payload = build_create_payload(account, doc, REFERENCE, ISSUED)
+    assert payload["items"][0] == sent
+    assert payload["total_amount"] == record["request_total_amount"]
+    assert record["status"] == 202 and record["body"]["success"] is True
+    assert record["check_final_state"] == "success"
+    assert [item["quantity"] for item in record["lookup"]["items"]] == ["1.50"]
+    assert record["lookup"]["total_amount"] == record["request_total_amount"]

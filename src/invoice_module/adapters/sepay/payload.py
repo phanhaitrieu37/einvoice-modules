@@ -125,7 +125,11 @@ def _int(value: object, field: str) -> int:
 
 
 def _quantity(value: object) -> int | str:
-    """A whole quantity as a JSON integer; a fractional one as its decimal string."""
+    """A whole quantity as a JSON integer; a fractional one as its decimal string.
+
+    The sandbox issued a line sent as ``"1.5"`` and reads it back as ``"1.50"``
+    (``create_fractional_quantity.json``), so no float is ever needed.
+    """
     if isinstance(value, bool | float):
         raise TypeError("quantity must be a decimal string or an integer")
     quantity = Decimal(str(value))

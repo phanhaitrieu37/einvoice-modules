@@ -338,12 +338,29 @@ async def test_provider_create_409_raises_document_exists(
     assert len(h.calls("/v1/invoices/create", "POST")) == 1
 
 
+def test_recorded_unknown_reference_fixture_is_404_with_envelope(recorded: Loader) -> None:
+    record = recorded("lookup_unknown_reference.json")
+    assert record["status"] == 404
+    assert record["request"] == {
+        "method": "GET",
+        "path": endpoints.ENDPOINTS["get_by_reference"][1],
+    }
+    assert record["headers"]["content-type"].startswith("application/json")
+    assert record["body"]["success"] is False
+    assert record["body"]["error"]["code"] == "EINVOICE_DOCUMENT_NOT_FOUND"
+    assert isinstance(record["body"]["error"]["message"], str)
+    assert "data" not in record["body"]
+
+
 async def test_provider_find_by_reference_none_on_404(
-    harness: Callable[..., Any], account: IssuerAccountView, creds: Any
+    harness: Callable[..., Any], recorded: Loader, account: IssuerAccountView, creds: Any
 ) -> None:
-    not_found = {"success": False, "error": {"code": "NOT_FOUND", "message": "x"}}
-    h = harness(lambda request: httpx.Response(404, json=not_found))
+    """Replays the sandbox answer for a reference it never saw."""
+    h = harness(lambda request: _json(recorded("lookup_unknown_reference.json")))
     assert await h.provider.find_by_reference(account, creds, REFERENCE) is None
+    documented = {"success": False, "error": {"code": "NOT_FOUND", "message": "x"}}
+    docs = harness(lambda request: httpx.Response(404, json=documented))
+    assert await docs.provider.find_by_reference(account, creds, REFERENCE) is None
     assert [r.url.path for r in h.calls("/v1/invoices/")] == [f"/v1/invoices/{REFERENCE}"]
     failing = harness(lambda request: httpx.Response(500, json={}))
     with pytest.raises(ProviderTransient):
