@@ -139,6 +139,7 @@ class FakeEInvoiceProvider:
         self._prepare_delay: dict[str, deque[timedelta]] = {}
         self._prepare_hooks: deque[Callable[[], Awaitable[None]]] = deque()
         self._number = 0
+        self._account_facts: dict[str, Any] = {"active": True}
 
     # -- scripting -----------------------------------------------------------------------
 
@@ -223,6 +224,11 @@ class FakeEInvoiceProvider:
             invoice.invoice_number = self._next_number()
         invoice.provider_invoice_id = invoice.provider_invoice_id or f"inv-{invoice.reference_code}"
         self.invoices[invoice.reference_code] = invoice
+
+    def set_account_facts(self, **facts: Any) -> None:
+        """What ``describe_account`` reports, for example ``active=False`` or
+        ``tax_authority_approved_date=date(...)``; unset facts keep their defaults."""
+        self._account_facts.update(facts)
 
     def reconcile_at_portal(self, reference_code: str) -> None:
         """An operator settled the reference at the portal: it can never create an invoice."""
@@ -427,7 +433,9 @@ class FakeEInvoiceProvider:
         self, account: IssuerAccountView, creds: ClientCredentials
     ) -> AccountFacts:
         self.calls.append(Call("describe_account", account.provider_account_id, self.clock.now()))
-        return AccountFacts(account.provider_account_id, ("1",), ("C26TSE",))
+        return replace(
+            AccountFacts(account.provider_account_id, ("1",), ("C26TSE",)), **self._account_facts
+        )
 
     async def adjust(self, account: Any, creds: Any, request: Mapping[str, object]) -> Accepted:
         self.calls.append(Call("adjust", str(request.get("reference_code")), self.clock.now()))
