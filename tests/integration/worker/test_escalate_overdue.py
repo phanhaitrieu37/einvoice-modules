@@ -411,6 +411,31 @@ async def test_draft_sweep_reaches_document_beyond_batch_of_stuck_documents(worl
     assert [(await world.doc(s.document_id)).status for s in stuck] == ["needs_draft"] * 2
 
 
+async def test_draft_sweep_reaches_document_behind_mismatched_open_drafts(world):
+    world.config = InvoiceModuleConfig(batch_size=2)
+    world.restart()
+    stuck = []
+    for _ in range(2):  # settled at 100 while their open draft still declares 150
+        stuck.append(await world.settle(draft_amount=150))
+        assert await world.open_reasons(stuck[-1].document_id) == ["AMOUNT_MISMATCH"]
+        world.advance(timedelta(seconds=1))
+    before = [await world.doc(s.document_id) for s in stuck]
+    late = await world.settle(draft=False)
+    draft_id = await insert_draft(world, late, intent_id=late.intent_id)  # the wake-up was missed
+    report = await escalate(world)
+    doc = await world.doc(late.document_id)
+    assert (doc.status, doc.draft_id) == ("queued", draft_id)
+    assert report.drafts_attached == [late.document_id]
+    after = [await world.doc(s.document_id) for s in stuck]
+    assert [(d.status, d.updated_at) for d in after] == [(d.status, d.updated_at) for d in before]
+    assert {d.status for d in after} == {"blocked"}
+    # A corrected revision of the same draft row is attachable again.
+    await fix_draft_amount(world, stuck[0], 100)
+    report = await escalate(world)
+    assert report.drafts_attached == [stuck[0].document_id]
+    assert (await world.doc(stuck[0].document_id)).status == "queued"
+
+
 @pytest.mark.parametrize("older", ["waived", "open"])
 async def test_draft_missing_reaches_newest_document_behind_decided_ones(world, monkeypatch, older):
     monkeypatch.setattr(escalate_module, "_ALERT_SCAN_LIMIT", 2)

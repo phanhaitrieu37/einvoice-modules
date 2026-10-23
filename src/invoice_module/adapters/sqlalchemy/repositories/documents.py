@@ -232,14 +232,16 @@ class DocumentRepository(SqlAlchemyRepository):
 
     async def list_awaiting_draft(self, limit: int) -> list[DocumentRow]:
         """Documents still waiting for a draft that have an open draft of their merchant they
-        may take, across hosts, oldest first. A document with nothing to attach never takes a
-        place in the batch, so it cannot hold newer documents back."""
+        may take, across hosts, oldest first. A document with nothing to attach, or whose open
+        draft still declares another total than the settled amount, never takes a place in the
+        batch, so it cannot hold newer documents back."""
         table, drafts = self.tables.documents, self.tables.invoice_drafts
         attachable = sa.exists(
             sa.select(1).where(
                 drafts.c.status == DraftStatus.OPEN.value,
                 drafts.c.tenant_id == table.c.tenant_id,
                 drafts.c.merchant_id == table.c.merchant_id,
+                drafts.c.declared_total_vnd == table.c.settled_amount_vnd,
                 sa.or_(
                     drafts.c.intent_id == table.c.intent_id,
                     sa.and_(
