@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextlib
 import dataclasses
 import json
@@ -402,6 +403,51 @@ async def test_refused_authorization_header_is_raised_without_the_library_error(
     assert received == [b"/v1/token"]
     assert raised.value.__cause__ is None and raised.value.__context__ is None
     assert_no_secret_in_any_frame(raised.value)
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+# A synthetic token in the JWT shape of the token docs: three base64url segments, built here
+# so no literal looks like a credential. The signature bytes encode to ``-`` and ``_``.
+JWT_SHAPED_TOKEN = ".".join(
+    [
+        _b64url(b'{"alg":"HS256","typ":"JWT"}'),
+        _b64url(b'{"sub":"synthetic-subject","exp":1}'),
+        _b64url(b"\xfb\xff\xbfsynthetic-signature"),
+    ]
+)
+# Token shapes inside the RFC 6750 grammar: the 64-hex shape of the token docs example,
+# the JWT shape, every non-alphanumeric character the grammar allows, and its padding.
+ACCEPTED_TOKENS = {
+    "hex": "0123456789abcdef" * 4,
+    "jwt": JWT_SHAPED_TOKEN,
+    "tilde_plus_slash": "a~b+c/d",
+    "one_pad": "abc=",
+    "two_pad": "abc==",
+    "dot_underscore": "synthetic.access_token",
+}
+
+
+@pytest.mark.parametrize("token", list(ACCEPTED_TOKENS.values()), ids=list(ACCEPTED_TOKENS))
+async def test_token_inside_the_bearer_grammar_is_cached_and_sent(
+    token: str,
+    harness: Callable[..., Any],
+    recorded: Loader,
+    account: IssuerAccountView,
+    creds: Any,
+) -> None:
+    success = recorded("check_success.json")["body"]
+    h = harness(
+        lambda request: httpx.Response(200, json=success),
+        token_handler=lambda request: token_response(token, 86400),
+    )
+    first = await h.provider.check_create(account, creds, REFERENCE)
+    second = await h.provider.check_create(account, creds, REFERENCE)
+    assert first.state == second.state == "success"
+    assert h.events.count("token") == 1
+    assert [r.headers["Authorization"] for r in h.calls("/check/")] == [f"Bearer {token}"] * 2
 
 
 @pytest.mark.parametrize(
