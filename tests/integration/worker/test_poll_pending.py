@@ -1,11 +1,16 @@
 from datetime import date, timedelta
 
 import pytest
-from tests.fakes.fake_einvoice_provider import TRANSIENT
+from tests.fakes.fake_einvoice_provider import (
+    AUTH_FAILED,
+    TRANSIENT,
+    check_rejected,
+    failed_invoice,
+)
 from tests.integration.worker.world import TENANT, vn
 
 from invoice_module.domain.enums import DeliveryMode
-from invoice_module.ports.provider import ProviderProgress
+from invoice_module.ports.provider import ProviderInvoice, ProviderProgress
 
 pytestmark = pytest.mark.integration
 
@@ -13,6 +18,8 @@ DATE_ORDER_MESSAGE = (
     "Ngày lập (07/10/2026) phải lớn hơn hoặc bằng ngày lập của hóa đơn số 330964 "
     "(20/10/2026) liền kề trước cùng ký hiệu C26TSE."
 )
+# A synthetic stand-in: the module reads the adapter's code, never this text.
+UNCONFIRMED_MESSAGE = "Thông điệp tổng hợp: kết quả chưa rõ."
 
 
 async def accepted(world, **settle):
@@ -209,3 +216,118 @@ async def test_finalize_issued_clears_open_provider_reasons(world):
         "system:issuance",
     )
     assert case.status == "resolved"
+
+
+@pytest.mark.parametrize(
+    "case", ["success", "pending", "failed", "cancelled", "none", "check_auth_failed"]
+)
+async def test_check_rejected_looks_up_before_review(world, case):
+    settled = await accepted(world)
+    now = world.clock.now()
+    if case == "check_auth_failed":
+        world.provider.script_check(settled.reference, AUTH_FAILED)
+    else:
+        world.provider.script_check(settled.reference, check_rejected("NOT_FOUND"))
+    if case == "pending":
+        world.provider.script_lookup(
+            settled.reference, ProviderInvoice(settled.reference, "pending", settled.reference)
+        )
+    elif case == "failed":
+        world.provider.script_lookup(
+            settled.reference, failed_invoice(settled.reference, "Synthetic refusal")
+        )
+    elif case == "cancelled":
+        world.provider.cancel_under_reference(settled.reference)
+    elif case == "none":
+        world.provider.script_lookup(settled.reference, None)
+    [result] = await world.poll()
+    doc = await world.doc(settled.document_id)
+    ops = world.provider.ops()
+    assert len(world.provider.posts()) == 1
+    if case == "check_auth_failed":
+        assert ops == ["create", "check_create"]
+        assert (result.outcome, doc.status, doc.tracking_code) == (
+            "backoff",
+            "pending_provider",
+            settled.reference,
+        )
+        assert doc.next_attempt_at == now + timedelta(seconds=3)
+        assert await world.cases(settled.document_id) == []
+        return
+    assert ops == ["create", "check_create", "find_by_reference"]
+    if case == "success":
+        assert (doc.status, doc.invoice_number) == (
+            "issued",
+            world.provider.invoices[settled.reference].invoice_number,
+        )
+        return
+    if case == "pending":
+        assert (doc.status, doc.tracking_code, doc.poll_count) == ("pending_provider", None, 1)
+        assert doc.next_attempt_at == now + timedelta(seconds=5)
+        assert await world.cases(settled.document_id) == []
+        world.advance(timedelta(seconds=5))
+        await world.poll()
+        assert world.provider.ops()[-1] == "find_by_reference"
+        assert (await world.doc(settled.document_id)).status == "issued"
+        return
+    expected = {
+        "failed": ("provider_failed", "PROVIDER_REJECTED"),
+        "cancelled": ("document_existed_unresolved", "DOCUMENT_EXISTED_UNRESOLVED"),
+        "none": ("document_existed_unresolved", "DOCUMENT_EXISTED_UNRESOLVED"),
+    }[case]
+    assert (doc.status, doc.last_error_code) == ("failed", expected[0])
+    assert await world.open_reasons(settled.document_id) == [expected[1]]
+    details = await world.reason_details(settled.document_id, expected[1])
+    assert (
+        details
+        == {
+            "failed": {"provider_job_state": "Failed", "provider_message": "Synthetic refusal"},
+            "cancelled": {"provider_state": "cancelled"},
+            "none": {"provider_state": "none", "phase": "poll", "check_status": "NOT_FOUND"},
+        }[case]
+    )
+
+
+@pytest.mark.parametrize("state", ["failed", "pending", "success"])
+async def test_unconfirmed_code_opens_review_without_resend(world, state):
+    settled = await accepted(world)
+    world.provider.unconfirmed(settled.reference, state, message=UNCONFIRMED_MESSAGE)
+    await world.poll()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.last_error_code, doc.next_attempt_at) == (
+        "failed",
+        "provider_failed",
+        None,
+    )
+    assert doc.invoice_number is None
+    assert await world.open_reasons(settled.document_id) == ["PROVIDER_REJECTED"]
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
+        "unconfirmed": True,
+        "provider_job_state": state,
+        "provider_message": UNCONFIRMED_MESSAGE,
+    }
+    # Neither a resend nor a wait for the timeout: the case stays with the operator.
+    for _ in range(4):
+        world.advance(timedelta(hours=1))
+        await world.drive(rounds=1)
+        await world.module.escalate_overdue.run(world.clock.now())
+    assert world.provider.ops() == ["create", "check_create"]
+    assert (await world.doc(settled.document_id)).status == "failed"
+
+
+async def test_poll_lookup_cancelled_opens_document_existed_unresolved(world):
+    settled = await accepted(world)
+    await world.set_columns(settled.document_id, tracking_code=None)
+    world.provider.cancel_under_reference(settled.reference)
+    [result] = await world.poll()
+    doc = await world.doc(settled.document_id)
+    assert result.outcome == "failed"
+    assert (doc.status, doc.last_error_code, doc.invoice_number, doc.issued_at) == (
+        "failed",
+        "document_existed_unresolved",
+        None,
+        None,
+    )
+    assert world.provider.ops() == ["create", "find_by_reference"]
+    details = await world.reason_details(settled.document_id, "DOCUMENT_EXISTED_UNRESOLVED")
+    assert details == {"provider_state": "cancelled"}

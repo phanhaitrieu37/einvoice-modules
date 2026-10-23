@@ -439,12 +439,14 @@ class IssueQueued:
             return await self._finalize_from_lookup(document, found)
         if found.state == "pending":
             return await self._to_pending(document, found.tracking_code)
-        if found.state == "draft":
+        if found.state in ("draft", "cancelled"):
+            # A record under our reference that is not an issued invoice: a resend could only
+            # answer 409, so an operator decides.
             return await self._fail(
                 document,
                 IssueErrorCode.DOCUMENT_EXISTED_UNRESOLVED,
                 ReviewReason.DOCUMENT_EXISTED_UNRESOLVED,
-                {"provider_state": "draft"},
+                {"provider_state": found.state},
                 request_authorized_resend=False,
             )
         return await self._fail(

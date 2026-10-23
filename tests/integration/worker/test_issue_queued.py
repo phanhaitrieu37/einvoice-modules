@@ -484,6 +484,31 @@ async def test_create_2xx_without_tracking_goes_lookup_first(world):
     assert world.provider.effective_creates[settled.reference] == 1
 
 
+@pytest.mark.parametrize("path", ["reclaim_lookup", "conflict_lookup"])
+async def test_lookup_cancelled_opens_document_existed_unresolved(world, path):
+    settled = await world.settle()
+    if path == "reclaim_lookup":
+        world.provider.script_create(settled.reference, TRANSIENT)
+        await world.issue()
+        world.provider.cancel_under_reference(settled.reference)
+        world.past_lease()
+    else:
+        world.provider.cancel_under_reference(settled.reference)
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert world.provider.ops() == ["create", "find_by_reference"]
+    assert (doc.status, doc.last_error_code, doc.invoice_number) == (
+        "failed",
+        "document_existed_unresolved",
+        None,
+    )
+    assert doc.request_authorized_resend is False
+    details = await world.reason_details(settled.document_id, "DOCUMENT_EXISTED_UNRESOLVED")
+    assert details == {"provider_state": "cancelled"}
+    await world.drive(rounds=4, step=timedelta(hours=1))
+    assert len(world.provider.posts()) == 1
+
+
 async def test_auth_failed_opens_review(world):
     settled = await world.settle()
     world.provider.script_create(settled.reference, AUTH_FAILED)

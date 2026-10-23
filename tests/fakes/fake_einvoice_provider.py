@@ -59,6 +59,8 @@ BLOCK = "block"  # the POST waits until the test releases it
 
 # The provider's quota code, spelled exactly as the API returns it.
 QUOTA_CODE = "QUOTA_HAS_BEEN_USERD_UP"
+# The code the adapter sets on a status check whose outcome the provider could not confirm.
+PROVIDER_UNCONFIRMED = "provider_unconfirmed"
 
 
 def rejected(code: str) -> tuple[str, str]:
@@ -70,6 +72,11 @@ def account_status_rejected(code: str) -> tuple[str, str]:
     """A refusal about the account or seller store (for example ``BILLING_IS_UNPAID``), passed
     through by the adapter as the provider's code."""
     return rejected(code)
+
+
+def check_rejected(code: str) -> tuple[str, str]:
+    """A status check answered with an error code (docs: 400 bad tracking code, 404 unknown)."""
+    return ("check_rejected", code)
 
 
 def raises(error: Exception) -> tuple[str, Exception]:
@@ -147,8 +154,41 @@ class FakeEInvoiceProvider:
         self._lookup_scripts.setdefault(reference_code, deque()).extend(results)
 
     def script_check(self, reference_code: str, *results: Any) -> None:
-        """Each item is ``TRANSIENT`` or a ``ProviderProgress`` returned once."""
+        """Each item is ``TRANSIENT``, ``AUTH_FAILED``, ``check_rejected(code)`` or a
+        ``ProviderProgress`` returned once."""
         self._check_scripts.setdefault(reference_code, deque()).extend(results)
+
+    def unconfirmed(
+        self, reference_code: str, state: str = "failed", message: str = "Synthetic"
+    ) -> None:
+        """The next check carries the adapter's ``provider_unconfirmed`` code with ``state``;
+        a ``success`` keeps the invoice facts the provider reported."""
+        invoice = self.invoices.get(reference_code)
+        facts: dict[str, Any] = {}
+        if state == "success" and invoice is not None:
+            facts = {
+                "invoice_number": invoice.invoice_number,
+                "provider_invoice_id": invoice.provider_invoice_id,
+                "issued_date": invoice.issued_date,
+            }
+        self.script_check(
+            reference_code,
+            ProviderProgress(
+                state=state,  # type: ignore[arg-type]
+                error_code=PROVIDER_UNCONFIRMED,
+                provider_message=message,
+                **facts,
+            ),
+        )
+
+    def cancel_under_reference(self, reference_code: str, message: str | None = None) -> None:
+        """The provider reports the invoice under ``reference_code`` as cancelled."""
+        invoice = self.invoices.get(reference_code)
+        if invoice is None:
+            invoice = FakeInvoice(reference_code, None, None)
+            self.seed_invoice(invoice)
+        invoice.state, invoice.pending_polls = "cancelled", 0
+        invoice.provider_message = message
 
     def new_invoice(
         self,
@@ -312,6 +352,10 @@ class FakeEInvoiceProvider:
         try:
             if scripted is TRANSIENT:
                 raise ProviderTransient()
+            if scripted is AUTH_FAILED:
+                raise ProviderAuthFailed("forbidden")
+            if isinstance(scripted, tuple) and scripted[0] == "check_rejected":
+                raise ProviderRejected(scripted[1])
             if scripted is not None:
                 return scripted
             invoice = self.invoices.get(tracking_code)
