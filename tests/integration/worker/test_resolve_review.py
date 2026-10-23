@@ -44,7 +44,7 @@ from invoice_module.domain.errors import (
     ResolutionNotAllowed,
     ScopeMismatch,
 )
-from invoice_module.ports.provider import ProviderInvoice
+from invoice_module.ports.provider import ProviderInvoice, ProviderProgress
 
 pytestmark = pytest.mark.integration
 
@@ -1562,6 +1562,82 @@ async def test_unconfirmed_allows_mark_external_and_waive(world, resolution):
     assert result.case_resolved is True
     assert world.provider.ops().count("find_by_reference") == 0
     assert len(world.provider.posts()) == 1
+
+
+@pytest.mark.parametrize("lookup", ["none", "failed", "pending"])
+async def test_retry_with_new_reference_while_provider_unconfirmed_follows_the_lookup(
+    world, lookup
+):
+    settled = await failed_unconfirmed(world)
+    before = await world.doc(settled.document_id)
+    if lookup == "none":
+        world.provider.script_lookup(settled.reference, None)
+    elif lookup == "failed":
+        world.provider.script_lookup(settled.reference, failed_invoice(settled.reference, None))
+    else:
+        world.provider.script_lookup(
+            settled.reference, ProviderInvoice(settled.reference, "pending", settled.reference)
+        )
+    if lookup != "none":
+        with pytest.raises(ReferenceStillExists):
+            await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+        await assert_untouched(world, settled, before, "PROVIDER_REJECTED")
+        assert (await world.doc(settled.document_id)).reference_code == settled.reference
+        return
+    result = await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    doc = await world.doc(settled.document_id)
+    assert result.reference_code != settled.reference
+    assert (result.document_status, doc.status, doc.reference_code) == (
+        "queued",
+        "queued",
+        result.reference_code,
+    )
+    assert await world.open_reasons(settled.document_id) == []
+
+
+async def test_retry_allowed_once_unconfirmed_reason_was_cleared_in_the_same_case(world):
+    settled = await world.settle()
+    await world.issue()
+    # Another open reason keeps the case open across the whole sequence.
+    async with world.crash() as uow:
+        await uow.review_cases.open_once(
+            TENANT, settled.document_id, "STALE_REFERENCE_FOUND", {"previous_reference": "x"}
+        )
+        await uow.commit()
+    world.advance(timedelta(seconds=3))
+    world.provider.unconfirmed(settled.reference, "failed")
+    await world.poll()
+    assert (await world.doc(settled.document_id)).status == "failed"
+    # A lookup that shows the job settles the unconfirmed reason.
+    world.provider.script_lookup(
+        settled.reference, ProviderInvoice(settled.reference, "pending", settled.reference)
+    )
+    await world.resolve(settled.document_id, "retry", reason="PROVIDER_REJECTED")
+    assert (await world.doc(settled.document_id)).status == "pending_provider"
+    world.advance(timedelta(seconds=3))
+    world.provider.script_check(
+        settled.reference, ProviderProgress(state="failed", provider_message="Synthetic")
+    )
+    await world.poll()
+    assert (await world.doc(settled.document_id)).status == "failed"
+    case = await world.open_case(settled.document_id)
+    assert [
+        (item["reason"], item["status"], (item.get("details") or {}).get("unconfirmed"))
+        for item in case.details["reasons"]
+    ] == [
+        ("STALE_REFERENCE_FOUND", "open", None),
+        ("PROVIDER_REJECTED", "cleared", True),
+        ("PROVIDER_REJECTED", "open", None),
+    ]
+    world.provider.script_lookup(settled.reference, failed_invoice(settled.reference, None))
+    result = await world.resolve(settled.document_id, "retry", reason="PROVIDER_REJECTED")
+    doc = await world.doc(settled.document_id)
+    assert (result.document_status, doc.status, doc.reference_code) == (
+        "queued",
+        "queued",
+        settled.reference,
+    )
+    assert await world.open_reasons(settled.document_id) == ["STALE_REFERENCE_FOUND"]
 
 
 async def test_retry_refused_when_lookup_cancelled(world):
