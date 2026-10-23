@@ -110,8 +110,16 @@ class DraftRepository(SqlAlchemyRepository):
         )
         return _draft_row(result.mappings().one())
 
-    async def discard(self, tenant_id: str, host_ref_type: str, host_ref_id: str) -> bool:
+    async def discard(
+        self, tenant_id: str, host_ref_type: str, host_ref_id: str, now: datetime | None = None
+    ) -> bool:
         table = self.tables.invoice_drafts
+        values: dict[str, Any] = {
+            "status": DraftStatus.DISCARDED.value,
+            "revision": table.c.revision + 1,
+        }
+        if now is not None:
+            values["updated_at"] = now
         result = await self.session.execute(
             table.update()
             .where(
@@ -120,6 +128,6 @@ class DraftRepository(SqlAlchemyRepository):
                 table.c.host_ref_id == host_ref_id,
                 table.c.status == DraftStatus.OPEN.value,
             )
-            .values(status=DraftStatus.DISCARDED.value, revision=table.c.revision + 1)
+            .values(**values)
         )
         return result.rowcount == 1

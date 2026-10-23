@@ -364,7 +364,7 @@ async def test_missing_draft_creates_needs_draft(engine, inv_tables):
 
 
 @pytest.mark.asyncio
-async def test_cross_merchant_draft_fk_failure_rolls_back_settlement(engine, inv_tables):
+async def test_cross_merchant_draft_is_ignored_and_settlement_waits_for_draft(engine, inv_tables):
     merchant_with_draft, settlement_merchant = uuid4(), uuid4()
     payment = settled(merchant_id=settlement_merchant)
     await add_account(engine, inv_tables, settlement_merchant)
@@ -381,9 +381,10 @@ async def test_cross_merchant_draft_fk_failure_rolls_back_settlement(engine, inv
             delivery_mode=DeliveryMode.AUTO,
         )
     )
-    with pytest.raises(IntegrityError):
-        await record(module, payment)
-    assert await counts(engine, inv_tables, payment.settlement_id) == (0, 0)
+    result = await record(module, payment)
+    document, case = await document_and_case(engine, inv_tables, result.document_id)
+    assert (document.status, document.draft_id, case) == ("needs_draft", None, None)
+    assert await counts(engine, inv_tables, payment.settlement_id) == (1, 1)
 
 
 @pytest.mark.asyncio
