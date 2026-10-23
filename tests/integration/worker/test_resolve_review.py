@@ -847,7 +847,7 @@ async def test_retry_after_date_review_grants_exactly_one_post(world, mode, vari
     if variant == "rejected_again":
         assert (doc.status, doc.last_error_code) == ("failed", "issued_date_invalid")
         details = await world.reason_details(settled.document_id, "PROVIDER_REJECTED")
-        assert details["date_resend_skipped"] == "earlier_post_unrecorded"
+        assert details["date_resend_skipped"] == "date_resend_used"
     else:
         assert (doc.status, doc.last_error_code) == ("failed", "document_existed_unresolved")
 

@@ -900,6 +900,43 @@ async def test_date_resend_follows_cross_day_review_policy(world, action):
     assert (doc.status, doc.post_count, doc.date_resend_at) == ("pending_provider", 2, None)
 
 
+@pytest.mark.parametrize("operator_permission", [False, True])
+async def test_date_rejection_after_cross_day_block_and_retry_names_the_recorded_rejection(
+    world, operator_permission
+):
+    await world.set_cross_day("review")
+    world.clock.set(vn(2026, 10, 21, 23, 59, 59, 900_000))
+    settled = await world.settle()
+    if operator_permission:
+        # As left by an operator grant on a request that was never sent.
+        await world.set_columns(settled.document_id, operator_retry_at=world.clock.now())
+    world.provider.receive_delay(settled.reference, timedelta(milliseconds=200))
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.post_count, doc.request_authorized_resend) == ("blocked", 1, False)
+    details = await world.reason_details(settled.document_id, "ISSUE_DATE_CROSSED_DAY")
+    assert details["after_date_rejection"] is True
+    await world.resolve(settled.document_id, "retry")
+    world.provider.script_create(settled.reference, rejected("issued_date_invalid"))
+    await world.issue()
+    for _ in range(4):
+        world.past_lease()
+        await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert len(world.provider.posts(settled.reference)) == 2
+    assert (doc.status, doc.last_error_code, doc.date_resend_at) == (
+        "failed",
+        "issued_date_invalid",
+        None,
+    )
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
+        "code": "issued_date_invalid",
+        "date_resend_skipped": "earlier_post_rejected",
+        "post_count": 2,
+        "post_limit": 2,
+    }
+
+
 async def test_mark_post_contract_refuses_without_budget_and_keeps_first_send_started_at(world):
     settled = await world.settle()
     sessions = async_sessionmaker(world.engine, expire_on_commit=False)

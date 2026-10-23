@@ -265,12 +265,32 @@ class IssueQueued:
         return await self._freeze_send(document, account, today)
 
     async def _cross_day(
-        self, document: DocumentRow, account: IssuerAccountView, issued_date: date
+        self,
+        document: DocumentRow,
+        account: IssuerAccountView,
+        issued_date: date,
+        *,
+        after_date_rejection: bool = False,
     ) -> IssueResult | None:
-        """The issue date would differ from the settlement date (or from the frozen request)."""
+        """The issue date would differ from the settlement date (or from the frozen request).
+
+        ``after_date_rejection``: the provider refused the earlier POST for its date, a
+        definitive answer, so any permission to resend that POST is spent.
+        """
         action = account.issue_date_cross_day_action
         if action != CrossDayAction.ISSUE and not await self._cross_day_confirmed(document):
             now = self._clock.now()
+            details: dict[str, Any] = {
+                "settled_date": today_vn(document.settled_at).isoformat(),
+                "frozen_issued_date": (
+                    document.issued_date.isoformat() if document.issued_date else None
+                ),
+                "issue_date": issued_date.isoformat(),
+            }
+            values: dict[str, Any] = {}
+            if after_date_rejection:
+                details["after_date_rejection"] = True
+                values["request_authorized_resend"] = False
             async with self._uow_factory() as uow:
                 state.ensure_transition(document.status, DocumentStatus.BLOCKED)
                 if not await uow.documents.finalize(
@@ -279,21 +299,10 @@ class IssueQueued:
                     status=DocumentStatus.BLOCKED.value,
                     next_attempt_at=None,
                     updated_at=now,
+                    **values,
                 ):
                     return self._lease_lost(document)
-                await open_review(
-                    uow,
-                    document,
-                    ReviewReason.ISSUE_DATE_CROSSED_DAY,
-                    {
-                        "settled_date": today_vn(document.settled_at).isoformat(),
-                        "frozen_issued_date": (
-                            document.issued_date.isoformat() if document.issued_date else None
-                        ),
-                        "issue_date": issued_date.isoformat(),
-                    },
-                    now,
-                )
+                await open_review(uow, document, ReviewReason.ISSUE_DATE_CROSSED_DAY, details, now)
                 await uow.commit()
             return IssueResult(document.id, DocumentStatus.BLOCKED.value)
         self._count("invoice_cross_day_total")
@@ -540,11 +549,11 @@ class IssueQueued:
             today = today_vn(self._clock.now())
             # The resend goes through the cross-day policy like every other send.
             if current.delivery_mode == DeliveryMode.AUTO and today != today_vn(current.settled_at):
-                blocked = await self._cross_day(current, account, today)
+                blocked = await self._cross_day(current, account, today, after_date_rejection=True)
                 if blocked is not None:
                     return blocked
             return await self._freeze_send(current, account, today, date_resend=True)
-        skipped = "earlier_post_unrecorded" if current.post_count >= 2 else "operator_grant_used"
+        skipped = await self._date_resend_skipped(current)
         return await self._fail(
             current,
             IssueErrorCode.ISSUED_DATE_INVALID,
@@ -552,6 +561,21 @@ class IssueQueued:
             {"code": ISSUED_DATE_INVALID, "date_resend_skipped": skipped, **budget},
             request_authorized_resend=False,
         )
+
+    async def _date_resend_skipped(self, current: DocumentRow) -> str:
+        """Why a date refusal gets no resend, named from what the database recorded."""
+        if current.date_resend_at is not None:
+            return "date_resend_used"
+        if current.post_count < 2:
+            return "operator_grant_used"
+        async with self._uow_factory() as uow:
+            rejected_before = await uow.review_cases.reason_recorded(
+                current.id,
+                ReviewReason.ISSUE_DATE_CROSSED_DAY.value,
+                {"after_date_rejection": True},
+            )
+        # Otherwise an earlier POST of this reference has no recorded answer.
+        return "earlier_post_rejected" if rejected_before else "earlier_post_unrecorded"
 
     async def _date_resend_conflict(
         self, document: DocumentRow, account: IssuerAccountView, creds: ClientCredentials
