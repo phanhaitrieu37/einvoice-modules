@@ -110,6 +110,9 @@ class PollPending:
                     )
                 except ProviderRejected as exc:
                     return await self._check_rejected(document, account, creds, exc.code)
+                except ProviderAuthFailed:
+                    # The check is a read: it is retried like any unclear answer.
+                    return await self._reschedule(document, _TRANSIENT_DELAY, count_poll=False)
                 lookup: ProviderInvoice | None = None
             else:
                 lookup = await self._provider.find_by_reference(
@@ -123,7 +126,7 @@ class PollPending:
                         {"provider_state": "none", "phase": "poll"},
                     )
                 progress = _progress(lookup)
-        except (ProviderTransient, ProviderAuthFailed):
+        except ProviderTransient:
             return await self._reschedule(document, _TRANSIENT_DELAY, count_poll=False)
         if progress.error_code == PROVIDER_UNCONFIRMED:
             return await self._fail(
