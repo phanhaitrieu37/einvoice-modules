@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 import sqlalchemy as sa
-from tests.fakes.fake_einvoice_provider import CONFLICT, FakeInvoice
+from tests.fakes.fake_einvoice_provider import CONFLICT, TRANSIENT, FakeInvoice
 from tests.integration.worker.world import TENANT, vn
 
 from invoice_module.adapters.sqlalchemy.repositories.documents import DocumentRepository
@@ -173,6 +173,34 @@ async def test_pending_over_three_hours_fails_with_timeout_review(world):
     assert await world.open_reasons(settled.document_id) == ["PROVIDER_TIMEOUT"]
     # The default timeout is three hours.
     assert InvoiceModuleConfig().pending_timeout == timedelta(hours=3)
+
+
+@pytest.mark.parametrize("last_poll", ["pending", "transient", "transient_then_pending"])
+async def test_timeout_review_tells_unanswered_polls_from_pending(world, last_poll):
+    world.config = InvoiceModuleConfig(pending_timeout=timedelta(minutes=30))
+    world.restart()
+    settled = await world.settle()
+    world.provider.new_invoice(settled.reference, pending_polls=10_000)
+    await world.issue()
+    answers = {
+        "pending": [None],
+        "transient": [None, TRANSIENT, TRANSIENT],
+        "transient_then_pending": [TRANSIENT, None],
+    }[last_poll]
+    for answer in answers:
+        if answer is not None:
+            world.provider.script_check(settled.reference, answer)
+        world.clock.set((await world.doc(settled.document_id)).next_attempt_at)
+        await world.poll()
+    unanswered = last_poll == "transient"
+    doc = await world.doc(settled.document_id)
+    assert doc.last_error_code == ("transient_error" if unanswered else None)
+    assert world.metrics.count("invoice_poll_transient_total") == answers.count(TRANSIENT)
+    world.clock.set(doc.pending_since + timedelta(minutes=31))
+    assert (await escalate(world)).timed_out == [settled.document_id]
+    details = await world.reason_details(settled.document_id, "PROVIDER_TIMEOUT")
+    assert details["last_poll_error"] == ("transient_error" if unanswered else None)
+    assert details["poll_count"] == answers.count(None)
 
 
 async def test_stale_alert_after_fifteen_minutes_despite_frequent_polls(world):

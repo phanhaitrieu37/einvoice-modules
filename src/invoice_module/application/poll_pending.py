@@ -253,6 +253,12 @@ class PollPending:
         values: dict[str, Any] = {"next_attempt_at": now + delay, "updated_at": now, **extra}
         if count_poll:
             values["poll_count"] = document.poll_count + 1
+            values["last_error_code"] = None
+        else:
+            # No usable answer; kept so a later timeout can tell polls left unanswered from a
+            # provider that kept answering ``pending``.
+            values["last_error_code"] = IssueErrorCode.TRANSIENT_ERROR.value
+            increment_safely(self._metrics, "invoice_poll_transient_total", {})
         async with self._uow_factory() as uow:
             if not await uow.documents.finalize(document.id, document.lease_generation, **values):
                 return self._lease_lost(document)
