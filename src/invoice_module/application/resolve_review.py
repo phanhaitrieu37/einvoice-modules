@@ -86,7 +86,7 @@ def _rules() -> dict[tuple[ReviewReason, DocumentStatus], frozenset[ReviewResolu
             {A.RETRY, A.WAIVE},
         ),
         ({R.DRAFT_HELD}, {S.BLOCKED}, {A.RETRY, A.ATTACH_DRAFT, A.WAIVE}),
-        ({R.QUOTA_EXHAUSTED}, {S.QUEUED, S.APPROVED}, {A.ACKNOWLEDGE, A.RETRY}),
+        ({R.QUOTA_EXHAUSTED}, {S.QUEUED, S.APPROVED}, {A.RETRY}),
         (
             {R.PROVIDER_REJECTED, R.PROVIDER_FAILED, R.LOOKUP_MISMATCH},
             {S.FAILED},
@@ -228,18 +228,22 @@ class ResolveReview:
             A.RETRY_WITH_NEW_REFERENCE,
         ):
             lookup = await self._lookup(document)
+            found = lookup.state if lookup is not None else None
             if resolution == A.RETRY_WITH_NEW_REFERENCE and lookup is not None:
                 raise ReferenceStillExists(document.reference_code)
+            if resolution == A.ATTACH_DRAFT and found in ("success", "pending", "cancelled"):
+                raise ResolutionNotAllowed(f"provider_record_{found}")
             if (
-                resolution == A.ATTACH_DRAFT
-                and lookup is not None
-                and lookup.state
-                in (
-                    "success",
-                    "pending",
-                )
+                resolution in (A.RETRY, A.ATTACH_DRAFT)
+                and found not in ("success", "pending")
+                and _unconfirmed(case, target)
             ):
-                raise ResolutionNotAllowed(f"provider_record_{lookup.state}")
+                # The provider asked not to resend an outcome it could not confirm: only a
+                # lookup that shows the outcome settles the case.
+                raise ResolutionNotAllowed("provider_unconfirmed")
+            if resolution == A.RETRY and found == "cancelled":
+                # The same reference can only answer 409 now.
+                raise ResolutionNotAllowed("provider_record_cancelled")
 
         async with self._uow_factory() as uow:
             current = await self._lock(uow, document, case_id, request)
@@ -355,12 +359,12 @@ class ResolveReview:
         lookup: ProviderInvoice | None,
     ) -> DocumentStatus:
         resolution = request.resolution
-        if resolution in (A.WAIVE, A.ACKNOWLEDGE) or (
-            resolution == A.RETRY and request.reason == R.QUOTA_EXHAUSTED
-        ):
+        if resolution in (A.WAIVE, A.ACKNOWLEDGE):
             await self._clear(uow, document, request)
             await uow.documents.bump_generation(document.id)
             return document.status
+        if resolution == A.RETRY and request.reason == R.QUOTA_EXHAUSTED:
+            return await self._retry_quota(uow, document, request)
         if resolution == A.MARK_EXTERNAL:
             return await self._mark_external(uow, document, request)
         if resolution == A.RETRY_WITH_NEW_REFERENCE:
@@ -370,6 +374,18 @@ class ResolveReview:
         if document.status == S.FAILED:
             return await self._retry_failed(uow, document, request, lookup)
         return await self._retry_blocked(uow, document, request)
+
+    async def _retry_quota(
+        self, uow: InvoiceUnitOfWork, document: DocumentRow, request: _Request
+    ) -> DocumentStatus:
+        """The quota was topped up: the document is claimable again with exactly one more POST.
+        Its status and approval stay; the next claim looks the reference up before it sends."""
+        now = self._clock.now()
+        await self._clear(uow, document, request)
+        await self._audit_attempts(uow, document, request, now)
+        await uow.documents.operator_update(document.id, now, next_attempt_at=now, attempts=0)
+        await uow.documents.grant_post(document.id)
+        return document.status
 
     async def _retry_failed(
         self,
@@ -709,6 +725,16 @@ class ResolveReview:
 
 
 _NOTE_REQUIRED = frozenset({A.WAIVE, A.ACKNOWLEDGE, A.RETRY_WITH_NEW_REFERENCE})
+
+
+def _unconfirmed(case: ReviewCaseRow, reason: ReviewReason) -> bool:
+    """Whether the open ``reason`` records a provider outcome that could not be confirmed."""
+    return any(
+        item.get("reason") == reason.value
+        and item.get("status") == "open"
+        and (item.get("details") or {}).get("unconfirmed") is True
+        for item in case.details.get("reasons", [])
+    )
 
 
 async def repair_failed_document(

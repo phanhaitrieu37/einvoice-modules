@@ -4,18 +4,24 @@ from datetime import date, timedelta
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from tests.fakes.fake_einvoice_provider import (
+    ACCEPTED_WITHOUT_TRACKING,
     AUTH_FAILED,
     CONFLICT,
     CRASH_BEFORE_SEND,
     QUOTA,
     TRANSIENT,
     FakeInvoice,
+    account_status_rejected,
     failed_invoice,
+    raises,
     rejected,
 )
 from tests.fakes.recording import Crash
 from tests.integration.worker.world import vn
 
+from invoice_module.adapters.sepay import provider as sepay_provider
+from invoice_module.adapters.sepay.client import Response as SePayResponse
+from invoice_module.adapters.sepay.errors import map_error
 from invoice_module.adapters.sqlalchemy.repositories.documents import DocumentRepository
 from invoice_module.application.config import today_vn
 from invoice_module.domain.enums import DeliveryMode, DocumentStatus
@@ -280,11 +286,24 @@ async def test_authorized_resend_gets_one_granted_post_across_quota_and_transien
     for _ in range(3):
         world.advance(timedelta(hours=2))
         await world.issue()
+    expected_posts = 2
+    if outcome == QUOTA:
+        # Nothing is sent again until the operator retries after a top-up; that retry is a
+        # new grant of exactly one POST.
+        doc = await world.doc(settled.document_id)
+        assert len(world.provider.posts(settled.reference)) == 2
+        assert (doc.status, doc.next_attempt_at) == ("queued", None)
+        await world.resolve(settled.document_id, "retry", reason="QUOTA_EXHAUSTED")
+        world.provider.script_create(settled.reference, TRANSIENT)
+        for _ in range(3):
+            await world.issue()
+            world.advance(timedelta(hours=2))
+        expected_posts = 3
     doc = await world.doc(settled.document_id)
-    assert len(world.provider.posts(settled.reference)) == 2
+    assert len(world.provider.posts(settled.reference)) == expected_posts
     assert (doc.status, doc.last_error_code) == ("failed", "max_attempts_exceeded")
     details = await world.reason_details(settled.document_id, "MAX_ATTEMPTS_EXCEEDED")
-    assert details["lookup_state"] == "failed" and details["post_count"] == 2
+    assert details["lookup_state"] == "failed" and details["post_count"] == expected_posts
 
 
 async def test_post_skipped_when_lease_would_expire_before_timeout(world):
@@ -340,35 +359,44 @@ async def test_transient_backs_off_then_reviews_when_post_budget_spent(world):
     }
 
 
-async def test_quota_backs_off_one_hour_and_opens_review_once(world):
+async def test_quota_opens_review_and_never_resends_automatically(world):
     settled = await world.settle()
-    world.provider.script_create(settled.reference, QUOTA, QUOTA)
+    world.provider.script_create(settled.reference, QUOTA)
     await world.issue()
     doc = await world.doc(settled.document_id)
-    assert (doc.status, doc.attempts, doc.next_attempt_at) == (
+    assert (doc.status, doc.attempts, doc.next_attempt_at, doc.last_error_code) == (
         "queued",
-        0,
-        world.clock.now() + timedelta(hours=1),
+        1,
+        None,
+        "quota_exhausted",
     )
-    world.advance(timedelta(minutes=59))
-    assert await world.issue() == []
-    world.advance(timedelta(minutes=2))
-    await world.issue()
-    cases = await world.cases(settled.document_id)
-    assert len(cases) == 1
-    assert [r for r in await world.reasons(settled.document_id)] == [
-        ("QUOTA_EXHAUSTED", "open", None)
-    ]
-    assert world.metrics.count("invoice_quota_exhausted_total") == 2
-    assert len(world.provider.posts()) == 2
+    assert (doc.post_count, doc.lease_owner) == (1, None)
+    for _ in range(24):
+        world.advance(timedelta(hours=1))
+        assert await world.issue() == []
+        await world.poll()
+        await world.module.escalate_overdue.run(world.clock.now())
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.next_attempt_at, doc.post_count) == ("queued", None, 1)
+    assert len(world.provider.posts()) == 1
+    [case] = await world.cases(settled.document_id)
+    assert case.status == "open"
+    assert await world.reasons(settled.document_id) == [("QUOTA_EXHAUSTED", "open", None)]
+    assert await world.reason_details(settled.document_id, "QUOTA_EXHAUSTED") == {
+        "code": "QUOTA_HAS_BEEN_USERD_UP",
+        "post_count": 1,
+        "post_limit": 2,
+    }
+    assert world.metrics.count("invoice_quota_exhausted_total") == 1
 
 
 @pytest.mark.parametrize(
     ("code", "error"),
     [
         ("validation_error", "validation_error"),
-        ("registration_not_approved", "registration_not_approved"),
-        ("seller_store_invalid", "seller_store_invalid"),
+        # The module's own error names are not provider codes: they are not translated.
+        ("registration_not_approved", "validation_error"),
+        ("seller_store_invalid", "validation_error"),
         ("SOMETHING_NEW", "validation_error"),
     ],
 )
@@ -379,6 +407,106 @@ async def test_rejected_opens_provider_rejected_review(world, code, error):
     doc = await world.doc(settled.document_id)
     assert (doc.status, doc.last_error_code) == ("failed", error)
     assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {"code": code}
+
+
+@pytest.mark.parametrize(
+    ("code", "error"),
+    [
+        ("REGISTRATION_NOT_COMPLETE", "registration_not_approved"),
+        ("BILLING_IS_UNPAID", "registration_not_approved"),
+        ("EINVOICE_ACCOUNT_NOT_FOUND", "registration_not_approved"),
+        ("REGISTRATION_NOT_TAX_APPROVED", "registration_not_approved"),
+        ("INVOICE_DATE_BEFORE_TAX_APPROVAL", "registration_not_approved"),
+        ("SELLER_STORE_NOT_FOUND", "seller_store_invalid"),
+        ("SELLER_STORE_INACTIVE", "seller_store_invalid"),
+    ],
+)
+async def test_account_status_rejections_open_provider_rejected_review(world, code, error):
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, account_status_rejected(code))
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.last_error_code, doc.request_authorized_resend) == (
+        "failed",
+        error,
+        False,
+    )
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {"code": code}
+    await world.drive(rounds=4, step=timedelta(hours=1))
+    assert world.provider.ops() == ["create"]
+
+
+@pytest.mark.parametrize("answer", ["2xx_body", "synchronous_400"])
+async def test_issued_date_code_letter_case_decides_the_resend(world, answer):
+    body = {"success": False, "error": {"code": "ISSUED_DATE_INVALID", "message": "Synthetic"}}
+    if answer == "2xx_body":
+        # A 2xx may have queued a job: the adapter keeps the provider's upper-case code.
+        error = sepay_provider._not_accepted(SePayResponse(200, body, {}))
+    else:
+        error = map_error(400, body)
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, raises(error))
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    if answer == "2xx_body":
+        assert error.code == "ISSUED_DATE_INVALID"
+        assert world.provider.ops() == ["create"]
+        assert (doc.status, doc.last_error_code, doc.request_authorized_resend) == (
+            "failed",
+            "validation_error",
+            False,
+        )
+        assert (doc.post_count, doc.date_resend_at) == (1, None)
+        assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
+            "code": "ISSUED_DATE_INVALID"
+        }
+    else:
+        assert error.code == "issued_date_invalid"
+        assert world.provider.ops() == ["create", "find_by_reference", "create"]
+        assert (doc.status, doc.post_count) == ("pending_provider", 2)
+        assert doc.date_resend_at is not None
+
+
+async def test_create_2xx_without_tracking_goes_lookup_first(world):
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, ACCEPTED_WITHOUT_TRACKING)
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert result.outcome == "backoff"
+    assert (doc.status, doc.post_count, doc.tracking_code) == ("queued", 1, None)
+    assert doc.request is not None
+    world.provider.calls.clear()
+    world.past_lease()
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert world.provider.ops() == ["find_by_reference"]
+    assert (doc.status, doc.post_count) == ("issued", 1)
+    assert world.provider.effective_creates[settled.reference] == 1
+
+
+@pytest.mark.parametrize("path", ["reclaim_lookup", "conflict_lookup"])
+async def test_lookup_cancelled_opens_document_existed_unresolved(world, path):
+    settled = await world.settle()
+    if path == "reclaim_lookup":
+        world.provider.script_create(settled.reference, TRANSIENT)
+        await world.issue()
+        world.provider.cancel_under_reference(settled.reference)
+        world.past_lease()
+    else:
+        world.provider.cancel_under_reference(settled.reference)
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert world.provider.ops() == ["create", "find_by_reference"]
+    assert (doc.status, doc.last_error_code, doc.invoice_number) == (
+        "failed",
+        "document_existed_unresolved",
+        None,
+    )
+    assert doc.request_authorized_resend is False
+    details = await world.reason_details(settled.document_id, "DOCUMENT_EXISTED_UNRESOLVED")
+    assert details == {"provider_state": "cancelled"}
+    await world.drive(rounds=4, step=timedelta(hours=1))
+    assert len(world.provider.posts()) == 1
 
 
 async def test_auth_failed_opens_review(world):
@@ -482,6 +610,7 @@ async def test_approved_sends_one_create_with_send_day_issued_date(world):
 
 async def test_approved_transient_and_quota_keep_approved(world):
     settled = await approved_manual(world)
+    approval = (await world.doc(settled.document_id)).approved_snapshot_sha256
     world.provider.script_create(settled.reference, TRANSIENT, QUOTA)
     await world.issue()
     doc = await world.doc(settled.document_id)
@@ -489,8 +618,16 @@ async def test_approved_transient_and_quota_keep_approved(world):
     world.past_lease()
     await world.issue()
     doc = await world.doc(settled.document_id)
-    assert (doc.status, doc.approved_by) == ("approved", "accountant-a")
+    assert (doc.status, doc.approved_by, doc.approved_snapshot_sha256) == (
+        "approved",
+        "accountant-a",
+        approval,
+    )
+    assert (doc.next_attempt_at, doc.last_error_code) == (None, "quota_exhausted")
     assert await world.open_reasons(settled.document_id) == ["QUOTA_EXHAUSTED"]
+    world.advance(timedelta(hours=6))
+    assert await world.issue() == []
+    assert len(world.provider.posts()) == 2
 
 
 async def test_approved_rejected_opens_review(world):
@@ -761,6 +898,102 @@ async def test_date_resend_follows_cross_day_review_policy(world, action):
     posts = world.provider.posts(settled.reference)
     assert [issued(post) for post in posts] == [date(2026, 10, 21), date(2026, 10, 22)]
     assert (doc.status, doc.post_count, doc.date_resend_at) == ("pending_provider", 2, None)
+
+
+@pytest.mark.parametrize("operator_permission", [False, True])
+async def test_date_rejection_after_cross_day_block_and_retry_names_the_recorded_rejection(
+    world, operator_permission
+):
+    await world.set_cross_day("review")
+    world.clock.set(vn(2026, 10, 21, 23, 59, 59, 900_000))
+    settled = await world.settle()
+    if operator_permission:
+        # As left by an operator grant on a request that was never sent.
+        await world.set_columns(settled.document_id, operator_retry_at=world.clock.now())
+    world.provider.receive_delay(settled.reference, timedelta(milliseconds=200))
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.post_count, doc.request_authorized_resend) == ("blocked", 1, False)
+    details = await world.reason_details(settled.document_id, "ISSUE_DATE_CROSSED_DAY")
+    assert (details["after_date_rejection"], details["post_count"]) == (True, 1)
+    await world.resolve(settled.document_id, "retry")
+    world.provider.script_create(settled.reference, rejected("issued_date_invalid"))
+    await world.issue()
+    for _ in range(4):
+        world.past_lease()
+        await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert len(world.provider.posts(settled.reference)) == 2
+    assert (doc.status, doc.last_error_code, doc.date_resend_at) == (
+        "failed",
+        "issued_date_invalid",
+        None,
+    )
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
+        "code": "issued_date_invalid",
+        "date_resend_skipped": "earlier_post_rejected",
+        "post_count": 2,
+        "post_limit": 2,
+    }
+
+
+@pytest.mark.parametrize("history", ["plain_cross_day_block", "unrecorded_post_between"])
+async def test_date_rejection_names_an_earlier_rejection_only_for_the_post_just_before(
+    world, history
+):
+    await world.set_cross_day("review")
+    if history == "plain_cross_day_block":
+        # POST 1 goes unanswered before midnight; the reclaim after midnight blocks on the date.
+        world.clock.set(vn(2026, 10, 21, 23, 59))
+        settled = await world.settle()
+        world.provider.script_create(settled.reference, TRANSIENT)
+        await world.issue()
+        world.clock.set(vn(2026, 10, 22, 0, 5))
+    else:
+        # POST 1 is refused for its date, then the operator's POST 2 goes unanswered.
+        world.clock.set(vn(2026, 10, 21, 23, 59, 59, 900_000))
+        settled = await world.settle()
+        world.provider.receive_delay(settled.reference, timedelta(milliseconds=200))
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.post_count) == ("blocked", 1)
+    block = await world.reason_details(settled.document_id, "ISSUE_DATE_CROSSED_DAY")
+    if history == "plain_cross_day_block":
+        assert "after_date_rejection" not in block and "post_count" not in block
+    else:
+        assert (block["after_date_rejection"], block["post_count"]) == (True, 1)
+    await world.resolve(settled.document_id, "retry")
+    if history == "unrecorded_post_between":
+        world.provider.script_create(settled.reference, TRANSIENT)
+        await world.issue()
+        world.past_lease()
+        await world.issue()
+        doc = await world.doc(settled.document_id)
+        assert (doc.status, doc.last_error_code, doc.post_count) == (
+            "failed",
+            "max_attempts_exceeded",
+            2,
+        )
+        await world.resolve(settled.document_id, "retry")
+    world.provider.script_create(settled.reference, rejected("issued_date_invalid"))
+    await world.issue()
+    for _ in range(4):
+        world.past_lease()
+        await world.issue()
+    doc = await world.doc(settled.document_id)
+    rejected_post = 2 if history == "plain_cross_day_block" else 3
+    assert len(world.provider.posts(settled.reference)) == rejected_post
+    assert (doc.status, doc.last_error_code, doc.date_resend_at) == (
+        "failed",
+        "issued_date_invalid",
+        None,
+    )
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
+        "code": "issued_date_invalid",
+        "date_resend_skipped": "earlier_post_unrecorded",
+        "post_count": rejected_post,
+        "post_limit": rejected_post,
+    }
 
 
 async def test_mark_post_contract_refuses_without_budget_and_keeps_first_send_started_at(world):

@@ -183,6 +183,8 @@ class EscalateOverdue:
                         if document.pending_since
                         else None,
                         "poll_count": document.poll_count,
+                        # ``transient_error`` when the last poll got no usable answer.
+                        "last_poll_error": document.last_error_code,
                     },
                     now,
                 )

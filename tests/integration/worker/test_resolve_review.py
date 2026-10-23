@@ -28,7 +28,13 @@ from invoice_module.application.config import InvoiceModuleConfig
 from invoice_module.application.resolve_review import AmountMismatch
 from invoice_module.application.submit_draft import SubmitDraftCommand
 from invoice_module.domain.document import Buyer, SettledPayment
-from invoice_module.domain.enums import DeliveryMode, Environment
+from invoice_module.domain.enums import (
+    DeliveryMode,
+    DocumentStatus,
+    Environment,
+    ReviewReason,
+    ReviewResolution,
+)
 from invoice_module.domain.errors import (
     DocumentInFlight,
     InvalidLine,
@@ -38,10 +44,12 @@ from invoice_module.domain.errors import (
     ResolutionNotAllowed,
     ScopeMismatch,
 )
+from invoice_module.ports.provider import ProviderInvoice, ProviderProgress
 
 pytestmark = pytest.mark.integration
 
 AUTO, MANUAL = DeliveryMode.AUTO, DeliveryMode.MANUAL
+R, S, A = ReviewReason, DocumentStatus, ReviewResolution
 NOTE = "Checked at the provider portal by the operator"
 DATE_400 = rejected("issued_date_invalid")
 
@@ -270,11 +278,11 @@ async def test_retry_with_new_reference_refused_while_lease_active(world):
     settled = await world.settle()
     world.provider.script_create(settled.reference, QUOTA, BLOCK)
     await world.issue()
-    world.advance(timedelta(hours=1, seconds=1))
+    case = await world.open_case(settled.document_id)
+    await world.resolve(settled.document_id, "retry", reason="QUOTA_EXHAUSTED")
     worker = asyncio.create_task(world.issue())
     await asyncio.sleep(0.2)
     assert len(world.provider.posts()) == 2 and not worker.done()
-    case = await world.open_case(settled.document_id)
     for resolution, note in (("retry_with_new_reference", NOTE), ("retry", None)):
         with pytest.raises(DocumentInFlight):
             await world.module.resolve_review.execute(case.id, resolution, "operator-a", note)
@@ -341,13 +349,18 @@ async def test_rotation_after_reconciliation_total_creates_at_most_one(world):
 
 async def test_operator_change_invalidates_stale_worker_cas(world):
     settled = await world.settle()
-    world.provider.script_create(settled.reference, QUOTA, BLOCK)
-    await world.issue()
-    world.advance(timedelta(hours=1, seconds=1))
+    world.provider.script_create(settled.reference, BLOCK)
     worker = asyncio.create_task(world.issue())
     await asyncio.sleep(0.2)
+    assert len(world.provider.posts()) == 1 and not worker.done()
+    async with world.crash() as uow:
+        # The sweep opens this reason on a document in any status.
+        await uow.review_cases.open_once(
+            TENANT, settled.document_id, "STALE_REFERENCE_FOUND", {"previous_reference": "x"}
+        )
+        await uow.commit()
     world.past_lease()
-    await world.resolve(settled.document_id, "retry", reason="QUOTA_EXHAUSTED")
+    await world.resolve(settled.document_id, "acknowledge", note="Checked at the portal")
     world.provider.release(settled.reference, deliver=True, respond="accepted")
     [result] = await worker
     doc = await world.doc(settled.document_id)
@@ -841,7 +854,7 @@ async def test_retry_after_date_review_grants_exactly_one_post(world, mode, vari
     if variant == "rejected_again":
         assert (doc.status, doc.last_error_code) == ("failed", "issued_date_invalid")
         details = await world.reason_details(settled.document_id, "PROVIDER_REJECTED")
-        assert details["date_resend_skipped"] == "earlier_post_unrecorded"
+        assert details["date_resend_skipped"] == "date_resend_used"
     else:
         assert (doc.status, doc.last_error_code) == ("failed", "document_existed_unresolved")
 
@@ -889,6 +902,14 @@ async def test_retry_after_unrecorded_post_date_review_grants_exactly_one_post(
     expected_posts = 2 if outcome == CRASH_AFTER_MARK else 3
     assert len(world.provider.posts(settled.reference)) == expected_posts
     assert doc.post_count == doc.post_limit == 3
+    if outcome == QUOTA:
+        # The quota never clears by itself: the document waits for the operator, unclaimed.
+        assert (doc.status, doc.next_attempt_at) == (
+            "approved" if mode == MANUAL else "queued",
+            None,
+        )
+        assert await world.open_reasons(settled.document_id) == ["QUOTA_EXHAUSTED"]
+        return
     assert doc.status in ("failed", "pending_provider", "issued")
     if outcome != CRASH_AFTER_RECEIVE:
         assert doc.status == "failed" and await world.open_reasons(settled.document_id)
@@ -940,8 +961,15 @@ async def test_retry_before_first_post_grants_exactly_one_post(world, mode, outc
     if outcome == DATE_400:
         details = await world.reason_details(settled.document_id, "PROVIDER_REJECTED")
         assert details["date_resend_skipped"] == "operator_grant_used"
-    if outcome in (TRANSIENT, QUOTA, CRASH_AFTER_MARK):
+    if outcome in (TRANSIENT, CRASH_AFTER_MARK):
         assert (doc.status, doc.last_error_code) == ("failed", "max_attempts_exceeded")
+    if outcome == QUOTA:
+        assert (doc.status, doc.last_error_code, doc.next_attempt_at) == (
+            "approved" if mode == MANUAL else "queued",
+            "quota_exhausted",
+            None,
+        )
+        assert await world.open_reasons(settled.document_id) == ["QUOTA_EXHAUSTED"]
 
 
 async def test_attach_draft_on_failed_grants_exactly_one_post(world):
@@ -963,7 +991,7 @@ async def test_attach_draft_on_failed_grants_exactly_one_post(world):
     await run_claims(world, times=4, step=timedelta(minutes=5))
     doc = await world.doc(settled.document_id)
     assert len(world.provider.posts()) == 3
-    assert world.provider.posts()[-1].payload["items"][0]["name"] == "Corrected"
+    assert world.provider.posts()[-1].payload["items"][0]["item_name"] == "Corrected"
     assert (doc.status, doc.last_error_code) == ("failed", "max_attempts_exceeded")
     # A held draft was never sent: its correction keeps the default budget.
     held_doc = await held(world)
@@ -1187,6 +1215,60 @@ async def test_list_open_reviews_ordered_with_reasons(world):
     assert await world.module.list_open_reviews.execute(tenant_id="other-tenant") == []
 
 
+async def test_quota_retry_after_topup_grants_exactly_one_post(world):
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, QUOTA, QUOTA, QUOTA)
+    await world.issue()
+    assert len(world.provider.posts()) == 1
+    assert (await world.doc(settled.document_id)).status == "queued"
+    assert resolve_module.allowed_resolutions(R.QUOTA_EXHAUSTED, S.QUEUED) == {A.RETRY}
+    # Each retry is one more POST from the current count, also once the default budget is spent.
+    for posts_before in (1, 2):
+        before_retry = await world.doc(settled.document_id)
+        result = await world.resolve(settled.document_id, "retry", reason="QUOTA_EXHAUSTED")
+        [case] = [c for c in await world.cases(settled.document_id) if c.id == result.case_id]
+        assert case.details["previous_attempts"] == [
+            {
+                "attempts": before_retry.attempts,
+                "post_count": posts_before,
+                "post_limit": before_retry.post_limit,
+                "resolution": "retry",
+                "by": "operator-a",
+                "at": world.clock.now().isoformat(),
+            }
+        ]
+        doc = await world.doc(settled.document_id)
+        assert (doc.status, doc.next_attempt_at, doc.post_count, doc.post_limit) == (
+            "queued",
+            world.clock.now(),
+            posts_before,
+            posts_before + 1,
+        )
+        before = len(world.provider.calls)
+        await world.issue()
+        # The quota answer created nothing, so the lookup finds nothing and one POST follows.
+        assert world.provider.ops()[before:] == ["find_by_reference", "create"]
+    before = len(world.provider.calls)
+    for _ in range(12):
+        world.advance(timedelta(hours=2))
+        await world.drive(rounds=1)
+    doc = await world.doc(settled.document_id)
+    assert world.provider.calls[before:] == []
+    assert len(world.provider.posts()) == 3
+    assert (doc.status, doc.next_attempt_at, doc.post_count, doc.post_limit) == (
+        "queued",
+        None,
+        3,
+        3,
+    )
+    assert await world.open_reasons(settled.document_id) == ["QUOTA_EXHAUSTED"]
+    assert sorted(case.status for case in await world.cases(settled.document_id)) == [
+        "open",
+        "resolved",
+        "resolved",
+    ]
+
+
 async def test_quota_review_on_approved_keeps_approval(world):
     settled = await settled_in(world, MANUAL)
     world.provider.script_create(settled.reference, QUOTA, QUOTA)
@@ -1198,12 +1280,19 @@ async def test_quota_review_on_approved_keeps_approval(world):
         before.approved_snapshot_sha256,
         before.approved_reference_code,
     )
-    await world.resolve(settled.document_id, "acknowledge", note="Quota topped up")
+    assert (before.status, before.next_attempt_at) == ("approved", None)
+    assert resolve_module.allowed_resolutions(R.QUOTA_EXHAUSTED, S.APPROVED) == {A.RETRY}
+    with pytest.raises(ResolutionNotAllowed):
+        await world.resolve(settled.document_id, "acknowledge", note="Quota topped up")
     world.advance(timedelta(hours=1, seconds=1))
-    await world.issue()
+    assert await world.issue() == []
     await world.resolve(settled.document_id, "retry")
     doc = await world.doc(settled.document_id)
-    assert doc.status == "approved"
+    assert (doc.status, doc.next_attempt_at, doc.post_limit) == (
+        "approved",
+        world.clock.now(),
+        doc.post_count + 1,
+    )
     assert (
         doc.approved_at,
         doc.approved_by,
@@ -1211,6 +1300,12 @@ async def test_quota_review_on_approved_keeps_approval(world):
         doc.approved_reference_code,
     ) == approval
     assert await world.open_reasons(settled.document_id) == []
+    world.provider.calls.clear()
+    await world.issue()
+    assert world.provider.ops() == ["find_by_reference", "create"]
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.approved_by) == ("approved", "accountant-a")
+    assert await world.open_reasons(settled.document_id) == ["QUOTA_EXHAUSTED"]
 
 
 def money_line(quantity=Decimal("1"), price=100, rate=0, **tax):
@@ -1370,3 +1465,206 @@ async def test_operator_write_fenced_when_generation_moves_during_lookup(world):
         await first
     assert await world.doc(settled.document_id) == moved
     assert await world.open_reasons(settled.document_id) == ["PROVIDER_REJECTED"]
+
+
+async def failed_unconfirmed(world, state="failed"):
+    """An accepted create whose status check says the outcome could not be confirmed."""
+    settled = await world.settle()
+    await world.issue()
+    world.advance(timedelta(seconds=3))
+    world.provider.unconfirmed(settled.reference, state)
+    await world.poll()
+    details = await world.reason_details(settled.document_id, "PROVIDER_REJECTED")
+    assert details["unconfirmed"] is True
+    return settled
+
+
+async def assert_untouched(world, settled, before, reason):
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.lease_generation, doc.post_limit, doc.request) == (
+        before.status,
+        before.lease_generation,
+        before.post_limit,
+        before.request,
+    )
+    assert await world.open_reasons(settled.document_id) == [reason]
+    assert len(world.provider.posts()) == 1
+
+
+@pytest.mark.parametrize("lookup", ["none", "failed", "cancelled", "success", "pending"])
+async def test_retry_refused_while_provider_unconfirmed(world, lookup):
+    settled = await failed_unconfirmed(world)
+    before = await world.doc(settled.document_id)
+    if lookup == "none":
+        world.provider.script_lookup(settled.reference, None)
+    elif lookup == "failed":
+        world.provider.script_lookup(settled.reference, failed_invoice(settled.reference, None))
+    elif lookup == "cancelled":
+        world.provider.cancel_under_reference(settled.reference)
+    elif lookup == "pending":
+        world.provider.script_lookup(
+            settled.reference, ProviderInvoice(settled.reference, "pending", settled.reference)
+        )
+    if lookup in ("success", "pending"):
+        result = await world.resolve(settled.document_id, "retry")
+        expected = "issued" if lookup == "success" else "pending_provider"
+        assert (result.document_status, (await world.doc(settled.document_id)).status) == (
+            expected,
+            expected,
+        )
+        assert len(world.provider.posts()) == 1
+        return
+    with pytest.raises(ResolutionNotAllowed, match="provider_unconfirmed"):
+        await world.resolve(settled.document_id, "retry")
+    await assert_untouched(world, settled, before, "PROVIDER_REJECTED")
+    await world.drive(rounds=3, step=timedelta(hours=1))
+    assert len(world.provider.posts()) == 1
+
+
+@pytest.mark.parametrize("lookup", ["none", "failed"])
+async def test_attach_draft_refused_while_provider_unconfirmed(world, lookup):
+    settled = await failed_unconfirmed(world)
+    before = await world.doc(settled.document_id)
+    world.provider.script_lookup(
+        settled.reference,
+        None if lookup == "none" else failed_invoice(settled.reference, None),
+    )
+    with pytest.raises(ResolutionNotAllowed, match="provider_unconfirmed"):
+        await world.resolve(
+            settled.document_id,
+            "attach_draft",
+            draft=world.draft_command(settled.host_ref_id, settled.intent_id, name="Corrected"),
+        )
+    await assert_untouched(world, settled, before, "PROVIDER_REJECTED")
+    assert (await world.doc(settled.document_id)).document == before.document
+
+
+@pytest.mark.parametrize("resolution", ["mark_external", "waive"])
+async def test_unconfirmed_allows_mark_external_and_waive(world, resolution):
+    settled = await failed_unconfirmed(world, "pending")
+    if resolution == "mark_external":
+        result = await world.resolve(
+            settled.document_id,
+            "mark_external",
+            invoice_number="00000099",
+            issued_date=date(2026, 10, 21),
+        )
+        doc = await world.doc(settled.document_id)
+        assert (result.document_status, doc.status, doc.invoice_number) == (
+            "issued",
+            "issued",
+            "00000099",
+        )
+    else:
+        result = await world.resolve(settled.document_id, "waive", note="Confirmed with SePay")
+        doc = await world.doc(settled.document_id)
+        assert (result.document_status, doc.status) == ("failed", "failed")
+    assert result.case_resolved is True
+    assert world.provider.ops().count("find_by_reference") == 0
+    assert len(world.provider.posts()) == 1
+
+
+@pytest.mark.parametrize("lookup", ["none", "failed", "pending"])
+async def test_retry_with_new_reference_while_provider_unconfirmed_follows_the_lookup(
+    world, lookup
+):
+    settled = await failed_unconfirmed(world)
+    before = await world.doc(settled.document_id)
+    if lookup == "none":
+        world.provider.script_lookup(settled.reference, None)
+    elif lookup == "failed":
+        world.provider.script_lookup(settled.reference, failed_invoice(settled.reference, None))
+    else:
+        world.provider.script_lookup(
+            settled.reference, ProviderInvoice(settled.reference, "pending", settled.reference)
+        )
+    if lookup != "none":
+        with pytest.raises(ReferenceStillExists):
+            await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+        await assert_untouched(world, settled, before, "PROVIDER_REJECTED")
+        assert (await world.doc(settled.document_id)).reference_code == settled.reference
+        return
+    result = await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    doc = await world.doc(settled.document_id)
+    assert result.reference_code != settled.reference
+    assert (result.document_status, doc.status, doc.reference_code) == (
+        "queued",
+        "queued",
+        result.reference_code,
+    )
+    assert await world.open_reasons(settled.document_id) == []
+
+
+async def test_retry_allowed_once_unconfirmed_reason_was_cleared_in_the_same_case(world):
+    settled = await world.settle()
+    await world.issue()
+    # Another open reason keeps the case open across the whole sequence.
+    async with world.crash() as uow:
+        await uow.review_cases.open_once(
+            TENANT, settled.document_id, "STALE_REFERENCE_FOUND", {"previous_reference": "x"}
+        )
+        await uow.commit()
+    world.advance(timedelta(seconds=3))
+    world.provider.unconfirmed(settled.reference, "failed")
+    await world.poll()
+    assert (await world.doc(settled.document_id)).status == "failed"
+    # A lookup that shows the job settles the unconfirmed reason.
+    world.provider.script_lookup(
+        settled.reference, ProviderInvoice(settled.reference, "pending", settled.reference)
+    )
+    await world.resolve(settled.document_id, "retry", reason="PROVIDER_REJECTED")
+    assert (await world.doc(settled.document_id)).status == "pending_provider"
+    world.advance(timedelta(seconds=3))
+    world.provider.script_check(
+        settled.reference, ProviderProgress(state="failed", provider_message="Synthetic")
+    )
+    await world.poll()
+    assert (await world.doc(settled.document_id)).status == "failed"
+    case = await world.open_case(settled.document_id)
+    assert [
+        (item["reason"], item["status"], (item.get("details") or {}).get("unconfirmed"))
+        for item in case.details["reasons"]
+    ] == [
+        ("STALE_REFERENCE_FOUND", "open", None),
+        ("PROVIDER_REJECTED", "cleared", True),
+        ("PROVIDER_REJECTED", "open", None),
+    ]
+    world.provider.script_lookup(settled.reference, failed_invoice(settled.reference, None))
+    result = await world.resolve(settled.document_id, "retry", reason="PROVIDER_REJECTED")
+    doc = await world.doc(settled.document_id)
+    assert (result.document_status, doc.status, doc.reference_code) == (
+        "queued",
+        "queued",
+        settled.reference,
+    )
+    assert await world.open_reasons(settled.document_id) == ["STALE_REFERENCE_FOUND"]
+
+
+async def test_retry_refused_when_lookup_cancelled(world):
+    settled = await failed_by(world, rejected("validation_error"))
+    world.provider.cancel_under_reference(settled.reference)
+    before = await world.doc(settled.document_id)
+    with pytest.raises(ResolutionNotAllowed, match="provider_record_cancelled"):
+        await world.resolve(settled.document_id, "retry")
+    await assert_untouched(world, settled, before, "PROVIDER_REJECTED")
+    with pytest.raises(ReferenceStillExists):
+        await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    await assert_untouched(world, settled, before, "PROVIDER_REJECTED")
+    await world.drive(rounds=3, step=timedelta(hours=1))
+    assert len(world.provider.posts()) == 1
+
+
+async def test_attach_draft_refused_when_lookup_cancelled(world):
+    settled = await failed_by(world, rejected("validation_error"))
+    world.provider.cancel_under_reference(settled.reference)
+    before = await world.doc(settled.document_id)
+    with pytest.raises(ResolutionNotAllowed, match="provider_record_cancelled"):
+        await world.resolve(
+            settled.document_id,
+            "attach_draft",
+            draft=world.draft_command(settled.host_ref_id, settled.intent_id, name="Corrected"),
+        )
+    await assert_untouched(world, settled, before, "PROVIDER_REJECTED")
+    assert (await world.doc(settled.document_id)).document == before.document
+    await world.drive(rounds=3, step=timedelta(hours=1))
+    assert len(world.provider.posts()) == 1

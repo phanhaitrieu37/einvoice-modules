@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 import sqlalchemy as sa
-from tests.fakes.fake_einvoice_provider import CONFLICT, FakeInvoice
+from tests.fakes.fake_einvoice_provider import CONFLICT, TRANSIENT, FakeInvoice
 from tests.integration.worker.world import TENANT, vn
 
 from invoice_module.adapters.sqlalchemy.repositories.documents import DocumentRepository
@@ -173,6 +173,34 @@ async def test_pending_over_three_hours_fails_with_timeout_review(world):
     assert await world.open_reasons(settled.document_id) == ["PROVIDER_TIMEOUT"]
     # The default timeout is three hours.
     assert InvoiceModuleConfig().pending_timeout == timedelta(hours=3)
+
+
+@pytest.mark.parametrize("last_poll", ["pending", "transient", "transient_then_pending"])
+async def test_timeout_review_tells_unanswered_polls_from_pending(world, last_poll):
+    world.config = InvoiceModuleConfig(pending_timeout=timedelta(minutes=30))
+    world.restart()
+    settled = await world.settle()
+    world.provider.new_invoice(settled.reference, pending_polls=10_000)
+    await world.issue()
+    answers = {
+        "pending": [None],
+        "transient": [None, TRANSIENT, TRANSIENT],
+        "transient_then_pending": [TRANSIENT, None],
+    }[last_poll]
+    for answer in answers:
+        if answer is not None:
+            world.provider.script_check(settled.reference, answer)
+        world.clock.set((await world.doc(settled.document_id)).next_attempt_at)
+        await world.poll()
+    unanswered = last_poll == "transient"
+    doc = await world.doc(settled.document_id)
+    assert doc.last_error_code == ("transient_error" if unanswered else None)
+    assert world.metrics.count("invoice_poll_transient_total") == answers.count(TRANSIENT)
+    world.clock.set(doc.pending_since + timedelta(minutes=31))
+    assert (await escalate(world)).timed_out == [settled.document_id]
+    details = await world.reason_details(settled.document_id, "PROVIDER_TIMEOUT")
+    assert details["last_poll_error"] == ("transient_error" if unanswered else None)
+    assert details["poll_count"] == answers.count(None)
 
 
 async def test_stale_alert_after_fifteen_minutes_despite_frequent_polls(world):
@@ -411,6 +439,33 @@ async def test_draft_sweep_reaches_document_beyond_batch_of_stuck_documents(worl
     assert [(await world.doc(s.document_id)).status for s in stuck] == ["needs_draft"] * 2
 
 
+async def test_draft_sweep_reaches_document_behind_mismatched_open_drafts(world):
+    world.config = InvoiceModuleConfig(batch_size=2)
+    world.restart()
+    stuck = []
+    # Settled at 100 while their open draft still declares more or less: each kind alone
+    # would fill the batch if the sweep took it.
+    for amount in (150, 50, 150, 50):
+        stuck.append(await world.settle(draft_amount=amount))
+        assert await world.open_reasons(stuck[-1].document_id) == ["AMOUNT_MISMATCH"]
+        world.advance(timedelta(seconds=1))
+    before = [await world.doc(s.document_id) for s in stuck]
+    late = await world.settle(draft=False)
+    draft_id = await insert_draft(world, late, intent_id=late.intent_id)  # the wake-up was missed
+    report = await escalate(world)
+    doc = await world.doc(late.document_id)
+    assert (doc.status, doc.draft_id) == ("queued", draft_id)
+    assert report.drafts_attached == [late.document_id]
+    after = [await world.doc(s.document_id) for s in stuck]
+    assert [(d.status, d.updated_at) for d in after] == [(d.status, d.updated_at) for d in before]
+    assert {d.status for d in after} == {"blocked"}
+    # A corrected revision of the same draft row is attachable again.
+    await fix_draft_amount(world, stuck[0], 100)
+    report = await escalate(world)
+    assert report.drafts_attached == [stuck[0].document_id]
+    assert (await world.doc(stuck[0].document_id)).status == "queued"
+
+
 @pytest.mark.parametrize("older", ["waived", "open"])
 async def test_draft_missing_reaches_newest_document_behind_decided_ones(world, monkeypatch, older):
     monkeypatch.setattr(escalate_module, "_ALERT_SCAN_LIMIT", 2)
@@ -500,6 +555,46 @@ async def test_previous_reference_recheck_throttled_within_interval(world):
     world.advance(timedelta(minutes=10))
     await escalate(world)
     assert len(rechecks()) == before + 2
+
+
+async def test_recheck_memo_forgets_references_past_their_window(world):
+    settled = await rotated(world)
+    sweep = world.module.escalate_overdue
+    await escalate(world)
+    key = (settled.document_id, settled.reference)
+    assert set(sweep._rechecked_at) == {key}
+    world.advance(timedelta(hours=23, minutes=59))
+    await escalate(world)
+    assert set(sweep._rechecked_at) == {key}
+    world.advance(timedelta(minutes=2))
+    await escalate(world)
+    assert sweep._rechecked_at == {}
+
+
+async def test_recheck_memo_forgets_each_reference_on_its_own(world):
+    settled = await rotated(world)
+    sweep = world.module.escalate_overdue
+    await escalate(world)
+    first = (settled.document_id, settled.reference)
+    assert set(sweep._rechecked_at) == {first}
+    # Twelve hours later the same document retires its second reference as well.
+    world.advance(timedelta(hours=12))
+    second_reference = (await world.doc(settled.document_id)).reference_code
+    world.provider.script_create(second_reference, CONFLICT)
+    await world.issue()
+    assert (await world.doc(settled.document_id)).status == "failed"
+    await world.resolve(
+        settled.document_id,
+        "retry_with_new_reference",
+        note="Reconciled at the portal: no invoice for the second reference",
+    )
+    await escalate(world)
+    second = (settled.document_id, second_reference)
+    assert set(sweep._rechecked_at) == {first, second}
+    # Past the first reference's window only: the second one stays remembered.
+    world.advance(timedelta(hours=12, minutes=1))
+    await escalate(world)
+    assert set(sweep._rechecked_at) == {second}
 
 
 async def test_stale_alert_logs_once_per_entry_but_counts_every_sweep(world, caplog):

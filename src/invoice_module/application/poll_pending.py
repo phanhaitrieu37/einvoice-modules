@@ -2,6 +2,8 @@
 
 Polls count in ``poll_count`` and never in ``attempts``; the three-hour timeout is decided only
 by the overdue sweep. The issue date recorded is always the provider's, never the poll date.
+Only a ``success`` answer reaches ``issued``; a status check that is refused is followed by a
+lookup by reference, and an outcome the provider could not confirm goes to review at once.
 """
 
 import logging
@@ -28,8 +30,10 @@ from invoice_module.ports.provider import (
     ClientCredentials,
     EInvoiceProvider,
     IssuerAccountView,
+    ProviderAuthFailed,
     ProviderInvoice,
     ProviderProgress,
+    ProviderRejected,
     ProviderTransient,
 )
 from invoice_module.ports.unit_of_work import InvoiceUnitOfWorkFactory
@@ -37,6 +41,9 @@ from invoice_module.ports.unit_of_work import InvoiceUnitOfWorkFactory
 logger = logging.getLogger(__name__)
 
 _TRANSIENT_DELAY = timedelta(seconds=3)
+# Set by the adapter on a status check, in any state, when the provider says it could not
+# confirm the outcome and asks not to resend: the code is read, never the message.
+PROVIDER_UNCONFIRMED = "provider_unconfirmed"
 
 
 @dataclass(frozen=True)
@@ -97,7 +104,15 @@ class PollPending:
         creds = await self._credentials.client_credentials(account.credential_ref)
         try:
             if document.tracking_code:
-                progress = await self._provider.check_create(account, creds, document.tracking_code)
+                try:
+                    progress = await self._provider.check_create(
+                        account, creds, document.tracking_code
+                    )
+                except ProviderRejected as exc:
+                    return await self._check_rejected(document, account, creds, exc.code)
+                except ProviderAuthFailed:
+                    # The check is a read: it is retried like any unclear answer.
+                    return await self._reschedule(document, _TRANSIENT_DELAY, count_poll=False)
                 lookup: ProviderInvoice | None = None
             else:
                 lookup = await self._provider.find_by_reference(
@@ -113,6 +128,49 @@ class PollPending:
                 progress = _progress(lookup)
         except ProviderTransient:
             return await self._reschedule(document, _TRANSIENT_DELAY, count_poll=False)
+        if progress.error_code == PROVIDER_UNCONFIRMED:
+            return await self._fail(
+                document,
+                IssueErrorCode.PROVIDER_FAILED,
+                ReviewReason.PROVIDER_REJECTED,
+                unconfirmed_details(progress),
+            )
+        return await self._apply(document, account, creds, progress, lookup)
+
+    async def _check_rejected(
+        self,
+        document: DocumentRow,
+        account: IssuerAccountView,
+        creds: ClientCredentials,
+        check_code: str,
+    ) -> PollResult:
+        """A refused status check proves nothing about the invoice: the lookup decides."""
+        try:
+            found = await self._provider.find_by_reference(account, creds, document.reference_code)
+        except (ProviderTransient, ProviderAuthFailed):
+            return await self._reschedule(document, _TRANSIENT_DELAY, count_poll=False)
+        if found is None:
+            return await self._fail(
+                document,
+                IssueErrorCode.DOCUMENT_EXISTED_UNRESOLVED,
+                ReviewReason.DOCUMENT_EXISTED_UNRESOLVED,
+                {"provider_state": "none", "phase": "poll", "check_status": check_code},
+            )
+        if found.state == "pending":
+            # Later polls follow the job by reference.
+            now = self._clock.now()
+            delay = self._config.next_poll_delay(document.poll_count + 1, None, now)
+            return await self._reschedule(document, delay, count_poll=True, tracking_code=None)
+        return await self._apply(document, account, creds, _progress(found), found)
+
+    async def _apply(
+        self,
+        document: DocumentRow,
+        account: IssuerAccountView,
+        creds: ClientCredentials,
+        progress: ProviderProgress,
+        lookup: ProviderInvoice | None,
+    ) -> PollResult:
         if progress.state == "pending":
             now = self._clock.now()
             delay = self._config.next_poll_delay(
@@ -126,14 +184,15 @@ class PollPending:
                 ReviewReason.PROVIDER_REJECTED,
                 failed_job_details(progress.provider_message),
             )
-        if progress.state == "draft":
-            return await self._fail(
-                document,
-                IssueErrorCode.DOCUMENT_EXISTED_UNRESOLVED,
-                ReviewReason.DOCUMENT_EXISTED_UNRESOLVED,
-                {"provider_state": "draft"},
-            )
-        return await self._success(document, account, creds, progress, lookup)
+        if progress.state == "success":
+            return await self._success(document, account, creds, progress, lookup)
+        # A draft or a cancelled invoice under our reference is never an issued invoice.
+        return await self._fail(
+            document,
+            IssueErrorCode.DOCUMENT_EXISTED_UNRESOLVED,
+            ReviewReason.DOCUMENT_EXISTED_UNRESOLVED,
+            {"provider_state": progress.state},
+        )
 
     async def _success(
         self,
@@ -191,12 +250,18 @@ class PollPending:
         return PollResult(document.id, result.value)
 
     async def _reschedule(
-        self, document: DocumentRow, delay: timedelta, *, count_poll: bool
+        self, document: DocumentRow, delay: timedelta, *, count_poll: bool, **extra: Any
     ) -> PollResult:
         now = self._clock.now()
-        values: dict[str, Any] = {"next_attempt_at": now + delay, "updated_at": now}
+        values: dict[str, Any] = {"next_attempt_at": now + delay, "updated_at": now, **extra}
         if count_poll:
             values["poll_count"] = document.poll_count + 1
+            values["last_error_code"] = None
+        else:
+            # No usable answer; kept so a later timeout can tell polls left unanswered from a
+            # provider that kept answering ``pending``.
+            values["last_error_code"] = IssueErrorCode.TRANSIENT_ERROR.value
+            increment_safely(self._metrics, "invoice_poll_transient_total", {})
         async with self._uow_factory() as uow:
             if not await uow.documents.finalize(document.id, document.lease_generation, **values):
                 return self._lease_lost(document)
@@ -228,6 +293,15 @@ class PollPending:
         logger.warning("invoice_lease_lost", extra={"document_id": str(document.id)})
         increment_safely(self._metrics, "invoice_lease_lost_total", {"loop": "poll"})
         return PollResult(document.id, "lease_lost")
+
+
+def unconfirmed_details(progress: ProviderProgress) -> dict[str, Any]:
+    """Review details of a check whose outcome the provider could not confirm; the message is
+    stored verbatim for the operator and never parsed."""
+    details: dict[str, Any] = {"unconfirmed": True, "provider_job_state": progress.state}
+    if progress.provider_message is not None:
+        details["provider_message"] = progress.provider_message
+    return details
 
 
 def _progress(found: ProviderInvoice) -> ProviderProgress:

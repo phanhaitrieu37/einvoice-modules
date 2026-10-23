@@ -15,10 +15,12 @@ _POLL_FLOOR = timedelta(seconds=3)
 class InvoiceModuleConfig:
     lease_seconds: int = 60
     http_timeout_s: float = 20.0
+    # The host passes the same value to the provider client: each artifact download (PDF,
+    # then XML) may take this long.
+    artifact_timeout_s: float = 90.0
     issue_max_attempts: int = 10
     poll_schedule_s: tuple[int, ...] = (3, 5, 10, 20, 30, 60)
     pending_timeout: timedelta = timedelta(hours=3)
-    quota_backoff: timedelta = timedelta(hours=1)
     draft_missing_after: timedelta = timedelta(hours=1)
     stale_alert_after: timedelta = timedelta(minutes=15)
     artifacts_missing_alert_after: timedelta = timedelta(hours=1)
@@ -33,8 +35,16 @@ class InvoiceModuleConfig:
         # no timeout/lease inequality to enforce here; the timeout only has to be a real wait.
         if self.http_timeout_s <= 0:
             raise ValueError("http_timeout_s must be positive")
+        if self.artifact_timeout_s <= 0:
+            raise ValueError("artifact_timeout_s must be positive")
         if not self.poll_schedule_s:
             raise ValueError("poll_schedule_s must not be empty")
+
+    @property
+    def artifact_lease_seconds(self) -> int:
+        """Lease of an artifact claim: two sequential downloads plus the two stores before the
+        compare-and-set, so no other worker claims the document mid-download."""
+        return int(2 * self.artifact_timeout_s + 30)
 
     def owner(self) -> str:
         return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4()}"

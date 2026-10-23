@@ -1,0 +1,12 @@
+{
+  "_synthetic": "Hand-built, not recorded. Shape of the asynchronous Failed job observed on the issue path on 2026-10-20 (HTTP 200, success true, data.status Failed, a Vietnamese message and no error code); numbers and dates are invented.",
+  "status": 200,
+  "body": {
+    "success": true,
+    "data": {
+      "reference_code": "00000000-0000-4000-8000-0000000000f1",
+      "status": "Failed",
+      "message": "Ngày lập (01/01/2026) phải lớn hơn hoặc bằng ngày lập của hóa đơn số 100001 (02/01/2026) liền kề trước cùng ký hiệu C26TSE."
+    }
+  }
+}

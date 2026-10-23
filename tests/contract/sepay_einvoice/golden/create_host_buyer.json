@@ -1,0 +1,46 @@
+{
+  "buyer": {
+    "address": "1 Đường Mẫu, Hà Nội",
+    "email": "buyer@example.com",
+    "legal_name": "CÔNG TY TNHH MẪU",
+    "name": "Công ty Mẫu",
+    "tax_code": "0000000000",
+    "type": "company"
+  },
+  "currency": "VND",
+  "invoice_series": "C26TSE",
+  "is_draft": false,
+  "issued_date": "2026-10-20 00:00:00",
+  "items": [
+    {
+      "before_discount_and_tax_amount": 358800,
+      "discount_amount": 0,
+      "item_code": "SYN-001",
+      "item_name": "Phần mềm mẫu",
+      "line_number": 1,
+      "line_type": 1,
+      "quantity": 1,
+      "tax_amount": 35880,
+      "tax_rate": 10,
+      "unit": "Tháng",
+      "unit_price": 358800
+    },
+    {
+      "before_discount_and_tax_amount": 100000,
+      "discount_amount": 10000,
+      "item_name": "Dịch vụ cài đặt",
+      "line_number": 2,
+      "line_type": 1,
+      "quantity": 2,
+      "tax_amount": 7200,
+      "tax_rate": 8,
+      "unit": "Lần",
+      "unit_price": 50000
+    }
+  ],
+  "payment_method": "TM/CK",
+  "provider_account_id": "00000000-0000-0000-0000-000000000000",
+  "reference_code": "00000000-0000-4000-8000-00000000c0de",
+  "template_code": "1",
+  "total_amount": 491880
+}

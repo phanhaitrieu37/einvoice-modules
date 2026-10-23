@@ -316,7 +316,9 @@ async def test_stale_hash_rebuilds_request_and_reapproval_sends_new_content(worl
     await world.issue()
     [post] = world.provider.posts()
     assert post.payload["buyer"] == {"name": "Buyer B", "address": "Street B"}
-    assert [(item["name"], item["unit"]) for item in post.payload["items"]] == [("Item B", "box")]
+    assert [(item["item_name"], item["unit"]) for item in post.payload["items"]] == [
+        ("Item B", "box")
+    ]
     assert post.payload == (await world.doc(settled.document_id)).request
 
 
@@ -389,6 +391,7 @@ async def test_approved_across_midnight_sends_send_day_date_and_keeps_approved_a
     world.provider.script_create(settled.reference, QUOTA)
     await world.issue()
     world.advance(timedelta(hours=1, seconds=1))
+    await world.resolve(settled.document_id, "retry", reason="QUOTA_EXHAUSTED")
     await world.issue()
     world.advance(timedelta(seconds=3))
     await world.poll()

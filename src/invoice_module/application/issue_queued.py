@@ -9,8 +9,10 @@ code never changes here.
 """
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from types import MappingProxyType
 from typing import Any
 from uuid import UUID
 
@@ -53,12 +55,22 @@ from invoice_module.ports.unit_of_work import InvoiceUnitOfWorkFactory
 logger = logging.getLogger(__name__)
 
 ISSUED_DATE_INVALID = IssueErrorCode.ISSUED_DATE_INVALID.value
-_REJECTION_CODES = {
-    IssueErrorCode.VALIDATION_ERROR.value,
-    IssueErrorCode.ISSUED_DATE_INVALID.value,
-    IssueErrorCode.REGISTRATION_NOT_APPROVED.value,
-    IssueErrorCode.SELLER_STORE_INVALID.value,
-}
+# Provider rejection code -> error recorded on the document; any other code is a validation
+# error. The code is matched exactly as the adapter passes it: only the synchronous 400 date
+# rejection arrives as ``issued_date_invalid``, while a 2xx carrying ``ISSUED_DATE_INVALID`` may
+# have queued a job and must not reach the resend path, so letter case is never normalised.
+PROVIDER_CODE_TO_ERROR: Mapping[str, IssueErrorCode] = MappingProxyType(
+    {
+        "REGISTRATION_NOT_COMPLETE": IssueErrorCode.REGISTRATION_NOT_APPROVED,
+        "BILLING_IS_UNPAID": IssueErrorCode.REGISTRATION_NOT_APPROVED,
+        "EINVOICE_ACCOUNT_NOT_FOUND": IssueErrorCode.REGISTRATION_NOT_APPROVED,
+        "REGISTRATION_NOT_TAX_APPROVED": IssueErrorCode.REGISTRATION_NOT_APPROVED,
+        "INVOICE_DATE_BEFORE_TAX_APPROVAL": IssueErrorCode.REGISTRATION_NOT_APPROVED,
+        "SELLER_STORE_NOT_FOUND": IssueErrorCode.SELLER_STORE_INVALID,
+        "SELLER_STORE_INACTIVE": IssueErrorCode.SELLER_STORE_INVALID,
+        ISSUED_DATE_INVALID: IssueErrorCode.ISSUED_DATE_INVALID,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -253,12 +265,34 @@ class IssueQueued:
         return await self._freeze_send(document, account, today)
 
     async def _cross_day(
-        self, document: DocumentRow, account: IssuerAccountView, issued_date: date
+        self,
+        document: DocumentRow,
+        account: IssuerAccountView,
+        issued_date: date,
+        *,
+        after_date_rejection: bool = False,
     ) -> IssueResult | None:
-        """The issue date would differ from the settlement date (or from the frozen request)."""
+        """The issue date would differ from the settlement date (or from the frozen request).
+
+        ``after_date_rejection``: the provider refused the earlier POST for its date, a
+        definitive answer, so any permission to resend that POST is spent; the details record
+        which POST of the reference it was.
+        """
         action = account.issue_date_cross_day_action
         if action != CrossDayAction.ISSUE and not await self._cross_day_confirmed(document):
             now = self._clock.now()
+            details: dict[str, Any] = {
+                "settled_date": today_vn(document.settled_at).isoformat(),
+                "frozen_issued_date": (
+                    document.issued_date.isoformat() if document.issued_date else None
+                ),
+                "issue_date": issued_date.isoformat(),
+            }
+            values: dict[str, Any] = {}
+            if after_date_rejection:
+                details["after_date_rejection"] = True
+                details["post_count"] = document.post_count
+                values["request_authorized_resend"] = False
             async with self._uow_factory() as uow:
                 state.ensure_transition(document.status, DocumentStatus.BLOCKED)
                 if not await uow.documents.finalize(
@@ -267,21 +301,10 @@ class IssueQueued:
                     status=DocumentStatus.BLOCKED.value,
                     next_attempt_at=None,
                     updated_at=now,
+                    **values,
                 ):
                     return self._lease_lost(document)
-                await open_review(
-                    uow,
-                    document,
-                    ReviewReason.ISSUE_DATE_CROSSED_DAY,
-                    {
-                        "settled_date": today_vn(document.settled_at).isoformat(),
-                        "frozen_issued_date": (
-                            document.issued_date.isoformat() if document.issued_date else None
-                        ),
-                        "issue_date": issued_date.isoformat(),
-                    },
-                    now,
-                )
+                await open_review(uow, document, ReviewReason.ISSUE_DATE_CROSSED_DAY, details, now)
                 await uow.commit()
             return IssueResult(document.id, DocumentStatus.BLOCKED.value)
         self._count("invoice_cross_day_total")
@@ -360,8 +383,8 @@ class IssueQueued:
             return await self._conflict(document, account, creds)
         except ProviderTransient as exc:
             return await self._transient(document, exc.retry_after)
-        except QuotaExhausted:
-            return await self._quota(document)
+        except QuotaExhausted as exc:
+            return await self._quota(document, str(exc), document.post_count + guard.granted)
         except ProviderRejected as exc:
             if exc.code == ISSUED_DATE_INVALID:
                 if date_resend:
@@ -427,12 +450,14 @@ class IssueQueued:
             return await self._finalize_from_lookup(document, found)
         if found.state == "pending":
             return await self._to_pending(document, found.tracking_code)
-        if found.state == "draft":
+        if found.state in ("draft", "cancelled"):
+            # A record under our reference that is not an issued invoice: a resend could only
+            # answer 409, so an operator decides.
             return await self._fail(
                 document,
                 IssueErrorCode.DOCUMENT_EXISTED_UNRESOLVED,
                 ReviewReason.DOCUMENT_EXISTED_UNRESOLVED,
-                {"provider_state": "draft"},
+                {"provider_state": found.state},
                 request_authorized_resend=False,
             )
         return await self._fail(
@@ -526,11 +551,11 @@ class IssueQueued:
             today = today_vn(self._clock.now())
             # The resend goes through the cross-day policy like every other send.
             if current.delivery_mode == DeliveryMode.AUTO and today != today_vn(current.settled_at):
-                blocked = await self._cross_day(current, account, today)
+                blocked = await self._cross_day(current, account, today, after_date_rejection=True)
                 if blocked is not None:
                     return blocked
             return await self._freeze_send(current, account, today, date_resend=True)
-        skipped = "earlier_post_unrecorded" if current.post_count >= 2 else "operator_grant_used"
+        skipped = await self._date_resend_skipped(current)
         return await self._fail(
             current,
             IssueErrorCode.ISSUED_DATE_INVALID,
@@ -538,6 +563,22 @@ class IssueQueued:
             {"code": ISSUED_DATE_INVALID, "date_resend_skipped": skipped, **budget},
             request_authorized_resend=False,
         )
+
+    async def _date_resend_skipped(self, current: DocumentRow) -> str:
+        """Why a date refusal gets no resend, named from what the database recorded."""
+        if current.date_resend_at is not None:
+            return "date_resend_used"
+        if current.post_count < 2:
+            return "operator_grant_used"
+        async with self._uow_factory() as uow:
+            # Only the POST right before this one counts: any POST in between may be unanswered.
+            rejected_before = await uow.review_cases.reason_recorded(
+                current.id,
+                ReviewReason.ISSUE_DATE_CROSSED_DAY.value,
+                {"after_date_rejection": True, "post_count": current.post_count - 1},
+            )
+        # Otherwise the POST before this one has no recorded answer.
+        return "earlier_post_rejected" if rejected_before else "earlier_post_unrecorded"
 
     async def _date_resend_conflict(
         self, document: DocumentRow, account: IssuerAccountView, creds: ClientCredentials
@@ -592,29 +633,38 @@ class IssueQueued:
             await uow.commit()
         return IssueResult(document.id, "backoff")
 
-    async def _quota(self, document: DocumentRow) -> IssueResult:
+    async def _quota(self, document: DocumentRow, code: str, post_count: int) -> IssueResult:
+        """The quota does not come back by itself: the document keeps its status (and a manual
+        approval) but is never claimed again until an operator retries after a top-up."""
         now = self._clock.now()
         async with self._uow_factory() as uow:
             if not await uow.documents.finalize(
                 document.id,
                 document.lease_generation,
-                next_attempt_at=now + self._config.quota_backoff,
-                attempts=max(document.attempts - 1, 0),
+                next_attempt_at=None,
                 last_error_code=IssueErrorCode.QUOTA_EXHAUSTED.value,
                 updated_at=now,
             ):
                 return self._lease_lost(document)
-            await open_review(uow, document, ReviewReason.QUOTA_EXHAUSTED, {}, now)
+            await open_review(
+                uow,
+                document,
+                ReviewReason.QUOTA_EXHAUSTED,
+                {"code": code, "post_count": post_count, "post_limit": document.post_limit},
+                now,
+            )
             await uow.commit()
-        logger.error("invoice_quota_exhausted", extra={"document_id": str(document.id)})
+        logger.error(
+            "invoice_quota_exhausted",
+            extra={"document_id": str(document.id), "post_count": post_count},
+        )
         self._count("invoice_quota_exhausted_total")
         return IssueResult(document.id, "quota")
 
     async def _rejected(self, document: DocumentRow, code: str) -> IssueResult:
-        error = code if code in _REJECTION_CODES else IssueErrorCode.VALIDATION_ERROR.value
         return await self._fail(
             document,
-            IssueErrorCode(error),
+            PROVIDER_CODE_TO_ERROR.get(code, IssueErrorCode.VALIDATION_ERROR),
             ReviewReason.PROVIDER_REJECTED,
             {"code": code},
             request_authorized_resend=False,

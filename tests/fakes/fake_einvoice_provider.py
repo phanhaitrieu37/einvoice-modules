@@ -2,7 +2,9 @@
 
 Every create issues in one step (a provider draft is never requested). The provider records the
 issue date sent in the request and refuses a date earlier than its own Asia/Saigon date at the
-moment it receives the request, as the sandbox did with ``400 ISSUED_DATE_INVALID``.
+moment it receives the request, as the sandbox did with ``400 ISSUED_DATE_INVALID``. Create
+requests are built by the SePay adapter's own payload builder, so a frozen request has the shape
+the provider receives.
 
 Counting: ``calls`` holds one entry per transport request (a POST that reached the provider,
 whatever its answer) and per read; ``effective_creates`` counts invoices that really exist at the
@@ -21,6 +23,7 @@ from typing import Any
 
 from tests.fakes.recording import Crash
 
+from invoice_module.adapters.sepay.payload import build_create_payload
 from invoice_module.application.config import today_vn
 from invoice_module.domain.document import InvoiceDocument
 from invoice_module.ports.provider import (
@@ -39,29 +42,46 @@ from invoice_module.ports.provider import (
     SendAborted,
 )
 
-try:  # The adapter payload is used when it exists; this fake never depends on it.
-    from invoice_module.adapters.sepay.payload import (  # type: ignore[import-not-found]
-        build_create_payload as _adapter_build_create_payload,
-    )
-except ImportError:  # pragma: no cover - depends on which phases are merged
-    _adapter_build_create_payload = None
-
 # Outcomes of one create, in the order a test scripts them.
 ACCEPT = "accept"
 TRANSIENT = "transient"  # the provider answers 5xx; nothing is created
 LOST_RESPONSE = "lost_response"  # created at the provider; the client times out
 CRASH_AFTER_RECEIVE = "crash_after_receive"  # created; the worker process dies
-QUOTA = "quota"
+QUOTA = "quota"  # 500 QUOTA_HAS_BEEN_USERD_UP: the POST counts, nothing is created
 AUTH_FAILED = "auth_failed"  # 403 on the POST
 AUTH_FAILED_BEFORE_SEND = "auth_failed_before_send"  # token request fails; no POST
 CRASH_BEFORE_SEND = "crash_before_send"  # process dies before the send-boundary hook
 CRASH_AFTER_MARK = "crash_after_mark"  # hook granted the POST; process dies before transport
 CONFLICT = "conflict"  # forced 409
+# Created at the provider, but the 2xx carries no tracking code: the adapter raises transient.
+ACCEPTED_WITHOUT_TRACKING = "accepted_without_tracking"
 BLOCK = "block"  # the POST waits until the test releases it
+
+# The provider's quota code, spelled exactly as the API returns it.
+QUOTA_CODE = "QUOTA_HAS_BEEN_USERD_UP"
+# The code the adapter sets on a status check whose outcome the provider could not confirm.
+PROVIDER_UNCONFIRMED = "provider_unconfirmed"
 
 
 def rejected(code: str) -> tuple[str, str]:
+    """The provider refuses the create with ``code``; nothing is created."""
     return ("rejected", code)
+
+
+def account_status_rejected(code: str) -> tuple[str, str]:
+    """A refusal about the account or seller store (for example ``BILLING_IS_UNPAID``), passed
+    through by the adapter as the provider's code."""
+    return rejected(code)
+
+
+def check_rejected(code: str) -> tuple[str, str]:
+    """A status check answered with an error code (docs: 400 bad tracking code, 404 unknown)."""
+    return ("check_rejected", code)
+
+
+def raises(error: Exception) -> tuple[str, Exception]:
+    """The create raises exactly ``error`` once the POST was sent; nothing is created."""
+    return ("raise", error)
 
 
 @dataclass(frozen=True)
@@ -119,6 +139,7 @@ class FakeEInvoiceProvider:
         self._prepare_delay: dict[str, deque[timedelta]] = {}
         self._prepare_hooks: deque[Callable[[], Awaitable[None]]] = deque()
         self._number = 0
+        self._account_facts: dict[str, Any] = {"active": True}
 
     # -- scripting -----------------------------------------------------------------------
 
@@ -134,8 +155,42 @@ class FakeEInvoiceProvider:
         self._lookup_scripts.setdefault(reference_code, deque()).extend(results)
 
     def script_check(self, reference_code: str, *results: Any) -> None:
-        """Each item is ``TRANSIENT`` or a ``ProviderProgress`` returned once."""
+        """Each item is ``TRANSIENT``, ``AUTH_FAILED``, ``check_rejected(code)`` or a
+        ``ProviderProgress`` returned once."""
         self._check_scripts.setdefault(reference_code, deque()).extend(results)
+
+    def unconfirmed(
+        self, reference_code: str, state: str = "failed", message: str = "Synthetic"
+    ) -> None:
+        """The next check carries the adapter's ``provider_unconfirmed`` code with ``state``;
+        a ``success`` keeps the invoice facts the provider reported. As in the adapter, only a
+        ``failed`` answer carries the provider's message."""
+        invoice = self.invoices.get(reference_code)
+        facts: dict[str, Any] = {}
+        if state == "success" and invoice is not None:
+            facts = {
+                "invoice_number": invoice.invoice_number,
+                "provider_invoice_id": invoice.provider_invoice_id,
+                "issued_date": invoice.issued_date,
+            }
+        self.script_check(
+            reference_code,
+            ProviderProgress(
+                state=state,  # type: ignore[arg-type]
+                error_code=PROVIDER_UNCONFIRMED,
+                provider_message=message if state == "failed" else None,
+                **facts,
+            ),
+        )
+
+    def cancel_under_reference(self, reference_code: str, message: str | None = None) -> None:
+        """The provider reports the invoice under ``reference_code`` as cancelled."""
+        invoice = self.invoices.get(reference_code)
+        if invoice is None:
+            invoice = FakeInvoice(reference_code, None, None)
+            self.seed_invoice(invoice)
+        invoice.state, invoice.pending_polls = "cancelled", 0
+        invoice.provider_message = message
 
     def new_invoice(
         self,
@@ -170,6 +225,11 @@ class FakeEInvoiceProvider:
             invoice.invoice_number = self._next_number()
         invoice.provider_invoice_id = invoice.provider_invoice_id or f"inv-{invoice.reference_code}"
         self.invoices[invoice.reference_code] = invoice
+
+    def set_account_facts(self, **facts: Any) -> None:
+        """What ``describe_account`` reports, for example ``active=False`` or
+        ``tax_authority_approved_date=date(...)``; unset facts keep their defaults."""
+        self._account_facts.update(facts)
 
     def reconcile_at_portal(self, reference_code: str) -> None:
         """An operator settled the reference at the portal: it can never create an invoice."""
@@ -215,24 +275,7 @@ class FakeEInvoiceProvider:
         reference_code: str,
         issued_date: date,
     ) -> dict[str, object]:
-        if _adapter_build_create_payload is not None:
-            payload = _adapter_build_create_payload(account, doc, reference_code, issued_date)
-        else:
-            payload = {
-                "reference_code": reference_code,
-                "is_draft": False,
-                "template_code": account.template_code,
-                "invoice_series": account.invoice_series_template.replace(
-                    "{YY}", f"{issued_date.year % 100:02d}"
-                ),
-                "issued_date": issued_date.isoformat(),
-                "payment_method": account.payment_method,
-                "currency": doc.currency,
-                "buyer": dict(doc.buyer),
-                "items": [dict(line) for line in doc.lines],
-                "total_amount": doc.total_vnd,
-                "notes": doc.notes,
-            }
+        payload = build_create_payload(account, doc, reference_code, issued_date)
         self._built[_canonical(payload)] = (doc.total_vnd, issued_date)
         return payload
 
@@ -278,7 +321,7 @@ class FakeEInvoiceProvider:
             raise ProviderTransient()
         if outcome == QUOTA:
             await self._fire("create")
-            raise QuotaExhausted("quota exhausted")
+            raise QuotaExhausted(QUOTA_CODE)
         if outcome == AUTH_FAILED:
             await self._fire("create")
             raise ProviderAuthFailed("forbidden")
@@ -288,10 +331,13 @@ class FakeEInvoiceProvider:
         if isinstance(outcome, tuple) and outcome[0] == "rejected":
             await self._fire("create")
             raise ProviderRejected(outcome[1])
+        if isinstance(outcome, tuple) and outcome[0] == "raise":
+            await self._fire("create")
+            raise outcome[1]
         try:
             self._receive(reference_code, request)
         except (DocumentExists, ProviderRejected):
-            if outcome in (LOST_RESPONSE, CRASH_AFTER_RECEIVE):
+            if outcome in (LOST_RESPONSE, ACCEPTED_WITHOUT_TRACKING, CRASH_AFTER_RECEIVE):
                 await self._fire("create")
                 if outcome == CRASH_AFTER_RECEIVE:
                     raise Crash("crash after the provider answered") from None
@@ -299,7 +345,7 @@ class FakeEInvoiceProvider:
             await self._fire("create")
             raise
         await self._fire("create")
-        if outcome == LOST_RESPONSE:
+        if outcome in (LOST_RESPONSE, ACCEPTED_WITHOUT_TRACKING):
             raise ProviderTransient()
         if outcome == CRASH_AFTER_RECEIVE:
             raise Crash("crash after the provider received the request")
@@ -313,6 +359,10 @@ class FakeEInvoiceProvider:
         try:
             if scripted is TRANSIENT:
                 raise ProviderTransient()
+            if scripted is AUTH_FAILED:
+                raise ProviderAuthFailed("forbidden")
+            if isinstance(scripted, tuple) and scripted[0] == "check_rejected":
+                raise ProviderRejected(scripted[1])
             if scripted is not None:
                 return scripted
             invoice = self.invoices.get(tracking_code)
@@ -384,7 +434,9 @@ class FakeEInvoiceProvider:
         self, account: IssuerAccountView, creds: ClientCredentials
     ) -> AccountFacts:
         self.calls.append(Call("describe_account", account.provider_account_id, self.clock.now()))
-        return AccountFacts(account.provider_account_id, ("1",), ("C26TSE",))
+        return replace(
+            AccountFacts(account.provider_account_id, ("1",), ("C26TSE",)), **self._account_facts
+        )
 
     async def adjust(self, account: Any, creds: Any, request: Mapping[str, object]) -> Accepted:
         self.calls.append(Call("adjust", str(request.get("reference_code")), self.clock.now()))

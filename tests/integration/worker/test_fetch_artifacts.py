@@ -5,6 +5,8 @@ from urllib.parse import urlparse
 
 import pytest
 
+from invoice_module.application.config import InvoiceModuleConfig
+
 pytestmark = pytest.mark.integration
 
 
@@ -76,3 +78,24 @@ async def test_documents_without_issue_are_not_claimed(world):
     assert [c.reference_code for c in world.provider.calls if c.op == "fetch_artifacts"] == [
         done.reference
     ]
+
+
+@pytest.mark.parametrize("artifact_timeout_s", [90.0, 12.5])
+async def test_artifact_claim_lease_covers_artifact_timeout(world, artifact_timeout_s):
+    world.config = InvoiceModuleConfig(artifact_timeout_s=artifact_timeout_s)
+    world.restart()
+    settled = await issued(world)
+    claimed_at = world.clock.now()
+    seen = []
+
+    async def during_download():
+        seen.append(await world.doc(settled.document_id))
+
+    world.provider.on_next("fetch_artifacts", during_download)
+    [result] = await world.artifacts()
+    [doc] = seen
+    assert result.outcome == "stored"
+    assert doc.lease_owner is not None
+    # The PDF and the XML download one after the other, each up to the artifact timeout.
+    assert doc.lease_until - claimed_at >= timedelta(seconds=2 * artifact_timeout_s)
+    assert doc.lease_until - claimed_at == timedelta(seconds=int(2 * artifact_timeout_s + 30))

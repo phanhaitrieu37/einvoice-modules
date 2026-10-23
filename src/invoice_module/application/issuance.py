@@ -96,6 +96,18 @@ async def fail_document(
     )
     if recorded:
         await open_review(uow, document, reason, details, now)
+        # Provider text stays in the database: the log carries codes, states and lengths only.
+        message = details.get("provider_message")
+        logger.warning(
+            "invoice_document_failed",
+            extra={
+                "document_id": str(document.id),
+                "error_code": error_code.value,
+                "reason": reason.value,
+                "provider_state": details.get("provider_state", details.get("provider_job_state")),
+                "provider_message_length": len(message) if isinstance(message, str) else None,
+            },
+        )
     return recorded
 
 
