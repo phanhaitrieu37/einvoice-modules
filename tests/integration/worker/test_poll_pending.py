@@ -303,11 +303,11 @@ async def test_unconfirmed_code_opens_review_without_resend(world, state):
     )
     assert doc.invoice_number is None
     assert await world.open_reasons(settled.document_id) == ["PROVIDER_REJECTED"]
-    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
-        "unconfirmed": True,
-        "provider_job_state": state,
-        "provider_message": UNCONFIRMED_MESSAGE,
-    }
+    # The adapter carries the provider's message on a failed check only.
+    expected = {"unconfirmed": True, "provider_job_state": state}
+    if state == "failed":
+        expected["provider_message"] = UNCONFIRMED_MESSAGE
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == expected
     # Neither a resend nor a wait for the timeout: the case stays with the operator.
     for _ in range(4):
         world.advance(timedelta(hours=1))
@@ -335,13 +335,27 @@ async def test_poll_lookup_cancelled_opens_document_existed_unresolved(world):
     assert details == {"provider_state": "cancelled"}
 
 
+# Attributes every log record has; anything else on a record came in through ``extra``.
+STANDARD_RECORD_KEYS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", (), None))) | {
+    "message",
+    "asctime",
+}
+
+
 async def test_worker_logs_never_include_provider_message(world, caplog):
     caplog.set_level(logging.DEBUG, logger="invoice_module")
+    # Each message carries its own marker token, so any slice of it in a log is traceable.
+    tokens = {
+        "poll_failed": "QX7PFAILZ",
+        "lookup_failed": "QX7LFAILZ",
+        "conflict_lookup": "QX7CONFLZ",
+        "unconfirmed": "QX7UNCONZ",
+    }
     messages = {
-        "poll_failed": "Tổng hợp 1: hoá đơn bị từ chối ở bước xử lý.",
-        "lookup_failed": "Tổng hợp 2: bản ghi lỗi tra theo reference",
-        "conflict_lookup": "Tổng hợp 3: 409 rồi tra cứu",
-        "unconfirmed": UNCONFIRMED_MESSAGE,
+        "poll_failed": f"Tổng hợp 1 {tokens['poll_failed']}: hoá đơn bị từ chối ở bước xử lý.",
+        "lookup_failed": f"Tổng hợp 2 {tokens['lookup_failed']}: bản ghi lỗi tra theo reference",
+        "conflict_lookup": f"Tổng hợp 3 {tokens['conflict_lookup']}: 409 rồi tra cứu",
+        "unconfirmed": f"{UNCONFIRMED_MESSAGE} {tokens['unconfirmed']}",
     }
     documents = {}
     poll_failed = await world.settle()
@@ -365,26 +379,44 @@ async def test_worker_logs_never_include_provider_message(world, caplog):
     documents["conflict_lookup"] = conflict
     unconfirmed = await world.settle()
     documents["unconfirmed"] = unconfirmed
+    # An unconfirmed pending check carries no message at all.
+    unconfirmed_pending = await world.settle()
+    documents["unconfirmed_pending"] = unconfirmed_pending
     await world.issue()
     world.provider.script_lookup(
         lookup_failed.reference, failed_invoice(lookup_failed.reference, messages["lookup_failed"])
     )
-    world.provider.unconfirmed(unconfirmed.reference, "pending", message=messages["unconfirmed"])
+    world.provider.unconfirmed(unconfirmed.reference, "failed", message=messages["unconfirmed"])
+    world.provider.unconfirmed(unconfirmed_pending.reference, "pending", message="unused")
     world.past_lease()
     await world.issue()
     await world.poll()
     for name, settled in documents.items():
         doc = await world.doc(settled.document_id)
         assert doc.status == "failed", name
+    details = await world.reason_details(unconfirmed.document_id, "PROVIDER_REJECTED")
+    assert details["provider_message"] == messages["unconfirmed"]
     records = [r for r in caplog.records if r.name.startswith("invoice_module")]
+    slices = {
+        message[start : start + 8]
+        for message in messages.values()
+        for start in range(len(message) - 7)
+    }
     for record in records:
         text = record.getMessage() + " ".join(str(value) for value in vars(record).values())
-        assert not any(message in text for message in messages.values()), record.msg
-    lengths = {
-        record.document_id: record.provider_message_length
-        for record in records
-        if record.msg == "invoice_document_failed"
-    }
+        assert not any(token in text for token in tokens.values()), record.msg
+        assert not [piece for piece in slices if piece in text], record.msg
+    failed_records = [record for record in records if record.msg == "invoice_document_failed"]
+    for record in failed_records:
+        assert set(vars(record)) - STANDARD_RECORD_KEYS == {
+            "document_id",
+            "error_code",
+            "reason",
+            "provider_state",
+            "provider_message_length",
+        }
+    lengths = {record.document_id: record.provider_message_length for record in failed_records}
     assert lengths == {
-        str(settled.document_id): len(messages[name]) for name, settled in documents.items()
+        str(settled.document_id): len(messages[name]) if name in messages else None
+        for name, settled in documents.items()
     }

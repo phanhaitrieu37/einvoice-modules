@@ -163,7 +163,8 @@ class FakeEInvoiceProvider:
         self, reference_code: str, state: str = "failed", message: str = "Synthetic"
     ) -> None:
         """The next check carries the adapter's ``provider_unconfirmed`` code with ``state``;
-        a ``success`` keeps the invoice facts the provider reported."""
+        a ``success`` keeps the invoice facts the provider reported. As in the adapter, only a
+        ``failed`` answer carries the provider's message."""
         invoice = self.invoices.get(reference_code)
         facts: dict[str, Any] = {}
         if state == "success" and invoice is not None:
@@ -177,7 +178,7 @@ class FakeEInvoiceProvider:
             ProviderProgress(
                 state=state,  # type: ignore[arg-type]
                 error_code=PROVIDER_UNCONFIRMED,
-                provider_message=message,
+                provider_message=message if state == "failed" else None,
                 **facts,
             ),
         )
