@@ -9,8 +9,10 @@ code never changes here.
 """
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from types import MappingProxyType
 from typing import Any
 from uuid import UUID
 
@@ -53,12 +55,22 @@ from invoice_module.ports.unit_of_work import InvoiceUnitOfWorkFactory
 logger = logging.getLogger(__name__)
 
 ISSUED_DATE_INVALID = IssueErrorCode.ISSUED_DATE_INVALID.value
-_REJECTION_CODES = {
-    IssueErrorCode.VALIDATION_ERROR.value,
-    IssueErrorCode.ISSUED_DATE_INVALID.value,
-    IssueErrorCode.REGISTRATION_NOT_APPROVED.value,
-    IssueErrorCode.SELLER_STORE_INVALID.value,
-}
+# Provider rejection code -> error recorded on the document; any other code is a validation
+# error. The code is matched exactly as the adapter passes it: only the synchronous 400 date
+# rejection arrives as ``issued_date_invalid``, while a 2xx carrying ``ISSUED_DATE_INVALID`` may
+# have queued a job and must not reach the resend path, so letter case is never normalised.
+PROVIDER_CODE_TO_ERROR: Mapping[str, IssueErrorCode] = MappingProxyType(
+    {
+        "REGISTRATION_NOT_COMPLETE": IssueErrorCode.REGISTRATION_NOT_APPROVED,
+        "BILLING_IS_UNPAID": IssueErrorCode.REGISTRATION_NOT_APPROVED,
+        "EINVOICE_ACCOUNT_NOT_FOUND": IssueErrorCode.REGISTRATION_NOT_APPROVED,
+        "REGISTRATION_NOT_TAX_APPROVED": IssueErrorCode.REGISTRATION_NOT_APPROVED,
+        "INVOICE_DATE_BEFORE_TAX_APPROVAL": IssueErrorCode.REGISTRATION_NOT_APPROVED,
+        "SELLER_STORE_NOT_FOUND": IssueErrorCode.SELLER_STORE_INVALID,
+        "SELLER_STORE_INACTIVE": IssueErrorCode.SELLER_STORE_INVALID,
+        ISSUED_DATE_INVALID: IssueErrorCode.ISSUED_DATE_INVALID,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -621,10 +633,9 @@ class IssueQueued:
         return IssueResult(document.id, "quota")
 
     async def _rejected(self, document: DocumentRow, code: str) -> IssueResult:
-        error = code if code in _REJECTION_CODES else IssueErrorCode.VALIDATION_ERROR.value
         return await self._fail(
             document,
-            IssueErrorCode(error),
+            PROVIDER_CODE_TO_ERROR.get(code, IssueErrorCode.VALIDATION_ERROR),
             ReviewReason.PROVIDER_REJECTED,
             {"code": code},
             request_authorized_resend=False,

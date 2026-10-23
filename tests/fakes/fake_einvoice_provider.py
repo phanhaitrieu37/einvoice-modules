@@ -60,7 +60,19 @@ QUOTA_CODE = "QUOTA_HAS_BEEN_USERD_UP"
 
 
 def rejected(code: str) -> tuple[str, str]:
+    """The provider refuses the create with ``code``; nothing is created."""
     return ("rejected", code)
+
+
+def account_status_rejected(code: str) -> tuple[str, str]:
+    """A refusal about the account or seller store (for example ``BILLING_IS_UNPAID``), passed
+    through by the adapter as the provider's code."""
+    return rejected(code)
+
+
+def raises(error: Exception) -> tuple[str, Exception]:
+    """The create raises exactly ``error`` once the POST was sent; nothing is created."""
+    return ("raise", error)
 
 
 @dataclass(frozen=True)
@@ -270,6 +282,9 @@ class FakeEInvoiceProvider:
         if isinstance(outcome, tuple) and outcome[0] == "rejected":
             await self._fire("create")
             raise ProviderRejected(outcome[1])
+        if isinstance(outcome, tuple) and outcome[0] == "raise":
+            await self._fire("create")
+            raise outcome[1]
         try:
             self._receive(reference_code, request)
         except (DocumentExists, ProviderRejected):

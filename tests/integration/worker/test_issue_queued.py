@@ -10,12 +10,17 @@ from tests.fakes.fake_einvoice_provider import (
     QUOTA,
     TRANSIENT,
     FakeInvoice,
+    account_status_rejected,
     failed_invoice,
+    raises,
     rejected,
 )
 from tests.fakes.recording import Crash
 from tests.integration.worker.world import vn
 
+from invoice_module.adapters.sepay import provider as sepay_provider
+from invoice_module.adapters.sepay.client import Response as SePayResponse
+from invoice_module.adapters.sepay.errors import map_error
 from invoice_module.adapters.sqlalchemy.repositories.documents import DocumentRepository
 from invoice_module.application.config import today_vn
 from invoice_module.domain.enums import DeliveryMode, DocumentStatus
@@ -388,8 +393,9 @@ async def test_quota_opens_review_and_never_resends_automatically(world):
     ("code", "error"),
     [
         ("validation_error", "validation_error"),
-        ("registration_not_approved", "registration_not_approved"),
-        ("seller_store_invalid", "seller_store_invalid"),
+        # The module's own error names are not provider codes: they are not translated.
+        ("registration_not_approved", "validation_error"),
+        ("seller_store_invalid", "validation_error"),
         ("SOMETHING_NEW", "validation_error"),
     ],
 )
@@ -400,6 +406,64 @@ async def test_rejected_opens_provider_rejected_review(world, code, error):
     doc = await world.doc(settled.document_id)
     assert (doc.status, doc.last_error_code) == ("failed", error)
     assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {"code": code}
+
+
+@pytest.mark.parametrize(
+    ("code", "error"),
+    [
+        ("REGISTRATION_NOT_COMPLETE", "registration_not_approved"),
+        ("BILLING_IS_UNPAID", "registration_not_approved"),
+        ("EINVOICE_ACCOUNT_NOT_FOUND", "registration_not_approved"),
+        ("REGISTRATION_NOT_TAX_APPROVED", "registration_not_approved"),
+        ("INVOICE_DATE_BEFORE_TAX_APPROVAL", "registration_not_approved"),
+        ("SELLER_STORE_NOT_FOUND", "seller_store_invalid"),
+        ("SELLER_STORE_INACTIVE", "seller_store_invalid"),
+    ],
+)
+async def test_account_status_rejections_open_provider_rejected_review(world, code, error):
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, account_status_rejected(code))
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.last_error_code, doc.request_authorized_resend) == (
+        "failed",
+        error,
+        False,
+    )
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {"code": code}
+    await world.drive(rounds=4, step=timedelta(hours=1))
+    assert world.provider.ops() == ["create"]
+
+
+@pytest.mark.parametrize("answer", ["2xx_body", "synchronous_400"])
+async def test_issued_date_code_letter_case_decides_the_resend(world, answer):
+    body = {"success": False, "error": {"code": "ISSUED_DATE_INVALID", "message": "Synthetic"}}
+    if answer == "2xx_body":
+        # A 2xx may have queued a job: the adapter keeps the provider's upper-case code.
+        error = sepay_provider._not_accepted(SePayResponse(200, body, {}))
+    else:
+        error = map_error(400, body)
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, raises(error))
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    if answer == "2xx_body":
+        assert error.code == "ISSUED_DATE_INVALID"
+        assert world.provider.ops() == ["create"]
+        assert (doc.status, doc.last_error_code, doc.request_authorized_resend) == (
+            "failed",
+            "validation_error",
+            False,
+        )
+        assert (doc.post_count, doc.date_resend_at) == (1, None)
+        assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
+            "code": "ISSUED_DATE_INVALID"
+        }
+    else:
+        assert error.code == "issued_date_invalid"
+        assert world.provider.ops() == ["create", "find_by_reference", "create"]
+        assert (doc.status, doc.post_count) == ("pending_provider", 2)
+        assert doc.date_resend_at is not None
 
 
 async def test_auth_failed_opens_review(world):
