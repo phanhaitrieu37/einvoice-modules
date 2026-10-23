@@ -296,7 +296,10 @@ async def test_crash_after_artifact_put_before_commit(world):
         await world.artifacts()
     doc = await world.doc(settled.document_id)
     assert (doc.status, doc.pdf_uri) == ("issued", None)
+    # The artifact lease covers two downloads, so the crashed claim is not taken over early.
     await restart(world)
+    assert await world.artifacts() == []
+    world.advance(timedelta(seconds=world.config.artifact_lease_seconds))
     [result] = await world.artifacts()
     doc = await assert_converged(world, settled)
     assert result.outcome == "stored" and doc.pdf_uri is not None and doc.xml_sha256 is not None
