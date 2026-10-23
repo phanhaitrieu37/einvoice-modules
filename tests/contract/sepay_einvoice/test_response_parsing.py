@@ -82,6 +82,17 @@ def test_parse_check_pending(synthetic: Loader) -> None:
     assert progress.issued_date is None
 
 
+@pytest.mark.parametrize("status", ["Error", "failed", "FAILED", "success", "Cancelled", "", None])
+def test_parse_check_unknown_status_stays_pending(recorded: Loader, status: object) -> None:
+    body = copy.deepcopy(recorded("check_success.json")["body"])
+    body["data"]["status"] = status
+    body["data"]["message"] = "x"
+    progress = parse_progress(body)
+    assert progress.state == "pending"
+    assert progress.provider_message is None
+    assert progress.invoice_number is None
+
+
 def test_parse_check_success(recorded: Loader) -> None:
     progress = parse_progress(recorded("check_success.json")["body"])
     assert progress.state == "success"
@@ -431,6 +442,16 @@ async def test_provider_fetch_artifacts_returns_pdf_and_xml(
         bad = harness(lambda request, c=content: httpx.Response(200, json={"data": {"content": c}}))
         with pytest.raises(ProviderRejected):
             await bad.provider.fetch_artifacts(account, creds, REFERENCE, "unused")
+    pdf = base64.b64encode(files["pdf"]).decode()
+    for content, code in (("PEhEb24+?!", "artifact_xml_invalid"), ("", "artifact_xml_missing")):
+
+        def strict(request: httpx.Request, c: str = content) -> httpx.Response:
+            data = c if request.url.params["type"] == "xml" else pdf
+            return httpx.Response(200, json={"data": {"content": data}})
+
+        with pytest.raises(ProviderRejected) as raised:
+            await harness(strict).provider.fetch_artifacts(account, creds, REFERENCE, "unused")
+        assert raised.value.code == code
 
 
 async def test_provider_describe_account(

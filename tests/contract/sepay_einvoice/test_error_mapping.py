@@ -126,6 +126,15 @@ def test_422_maps_to_rejected_with_code(recorded: Loader) -> None:
     assert isinstance(no_code, ProviderRejected) and no_code.code == "http_422"
 
 
+@pytest.mark.parametrize("status", [400, 402, 404, 405, 408, 410, 413, 415, 422])
+def test_other_4xx_are_definitive_rejections(status: int) -> None:
+    """4xx other than 401/403/409/429 is a refusal of this request, never retried."""
+    coded = map_error(status, _error("SOME_CODE"))
+    assert type(coded) is ProviderRejected and coded.code == "SOME_CODE"
+    bare = map_error(status, None)
+    assert type(bare) is ProviderRejected and bare.code == f"http_{status}"
+
+
 def test_401_and_403_map_to_auth_failed(recorded: Loader) -> None:
     record = recorded("error_401.json")
     assert isinstance(map_error(record["status"], record["body"]), ProviderAuthFailed)

@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from invoice_module.adapters.sepay import SePayEInvoiceClient, SePayEInvoiceProvider
+from invoice_module.adapters.sepay.client import Response
 from invoice_module.adapters.sepay.rate_limiter import ProcessRateLimiter
 from invoice_module.domain.enums import Environment
 from invoice_module.ports.clock import SystemClock
@@ -510,3 +511,32 @@ async def test_timeouts_are_pinned_per_call_kind(
         ("download", artifact_timeout_s),
     ]
     assert h.client.artifact_timeout_s == artifact_timeout_s
+
+
+def test_decoded_response_repr_leaves_out_body_and_headers() -> None:
+    body = {"data": {"access_token": f"{TOKEN_VALUE}-repr", "buyer": {"name": "Synthetic"}}}
+    response = Response(status=200, body=body, headers={"set-cookie": "synthetic-cookie"})
+    assert repr(response) == "Response(status=200)"
+
+
+@pytest.mark.parametrize(
+    "token_body",
+    [
+        {"success": True, "data": {"expires_in": 86400}},
+        {"success": True, "data": {"access_token": "", "expires_in": 86400}},
+        {"success": True, "data": {"access_token": 7, "expires_in": 86400}},
+        {"success": True, "data": "token"},
+        {"success": True},
+        None,
+    ],
+)
+async def test_token_response_without_a_token_is_an_auth_failure(
+    token_body: object, harness: Callable[..., Any], account: IssuerAccountView, creds: Any
+) -> None:
+    h = harness(
+        lambda request: httpx.Response(200, json={}),
+        token_handler=lambda request: httpx.Response(200, json=token_body),
+    )
+    with pytest.raises(ProviderAuthFailed):
+        await h.provider.check_create(account, creds, REFERENCE)
+    assert [r.url.path for r in h.requests] == ["/v1/token"]
