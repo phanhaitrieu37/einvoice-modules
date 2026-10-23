@@ -443,8 +443,10 @@ async def test_draft_sweep_reaches_document_behind_mismatched_open_drafts(world)
     world.config = InvoiceModuleConfig(batch_size=2)
     world.restart()
     stuck = []
-    for _ in range(2):  # settled at 100 while their open draft still declares 150
-        stuck.append(await world.settle(draft_amount=150))
+    # Settled at 100 while their open draft still declares more or less: each kind alone
+    # would fill the batch if the sweep took it.
+    for amount in (150, 50, 150, 50):
+        stuck.append(await world.settle(draft_amount=amount))
         assert await world.open_reasons(stuck[-1].document_id) == ["AMOUNT_MISMATCH"]
         world.advance(timedelta(seconds=1))
     before = [await world.doc(s.document_id) for s in stuck]
@@ -567,6 +569,32 @@ async def test_recheck_memo_forgets_references_past_their_window(world):
     world.advance(timedelta(minutes=2))
     await escalate(world)
     assert sweep._rechecked_at == {}
+
+
+async def test_recheck_memo_forgets_each_reference_on_its_own(world):
+    settled = await rotated(world)
+    sweep = world.module.escalate_overdue
+    await escalate(world)
+    first = (settled.document_id, settled.reference)
+    assert set(sweep._rechecked_at) == {first}
+    # Twelve hours later the same document retires its second reference as well.
+    world.advance(timedelta(hours=12))
+    second_reference = (await world.doc(settled.document_id)).reference_code
+    world.provider.script_create(second_reference, CONFLICT)
+    await world.issue()
+    assert (await world.doc(settled.document_id)).status == "failed"
+    await world.resolve(
+        settled.document_id,
+        "retry_with_new_reference",
+        note="Reconciled at the portal: no invoice for the second reference",
+    )
+    await escalate(world)
+    second = (settled.document_id, second_reference)
+    assert set(sweep._rechecked_at) == {first, second}
+    # Past the first reference's window only: the second one stays remembered.
+    world.advance(timedelta(hours=12, minutes=1))
+    await escalate(world)
+    assert set(sweep._rechecked_at) == {second}
 
 
 async def test_stale_alert_logs_once_per_entry_but_counts_every_sweep(world, caplog):
