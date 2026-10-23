@@ -1,9 +1,11 @@
+import logging
 from datetime import date, timedelta
 
 import pytest
 from tests.fakes.fake_einvoice_provider import (
     AUTH_FAILED,
     TRANSIENT,
+    FakeInvoice,
     check_rejected,
     failed_invoice,
 )
@@ -331,3 +333,58 @@ async def test_poll_lookup_cancelled_opens_document_existed_unresolved(world):
     assert world.provider.ops() == ["create", "find_by_reference"]
     details = await world.reason_details(settled.document_id, "DOCUMENT_EXISTED_UNRESOLVED")
     assert details == {"provider_state": "cancelled"}
+
+
+async def test_worker_logs_never_include_provider_message(world, caplog):
+    caplog.set_level(logging.DEBUG, logger="invoice_module")
+    messages = {
+        "poll_failed": "Tổng hợp 1: hoá đơn bị từ chối ở bước xử lý.",
+        "lookup_failed": "Tổng hợp 2: bản ghi lỗi tra theo reference",
+        "conflict_lookup": "Tổng hợp 3: 409 rồi tra cứu",
+        "unconfirmed": UNCONFIRMED_MESSAGE,
+    }
+    documents = {}
+    poll_failed = await world.settle()
+    world.provider.new_invoice(
+        poll_failed.reference, final_state="failed", message=messages["poll_failed"]
+    )
+    documents["poll_failed"] = poll_failed
+    lookup_failed = await world.settle()
+    world.provider.script_create(lookup_failed.reference, TRANSIENT)
+    documents["lookup_failed"] = lookup_failed
+    conflict = await world.settle()
+    world.provider.seed_invoice(
+        FakeInvoice(
+            conflict.reference,
+            None,
+            None,
+            state="failed",
+            provider_message=messages["conflict_lookup"],
+        )
+    )
+    documents["conflict_lookup"] = conflict
+    unconfirmed = await world.settle()
+    documents["unconfirmed"] = unconfirmed
+    await world.issue()
+    world.provider.script_lookup(
+        lookup_failed.reference, failed_invoice(lookup_failed.reference, messages["lookup_failed"])
+    )
+    world.provider.unconfirmed(unconfirmed.reference, "pending", message=messages["unconfirmed"])
+    world.past_lease()
+    await world.issue()
+    await world.poll()
+    for name, settled in documents.items():
+        doc = await world.doc(settled.document_id)
+        assert doc.status == "failed", name
+    records = [r for r in caplog.records if r.name.startswith("invoice_module")]
+    for record in records:
+        text = record.getMessage() + " ".join(str(value) for value in vars(record).values())
+        assert not any(message in text for message in messages.values()), record.msg
+    lengths = {
+        record.document_id: record.provider_message_length
+        for record in records
+        if record.msg == "invoice_document_failed"
+    }
+    assert lengths == {
+        str(settled.document_id): len(messages[name]) for name, settled in documents.items()
+    }
