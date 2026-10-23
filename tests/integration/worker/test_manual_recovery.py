@@ -316,7 +316,9 @@ async def test_stale_hash_rebuilds_request_and_reapproval_sends_new_content(worl
     await world.issue()
     [post] = world.provider.posts()
     assert post.payload["buyer"] == {"name": "Buyer B", "address": "Street B"}
-    assert [(item["name"], item["unit"]) for item in post.payload["items"]] == [("Item B", "box")]
+    assert [(item["item_name"], item["unit"]) for item in post.payload["items"]] == [
+        ("Item B", "box")
+    ]
     assert post.payload == (await world.doc(settled.document_id)).request
 
 

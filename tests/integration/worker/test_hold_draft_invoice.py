@@ -149,7 +149,7 @@ async def test_corrected_content_after_hold_requires_fresh_approval(world):
         None,
         settled.reference,
     )
-    assert doc.request["items"][0]["name"] == "Corrected item"
+    assert doc.request["items"][0]["item_name"] == "Corrected item"
     [case] = await world.cases(settled.document_id)
     assert [entry["approved_by"] for entry in case.details["previous_approvals"]] == [
         "accountant-a"

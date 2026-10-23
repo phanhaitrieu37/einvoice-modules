@@ -963,7 +963,7 @@ async def test_attach_draft_on_failed_grants_exactly_one_post(world):
     await run_claims(world, times=4, step=timedelta(minutes=5))
     doc = await world.doc(settled.document_id)
     assert len(world.provider.posts()) == 3
-    assert world.provider.posts()[-1].payload["items"][0]["name"] == "Corrected"
+    assert world.provider.posts()[-1].payload["items"][0]["item_name"] == "Corrected"
     assert (doc.status, doc.last_error_code) == ("failed", "max_attempts_exceeded")
     # A held draft was never sent: its correction keeps the default budget.
     held_doc = await held(world)

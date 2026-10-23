@@ -2,7 +2,9 @@
 
 Every create issues in one step (a provider draft is never requested). The provider records the
 issue date sent in the request and refuses a date earlier than its own Asia/Saigon date at the
-moment it receives the request, as the sandbox did with ``400 ISSUED_DATE_INVALID``.
+moment it receives the request, as the sandbox did with ``400 ISSUED_DATE_INVALID``. Create
+requests are built by the SePay adapter's own payload builder, so a frozen request has the shape
+the provider receives.
 
 Counting: ``calls`` holds one entry per transport request (a POST that reached the provider,
 whatever its answer) and per read; ``effective_creates`` counts invoices that really exist at the
@@ -21,6 +23,7 @@ from typing import Any
 
 from tests.fakes.recording import Crash
 
+from invoice_module.adapters.sepay.payload import build_create_payload
 from invoice_module.application.config import today_vn
 from invoice_module.domain.document import InvoiceDocument
 from invoice_module.ports.provider import (
@@ -38,13 +41,6 @@ from invoice_module.ports.provider import (
     QuotaExhausted,
     SendAborted,
 )
-
-try:  # The adapter payload is used when it exists; this fake never depends on it.
-    from invoice_module.adapters.sepay.payload import (  # type: ignore[import-not-found]
-        build_create_payload as _adapter_build_create_payload,
-    )
-except ImportError:  # pragma: no cover - depends on which phases are merged
-    _adapter_build_create_payload = None
 
 # Outcomes of one create, in the order a test scripts them.
 ACCEPT = "accept"
@@ -215,24 +211,7 @@ class FakeEInvoiceProvider:
         reference_code: str,
         issued_date: date,
     ) -> dict[str, object]:
-        if _adapter_build_create_payload is not None:
-            payload = _adapter_build_create_payload(account, doc, reference_code, issued_date)
-        else:
-            payload = {
-                "reference_code": reference_code,
-                "is_draft": False,
-                "template_code": account.template_code,
-                "invoice_series": account.invoice_series_template.replace(
-                    "{YY}", f"{issued_date.year % 100:02d}"
-                ),
-                "issued_date": issued_date.isoformat(),
-                "payment_method": account.payment_method,
-                "currency": doc.currency,
-                "buyer": dict(doc.buyer),
-                "items": [dict(line) for line in doc.lines],
-                "total_amount": doc.total_vnd,
-                "notes": doc.notes,
-            }
+        payload = build_create_payload(account, doc, reference_code, issued_date)
         self._built[_canonical(payload)] = (doc.total_vnd, issued_date)
         return payload
 
