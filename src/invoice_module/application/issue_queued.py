@@ -275,7 +275,8 @@ class IssueQueued:
         """The issue date would differ from the settlement date (or from the frozen request).
 
         ``after_date_rejection``: the provider refused the earlier POST for its date, a
-        definitive answer, so any permission to resend that POST is spent.
+        definitive answer, so any permission to resend that POST is spent; the details record
+        which POST of the reference it was.
         """
         action = account.issue_date_cross_day_action
         if action != CrossDayAction.ISSUE and not await self._cross_day_confirmed(document):
@@ -290,6 +291,7 @@ class IssueQueued:
             values: dict[str, Any] = {}
             if after_date_rejection:
                 details["after_date_rejection"] = True
+                details["post_count"] = document.post_count
                 values["request_authorized_resend"] = False
             async with self._uow_factory() as uow:
                 state.ensure_transition(document.status, DocumentStatus.BLOCKED)
@@ -569,12 +571,13 @@ class IssueQueued:
         if current.post_count < 2:
             return "operator_grant_used"
         async with self._uow_factory() as uow:
+            # Only the POST right before this one counts: any POST in between may be unanswered.
             rejected_before = await uow.review_cases.reason_recorded(
                 current.id,
                 ReviewReason.ISSUE_DATE_CROSSED_DAY.value,
-                {"after_date_rejection": True},
+                {"after_date_rejection": True, "post_count": current.post_count - 1},
             )
-        # Otherwise an earlier POST of this reference has no recorded answer.
+        # Otherwise the POST before this one has no recorded answer.
         return "earlier_post_rejected" if rejected_before else "earlier_post_unrecorded"
 
     async def _date_resend_conflict(

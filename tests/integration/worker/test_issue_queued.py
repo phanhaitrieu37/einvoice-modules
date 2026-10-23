@@ -915,7 +915,7 @@ async def test_date_rejection_after_cross_day_block_and_retry_names_the_recorded
     doc = await world.doc(settled.document_id)
     assert (doc.status, doc.post_count, doc.request_authorized_resend) == ("blocked", 1, False)
     details = await world.reason_details(settled.document_id, "ISSUE_DATE_CROSSED_DAY")
-    assert details["after_date_rejection"] is True
+    assert (details["after_date_rejection"], details["post_count"]) == (True, 1)
     await world.resolve(settled.document_id, "retry")
     world.provider.script_create(settled.reference, rejected("issued_date_invalid"))
     await world.issue()
@@ -934,6 +934,65 @@ async def test_date_rejection_after_cross_day_block_and_retry_names_the_recorded
         "date_resend_skipped": "earlier_post_rejected",
         "post_count": 2,
         "post_limit": 2,
+    }
+
+
+@pytest.mark.parametrize("history", ["plain_cross_day_block", "unrecorded_post_between"])
+async def test_date_rejection_names_an_earlier_rejection_only_for_the_post_just_before(
+    world, history
+):
+    await world.set_cross_day("review")
+    if history == "plain_cross_day_block":
+        # POST 1 goes unanswered before midnight; the reclaim after midnight blocks on the date.
+        world.clock.set(vn(2026, 10, 21, 23, 59))
+        settled = await world.settle()
+        world.provider.script_create(settled.reference, TRANSIENT)
+        await world.issue()
+        world.clock.set(vn(2026, 10, 22, 0, 5))
+    else:
+        # POST 1 is refused for its date, then the operator's POST 2 goes unanswered.
+        world.clock.set(vn(2026, 10, 21, 23, 59, 59, 900_000))
+        settled = await world.settle()
+        world.provider.receive_delay(settled.reference, timedelta(milliseconds=200))
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.post_count) == ("blocked", 1)
+    block = await world.reason_details(settled.document_id, "ISSUE_DATE_CROSSED_DAY")
+    if history == "plain_cross_day_block":
+        assert "after_date_rejection" not in block and "post_count" not in block
+    else:
+        assert (block["after_date_rejection"], block["post_count"]) == (True, 1)
+    await world.resolve(settled.document_id, "retry")
+    if history == "unrecorded_post_between":
+        world.provider.script_create(settled.reference, TRANSIENT)
+        await world.issue()
+        world.past_lease()
+        await world.issue()
+        doc = await world.doc(settled.document_id)
+        assert (doc.status, doc.last_error_code, doc.post_count) == (
+            "failed",
+            "max_attempts_exceeded",
+            2,
+        )
+        await world.resolve(settled.document_id, "retry")
+    world.provider.script_create(settled.reference, rejected("issued_date_invalid"))
+    await world.issue()
+    for _ in range(4):
+        world.past_lease()
+        await world.issue()
+    doc = await world.doc(settled.document_id)
+    rejected_post = 2 if history == "plain_cross_day_block" else 3
+    assert len(world.provider.posts(settled.reference)) == rejected_post
+    assert (doc.status, doc.last_error_code, doc.date_resend_at) == (
+        "failed",
+        "issued_date_invalid",
+        None,
+    )
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
+        "code": "issued_date_invalid",
+        "date_resend_skipped": "earlier_post_unrecorded",
+        "post_count": rejected_post,
+        "post_limit": rejected_post,
     }
 
 
