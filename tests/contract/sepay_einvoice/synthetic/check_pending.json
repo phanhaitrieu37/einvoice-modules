@@ -1,0 +1,17 @@
+{
+  "_synthetic": "Hand-built, not recorded (the sandbox never returned Pending). Shape from the docs schema CreateInvoiceStatusResponse with InvoiceRetryProgress (next_retry_at is 'Y-m-d H:i:s', Vietnam time).",
+  "status": 200,
+  "body": {
+    "success": true,
+    "data": {
+      "reference_code": "00000000-0000-4000-8000-0000000000f2",
+      "status": "Pending",
+      "message": "Đang xử lý",
+      "retry": {
+        "retries_count": 1,
+        "max_retries": 7,
+        "next_retry_at": "2026-10-20 15:12:30"
+      }
+    }
+  }
+}

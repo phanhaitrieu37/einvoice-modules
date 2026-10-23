@@ -41,7 +41,8 @@ class Accepted:
 
 # "draft" is defensive only: invoices are always created and issued in one step, so a
 # draft under one of our references is an anomaly the caller sends to review.
-ProviderState = Literal["pending", "success", "failed", "draft"]
+# "cancelled" is a lookup result: the provider reports the invoice as cancelled.
+ProviderState = Literal["pending", "success", "failed", "draft", "cancelled"]
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,10 @@ class AccountFacts:
     templates: tuple[str, ...]
     series: tuple[str, ...]
     quota_remaining: int | None = None
+    # Provider account status: only an active account may issue, and the provider refuses
+    # an issue date before the tax authority approval date (``None`` when not reported).
+    active: bool | None = None
+    tax_authority_approved_date: date | None = None
 
 
 class EInvoiceProvider(Protocol):

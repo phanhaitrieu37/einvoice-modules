@@ -1,0 +1,41 @@
+{
+  "_recorded": "Sandbox one-step create of the e2e line with quantity 1.5 sent as the JSON string \"1.5\", 2026-10-23 (one create); identifiers replaced by a placeholder, buyer synthetic and not recorded.",
+  "body": {
+    "data": {
+      "message": "Đã tạo yêu cầu xuất hóa đơn điện tử",
+      "tracking_code": "00000000-0000-4000-8000-000000000001",
+      "tracking_url": "https://einvoice-api-sandbox.sepay.vn/v1/invoices/create/check/00000000-0000-4000-8000-000000000001"
+    },
+    "success": true
+  },
+  "check_final_state": "success",
+  "headers": {
+    "content-length": null,
+    "content-type": "application/json; charset=UTF-8"
+  },
+  "lookup": {
+    "items": [
+      {
+        "quantity": "1.50",
+        "total_amount": "592020.00",
+        "unit_price": "358800.00"
+      }
+    ],
+    "total_amount": 592020
+  },
+  "request_item": {
+    "before_discount_and_tax_amount": 538200,
+    "discount_amount": 0,
+    "item_code": "SANDBOX-PHOTOSHOP",
+    "item_name": "Photoshop",
+    "line_number": 1,
+    "line_type": 1,
+    "quantity": "1.5",
+    "tax_amount": 53820,
+    "tax_rate": 10,
+    "unit": "Tháng",
+    "unit_price": 358800
+  },
+  "request_total_amount": 592020,
+  "status": 202
+}
