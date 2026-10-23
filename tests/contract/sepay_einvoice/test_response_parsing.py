@@ -1,6 +1,7 @@
 import base64
 import copy
 import json
+import time
 from collections.abc import Callable
 from datetime import date, datetime
 from decimal import Decimal
@@ -37,7 +38,9 @@ pytestmark = pytest.mark.contract
 
 RECORDED = Path(__file__).parents[2] / "fixtures" / "sepay_einvoice"
 Loader = Callable[[str], dict[str, Any]]
-REFERENCE = "00000000-0000-4000-8000-00000000c0de"
+# The reference of the recorded create and check (``create_accepted.json``,
+# ``check_success.json``): the tracking code equals the reference.
+REFERENCE = "8f3e0182-dcd9-42b5-aed2-6dd5f194f1cb"
 
 
 def _detail_body(recorded: Loader) -> dict[str, Any]:
@@ -80,6 +83,15 @@ def test_parse_check_pending(synthetic: Loader) -> None:
     )
     assert progress.invoice_number is None
     assert progress.issued_date is None
+
+
+@pytest.mark.parametrize("value", ["2026-10-23 25:00:00", "2026-02-30 10:00:00", "soon", 5])
+def test_parse_check_unreadable_next_retry_at_is_none(synthetic: Loader, value: object) -> None:
+    body = copy.deepcopy(synthetic("check_pending.json")["body"])
+    body["data"]["retry"]["next_retry_at"] = value
+    progress = parse_progress(body)
+    assert progress.state == "pending"
+    assert progress.next_retry_at is None
 
 
 @pytest.mark.parametrize("status", ["Error", "failed", "FAILED", "success", "Cancelled", "", None])
@@ -262,6 +274,11 @@ def test_tax_authority_code_is_carried_through(recorded: Loader) -> None:
 
 
 UNCONFIRMED = "Hệ thống chưa xác nhận được kết quả phát hành với nhà cung cấp hóa đơn"
+# The ``message`` of the docs example ``failed_unverified`` (page
+# ``theo-doi-trang-thai-xuat-hoa-don``), verbatim.
+UNCONFIRMED_DOCS_EXAMPLE = (
+    f"{UNCONFIRMED}. Vui lòng không phát hành lại và liên hệ SePay để được kiểm tra."
+)
 
 
 @pytest.mark.parametrize(
@@ -270,7 +287,11 @@ UNCONFIRMED = "Hệ thống chưa xác nhận được kết quả phát hành v
         ("Failed", UNCONFIRMED, "provider_unconfirmed"),
         ("Failed", f"  {UNCONFIRMED}\n", "provider_unconfirmed"),
         ("Pending", UNCONFIRMED, "provider_unconfirmed"),
-        ("Failed", f"{UNCONFIRMED}.", None),
+        ("Failed", f"{UNCONFIRMED}.", "provider_unconfirmed"),
+        ("Failed", f" {UNCONFIRMED}. Liên hệ SePay. ", "provider_unconfirmed"),
+        ("Failed", f"{UNCONFIRMED} đã phát hành", None),
+        ("Failed", f"{UNCONFIRMED}, vui lòng chờ", None),
+        ("Failed", f"{UNCONFIRMED}x", None),
         ("Failed", f"Lỗi: {UNCONFIRMED}", None),
         ("Failed", UNCONFIRMED.replace("hóa", "hoá"), None),
         ("Failed", UNCONFIRMED.upper(), None),
@@ -283,7 +304,7 @@ UNCONFIRMED = "Hệ thống chưa xác nhận được kết quả phát hành v
 def test_parse_check_unconfirmed_message_sets_error_code(
     recorded: Loader, status: str, message: str | None, error_code: str | None
 ) -> None:
-    """Docs: this exact message means the outcome is unknown and the request is not resent."""
+    """Docs: this sentence means the outcome is unknown and the request is not resent."""
     body = copy.deepcopy(recorded("check_success.json")["body"])
     body["data"]["status"] = status
     body["data"]["message"] = message
@@ -291,6 +312,22 @@ def test_parse_check_unconfirmed_message_sets_error_code(
     assert progress.error_code == error_code
     if status == "Failed":
         assert progress.provider_message == message
+
+
+def test_parse_check_unconfirmed_docs_example_sets_error_code() -> None:
+    """The docs example of a stopped job the provider has not confirmed."""
+    body = {
+        "success": True,
+        "data": {
+            "reference_code": REFERENCE,
+            "status": "Failed",
+            "message": UNCONFIRMED_DOCS_EXAMPLE,
+        },
+    }
+    progress = parse_progress(body)
+    assert progress.state == "failed"
+    assert progress.error_code == "provider_unconfirmed"
+    assert progress.provider_message == UNCONFIRMED_DOCS_EXAMPLE
 
 
 # --- provider over a replayed transport -------------------------------------------------
@@ -438,11 +475,19 @@ async def test_provider_fetch_artifacts_returns_pdf_and_xml(
     downloads = h.calls("/download")
     assert [r.url.path for r in downloads] == [f"/v1/invoices/{REFERENCE}/download"] * 2
     assert [r.url.params["type"] for r in downloads] == ["pdf", "xml"]
-    for content in ("not base64!", "SGVsbG8=?!", "", "\n"):
+    for content in ("not base64!", "SGVsbG8=?!", "", "\n", "\r\n"):
         bad = harness(lambda request, c=content: httpx.Response(200, json={"data": {"content": c}}))
         with pytest.raises(ProviderRejected):
             await bad.provider.fetch_artifacts(account, creds, REFERENCE, "unused")
     pdf = base64.b64encode(files["pdf"]).decode()
+    wrapped = harness(
+        lambda request: httpx.Response(
+            200, json={"data": {"content": pdf[:8] + "\r\n" + pdf[8:] + "\n"}}
+        )
+    )
+    assert (await wrapped.provider.fetch_artifacts(account, creds, REFERENCE, "u")).pdf == files[
+        "pdf"
+    ]
     for content, code in (("PEhEb24+?!", "artifact_xml_invalid"), ("", "artifact_xml_missing")):
 
         def strict(request: httpx.Request, c: str = content) -> httpx.Response:
@@ -544,7 +589,17 @@ CREATE_FAILURES = {
     "timeout": (_raise(httpx.ReadTimeout("slow")), ProviderTransient, False),
     "5xx": (lambda r: httpx.Response(503, json={}), ProviderTransient, False),
     "connect_error": (_raise(httpx.ConnectError("down")), ProviderTransient, False),
+    "202_corrupt_gzip": (lambda r: _corrupt_gzip(202), ProviderTransient, False),
+    "500_error_as_text": (
+        lambda r: httpx.Response(500, json={"error": "boom"}),
+        ProviderTransient,
+        False,
+    ),
 }
+
+
+def _corrupt_gzip(status: int) -> httpx.Response:
+    return httpx.Response(status, headers={"content-encoding": "gzip"}, content=b"not gzip")
 
 
 def _unauthorized() -> httpx.Response:
@@ -618,7 +673,14 @@ NOT_ACCEPTED = {
             202, json={"success": False, "error": {"code": "ISSUED_DATE_INVALID"}}
         ),
         ProviderRejected,
-        "issued_date_invalid",
+        "ISSUED_DATE_INVALID",
+    ),
+    "200_success_true_issued_date": (
+        lambda: httpx.Response(
+            200, json={"success": True, "error": {"code": "ISSUED_DATE_INVALID"}}
+        ),
+        ProviderRejected,
+        "ISSUED_DATE_INVALID",
     ),
     "200_quota_code": (
         lambda: httpx.Response(
@@ -637,6 +699,16 @@ NOT_ACCEPTED = {
     ),
     "202_success_true_without_tracking": (
         lambda: httpx.Response(202, json={"success": True, "data": {"message": "x"}}),
+        ProviderTransient,
+        None,
+    ),
+    "202_success_true_data_list": (
+        lambda: httpx.Response(202, json={"success": True, "data": ["x"]}),
+        ProviderTransient,
+        None,
+    ),
+    "202_success_true_data_text": (
+        lambda: httpx.Response(202, json={"success": True, "data": "x"}),
         ProviderTransient,
         None,
     ),
@@ -687,6 +759,151 @@ async def test_provider_create_accepts_success_with_tracking_code(
     assert accepted.tracking_code == body["data"]["tracking_code"]
 
 
+@pytest.mark.parametrize("tracking", ["other-ref", " ", f"{REFERENCE} ", REFERENCE.upper()])
+async def test_create_tracking_code_other_than_the_reference_is_transient(
+    tracking: str, harness: Callable[..., Any], account: IssuerAccountView, creds: Any
+) -> None:
+    """Docs: the tracking code is also the reference code of the new invoice."""
+    body = {"success": True, "data": {"tracking_code": tracking}}
+    h = harness(lambda request: httpx.Response(202, json=body))
+    hooks = 0
+
+    async def hook() -> bool:
+        nonlocal hooks
+        hooks += 1
+        return True
+
+    with pytest.raises(ProviderTransient) as raised:
+        await h.provider.create(account, creds, {"reference_code": REFERENCE}, before_send=hook)
+    assert raised.value.retry_after is None
+    assert hooks == 1
+    assert len(h.calls("/v1/invoices/create", "POST")) == 1
+
+
+@pytest.mark.parametrize("returned", ["other-ref", " ", "", 5, f"{REFERENCE} "])
+async def test_check_of_another_reference_is_transient(
+    returned: object,
+    harness: Callable[..., Any],
+    recorded: Loader,
+    account: IssuerAccountView,
+    creds: Any,
+) -> None:
+    body = copy.deepcopy(recorded("check_success.json")["body"])
+    body["data"]["reference_code"] = returned
+    h = harness(lambda request: httpx.Response(200, json=body))
+    with pytest.raises(ProviderTransient):
+        await h.provider.check_create(account, creds, REFERENCE)
+    del body["data"]["reference_code"]
+    assert (await h.provider.check_create(account, creds, REFERENCE)).state == "success"
+
+
+@pytest.mark.parametrize("call", ["check", "lookup"])
+async def test_success_false_on_check_or_lookup_is_transient(
+    call: str,
+    harness: Callable[..., Any],
+    recorded: Loader,
+    account: IssuerAccountView,
+    creds: Any,
+) -> None:
+    """An error envelope in a 200 is not a job or an invoice, whatever its ``data`` says."""
+    name = "check_success.json" if call == "check" else "get_by_reference.json"
+    body = copy.deepcopy(recorded(name)["body"])
+    reference = body["data"]["reference_code"]
+    body["success"] = False
+    body["error"] = {"code": "INTERNAL_SERVER_ERROR", "message": "x"}
+    h = harness(lambda request: httpx.Response(200, json=body))
+    read = h.provider.check_create if call == "check" else h.provider.find_by_reference
+    with pytest.raises(ProviderTransient):
+        await read(account, creds, reference)
+    body["success"] = True
+    assert (await read(account, creds, reference)).state == "success"
+
+
+def _with_number(body: Any, path: str, number: str) -> bytes:
+    """``body`` as JSON bytes with the raw JSON token ``number`` at the dotted ``path``."""
+    body = copy.deepcopy(body)
+    *parents, key = path.split(".")
+    node = body
+    for parent in parents:
+        node = node[parent]
+    node[key] = "__NUMBER__"
+    return json.dumps(body).replace('"__NUMBER__"', number).encode()
+
+
+def _number_calls(recorded: Loader) -> dict[str, tuple[dict[str, Any], str]]:
+    return {
+        "create": (
+            {"success": True, "data": {"tracking_code": REFERENCE, "total_amount": 0}},
+            "data.total_amount",
+        ),
+        "check": (recorded("check_success.json")["body"], "data.invoice.total_amount"),
+        "lookup": (recorded("get_by_reference.json")["body"], "data.total_amount"),
+        "usage": (recorded("quota.json")["body"], "data.quota_remaining"),
+    }
+
+
+async def _call_with_number(
+    call: str, number: str, recorded: Loader, harness: Callable[..., Any], account: Any, creds: Any
+) -> Any:
+    body, path = _number_calls(recorded)[call]
+    raw = _with_number(body, path, number)
+    detail = _detail_body(recorded)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/v1/provider-accounts/"):
+            return httpx.Response(200, json=detail)
+        return httpx.Response(200, content=raw, headers={"content-type": "application/json"})
+
+    h = harness(handler)
+    if call == "create":
+        return await h.provider.create(account, creds, {"reference_code": REFERENCE})
+    if call == "check":
+        return await h.provider.check_create(account, creds, REFERENCE)
+    if call == "lookup":
+        reference = recorded("get_by_reference.json")["body"]["data"]["reference_code"]
+        return await h.provider.find_by_reference(account, creds, reference)
+    return await h.provider.describe_account(account, creds)
+
+
+@pytest.mark.parametrize(
+    "number",
+    ["NaN", "Infinity", "-Infinity", "1e1000000", "1e999999999999999999", "1e9999999999999999999"],
+)
+@pytest.mark.parametrize("call", ["create", "check", "lookup", "usage"])
+async def test_non_finite_or_huge_json_number_is_transient_and_fast(
+    call: str,
+    number: str,
+    recorded: Loader,
+    harness: Callable[..., Any],
+    account: IssuerAccountView,
+    creds: Any,
+) -> None:
+    started = time.perf_counter()
+    with pytest.raises(ProviderTransient) as raised:
+        await _call_with_number(call, number, recorded, harness, account, creds)
+    assert time.perf_counter() - started < 2
+    assert raised.value.retry_after is None
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+async def test_json_numbers_are_read_as_decimal_never_float(
+    recorded: Loader, harness: Callable[..., Any], account: IssuerAccountView, creds: Any
+) -> None:
+    """A JSON fraction is a ``Decimal``: whole values are read, fractions never guessed."""
+    lookup = await _call_with_number("lookup", "1080.0", recorded, harness, account, creds)
+    assert lookup.total_amount_vnd == 1080
+    lookup = await _call_with_number("lookup", "1080.5", recorded, harness, account, creds)
+    assert lookup.total_amount_vnd is None
+    facts = await _call_with_number("usage", "999.0", recorded, harness, account, creds)
+    assert facts.quota_remaining == 999
+    facts = await _call_with_number("usage", "1e3", recorded, harness, account, creds)
+    assert facts.quota_remaining == 1000
+    facts = await _call_with_number("usage", "999.5", recorded, harness, account, creds)
+    assert facts.quota_remaining is None
+    with pytest.raises(ProviderTransient):
+        await _call_with_number("lookup", "NaN", recorded, harness, account, creds)
+
+
 async def test_deeply_nested_json_body_is_transient_not_recursion_error(
     harness: Callable[..., Any], account: IssuerAccountView, creds: Any
 ) -> None:
@@ -727,7 +944,8 @@ async def test_path_segments_are_percent_encoded(
     account: IssuerAccountView,
     creds: Any,
 ) -> None:
-    success = recorded("check_success.json")["body"]
+    success = copy.deepcopy(recorded("check_success.json")["body"])
+    success["data"]["reference_code"] = value
     h = harness(lambda request: httpx.Response(200, json=success))
     await h.provider.check_create(account, creds, value)
     path = h.calls("/check/")[0].url.raw_path.decode()
@@ -753,10 +971,24 @@ async def test_provider_account_listing_reads_one_full_page(
     request = h.calls("/v1/provider-accounts")[0]
     assert request.url.path == "/v1/provider-accounts"
     assert dict(request.url.params) == {"per_page": "100"}
+    listing["data"]["paging"]["has_more"] = "false"
+    text = harness(lambda request: httpx.Response(200, json=listing))
+    assert len(await text.provider.provider_account_ids(account)) == 1
     listing["data"]["paging"]["has_more"] = True
     more = harness(lambda request: httpx.Response(200, json=listing))
     with pytest.raises(ProviderConfigError):
         await more.provider.provider_account_ids(account)
+
+
+@pytest.mark.parametrize(
+    "items", [None, "x", [{"active": True, "id": {"x": 1}}, {"active": True, "id": 1.5}]]
+)
+async def test_provider_account_listing_takes_only_text_ids(
+    items: object, harness: Callable[..., Any], account: IssuerAccountView
+) -> None:
+    listing = {"success": True, "data": {"items": items}}
+    h = harness(lambda request: httpx.Response(200, json=listing))
+    assert await h.provider.provider_account_ids(account) == ()
 
 
 def _artifact(kind: str, content: bytes, file_type: str | None = None) -> dict[str, Any]:
@@ -790,15 +1022,43 @@ async def test_artifact_type_and_pdf_header_are_checked(
 
 def test_provider_amounts_and_numbers_are_never_guessed(recorded: Loader) -> None:
     body = copy.deepcopy(recorded("get_by_reference.json")["body"])
-    for total in ("1080.50", "1080.5", Decimal("1080.5"), "NaN", "abc", True):
+    refused = (
+        *("1080.50", "1080.5", Decimal("1080.5"), "NaN", "abc", True),
+        *("Infinity", Decimal("Infinity"), Decimal("-Infinity"), Decimal("NaN")),
+        *("1e3", "1e1000000", "1e999999999999999999", Decimal("1E+1000000")),
+        *("+1080", " 1080 ", "1_080", "\u0661\u0660\u0668\u0660", "1080.", ".5"),
+    )
+    started = time.perf_counter()
+    for total in refused:
         body["data"]["total_amount"] = total
         assert _lookup(body).total_amount_vnd is None
-    for total, expected in (("1080.00", 1080), (Decimal("1080"), 1080), (1080, 1080)):
+    assert time.perf_counter() - started < 2
+    for total, expected in (
+        ("1080.00", 1080),
+        (Decimal("1080"), 1080),
+        (1080, 1080),
+        ("-1080", -1080),
+        (Decimal("1E+3"), 1000),
+    ):
         body["data"]["total_amount"] = total
         assert _lookup(body).total_amount_vnd == expected
     for number in (" 0", "0 ", "0", "", None):
         body["data"]["invoice_number"] = number
         assert _lookup(body).invoice_number is None
+
+
+def test_parse_account_facts_skips_templates_without_both_codes(recorded: Loader) -> None:
+    detail = copy.deepcopy(_detail_body(recorded))
+    detail["data"]["templates"] += [
+        {"invoice_series": "C26TXX"},
+        {"template_code": "3"},
+        {"template_code": None, "invoice_series": "C26TYY"},
+        {"template_code": "", "invoice_series": "C26TZZ"},
+        "4",
+    ]
+    facts = parse_account_facts("acc", detail, None)
+    assert facts.templates == ("1", "2")
+    assert facts.series == ("C26TSE", "C26TSE")
 
 
 def test_parse_account_facts_reads_activation_and_approval_date(recorded: Loader) -> None:

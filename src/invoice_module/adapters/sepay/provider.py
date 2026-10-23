@@ -9,7 +9,7 @@ from urllib.parse import quote
 from invoice_module.adapters.sepay import payload
 from invoice_module.adapters.sepay.client import Response, SePayEInvoiceClient
 from invoice_module.adapters.sepay.endpoints import ENDPOINTS, PROVIDER_ACCOUNT_DETAIL, endpoint
-from invoice_module.adapters.sepay.errors import error_code, map_error
+from invoice_module.adapters.sepay.errors import ISSUED_DATE_INVALID, error_code, map_error
 from invoice_module.domain.document import InvoiceDocument
 from invoice_module.ports.provider import (
     Accepted,
@@ -64,7 +64,9 @@ class SePayEInvoiceProvider:
 
         Only ``success: true`` with a tracking code is an acceptance. Any other 2xx is an
         error: a provider error code maps like an error response, and a body without one
-        (HTML, empty, 204) is transient, so the caller looks the reference up first.
+        (HTML, empty, 204) is transient, so the caller looks the reference up first. The
+        tracking code "đồng thời là reference_code của hóa đơn mới" (create docs); any other
+        code is an unclear answer (transient), never an acceptance of this request.
         """
         method, path = endpoint("create")
         response = await self._client.request(
@@ -73,15 +75,22 @@ class SePayEInvoiceProvider:
         accepted = payload.parse_accepted(response.body)
         if accepted is None:
             raise _not_accepted(response)
+        if accepted.tracking_code != request.get("reference_code"):
+            raise ProviderTransient(retry_after=None)
         return accepted
 
     async def check_create(
         self, account: IssuerAccountView, creds: ClientCredentials, tracking_code: str
     ) -> ProviderProgress:
+        """The job of ``tracking_code``; an error envelope or a job of another reference is
+        an unclear answer."""
         method, template = endpoint("check_create")
         response = await self._client.request(
             method, _path(template, tracking_code=tracking_code), account=account, creds=creds
         )
+        returned = payload.response_data(response.body).get("reference_code")
+        if _is_failure(response.body) or (returned is not None and returned != tracking_code):
+            raise ProviderTransient(retry_after=None)
         return payload.parse_progress(response.body)
 
     async def find_by_reference(
@@ -104,6 +113,8 @@ class SePayEInvoiceProvider:
         if response.status == NOT_FOUND:
             if _is_error_envelope(response.body):
                 return None
+            raise ProviderTransient(retry_after=None)
+        if _is_failure(response.body):
             raise ProviderTransient(retry_after=None)
         return payload.parse_invoice(response.body, reference_code)
 
@@ -154,9 +165,12 @@ class SePayEInvoiceProvider:
             )
         items = data.get("items")
         return tuple(
-            str(item["id"])
+            item["id"]
             for item in (items if isinstance(items, list) else [])
-            if isinstance(item, Mapping) and item.get("id") and item.get("active") is True
+            if isinstance(item, Mapping)
+            and isinstance(item.get("id"), str)
+            and item["id"]
+            and item.get("active") is True
         )
 
     async def describe_account(
@@ -192,16 +206,27 @@ class SePayEInvoiceProvider:
         raise NotImplementedError("v0.2")
 
 
+def _is_failure(body: object) -> bool:
+    return isinstance(body, Mapping) and body.get("success") is False
+
+
 def _is_error_envelope(body: object) -> bool:
-    return (
-        isinstance(body, Mapping) and body.get("success") is False and error_code(body) is not None
-    )
+    return _is_failure(body) and error_code(body) is not None
 
 
 def _not_accepted(response: Response) -> ProviderError:
-    if error_code(response.body) is not None:
-        return map_error(max(response.status, 400), response.body, response.headers)
-    return ProviderTransient(retry_after=None)
+    """The error of a 2xx create that is not an acceptance.
+
+    The date rejection the caller answers with one resend is the synchronous 400 only; a
+    2xx may have queued a job, so its ``ISSUED_DATE_INVALID`` keeps the provider code and
+    goes to review like any other rejection.
+    """
+    code = error_code(response.body)
+    if code is None:
+        return ProviderTransient(retry_after=None)
+    if code == ISSUED_DATE_INVALID:
+        return ProviderRejected(code)
+    return map_error(max(response.status, 400), response.body, response.headers)
 
 
 def _decode_artifact(body: object, kind: str) -> bytes:

@@ -11,7 +11,9 @@ the request; a document whose outcome is unclear stays for the operator to recon
 its reference is never changed here.
 
 The access token travels only inside ``_Token`` and ``_BearerAuth``, whose reprs hide it, so
-no frame argument or local of a failure traceback shows it. Logs carry the method, path,
+no frame argument or local of a failure traceback shows it. Only a token of the RFC 6750
+grammar is used, and a refused request header ends in a port error without the library
+error chained, because that error's message quotes the header. Logs carry the method, path,
 HTTP status, ``error.code``, ``data.status`` and the length of the provider message, never a
 body or provider text (the full message is kept by the caller, not logged here).
 
@@ -21,16 +23,18 @@ a request really goes, so the sandbox guard here checks the configured base URLs
 
 import json
 import logging
+import re
 from collections.abc import Generator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 
 from invoice_module.adapters.sepay.endpoints import SANDBOX_BASE_URL, TOKEN_TTL_SECONDS, endpoint
 from invoice_module.adapters.sepay.errors import error_code, map_error
+from invoice_module.adapters.sepay.payload import bounded_decimal
 from invoice_module.adapters.sepay.rate_limiter import ProcessRateLimiter
 from invoice_module.domain.enums import Environment
 from invoice_module.ports.clock import Clock
@@ -51,6 +55,8 @@ REFRESH_MARGIN = timedelta(minutes=5)
 OK_STATUSES = range(200, 300)
 # A token lifetime outside (0, one year] is not believed; the documented 24 h is used.
 MAX_TOKEN_TTL_SECONDS = 365 * 86400
+# RFC 6750 ``b64token``, the only characters a bearer token may carry in the header.
+ACCESS_TOKEN = re.compile(r"[A-Za-z0-9\-._~+/]+=*")
 
 
 @dataclass(frozen=True)
@@ -185,16 +191,12 @@ class SePayEInvoiceClient:
             creds = await self._credentials.client_credentials(account.credential_ref)
         method, path = endpoint("token")
         await self._limiter.acquire()
-        try:
-            raw = await self._http.request(
-                method,
-                self.base_url_for(account.environment) + path,
-                auth=httpx.BasicAuth(creds.client_id, creds.client_secret),
-                timeout=self._timeout,
-                follow_redirects=False,
-            )
-        except httpx.HTTPError as error:
-            raise ProviderTransient(retry_after=None) from error
+        raw = await self._call(
+            method,
+            self.base_url_for(account.environment) + path,
+            auth=httpx.BasicAuth(creds.client_id, creds.client_secret),
+            timeout=self._timeout,
+        )
         token = _parse_token(_response(raw), now)
         self._tokens[key] = token
         return token, True
@@ -207,19 +209,30 @@ class SePayEInvoiceClient:
         body: Mapping[str, object] | None,
         timeout: float,
     ) -> Response:
+        raw = await self._call(
+            method,
+            url,
+            json=dict(body) if body is not None else None,
+            auth=_BearerAuth(token),
+            timeout=timeout,
+        )
+        return _response(raw)
+
+    async def _call(self, method: str, url: str, **options: Any) -> httpx.Response:
+        """One transport call; a transport failure becomes ``ProviderTransient``.
+
+        A refused header (``LocalProtocolError``, or a value that cannot be encoded) is not
+        chained: its message quotes the header, which may be the ``Authorization`` value.
+        """
         try:
-            raw = await self._http.request(
-                method,
-                url,
-                json=dict(body) if body is not None else None,
-                auth=_BearerAuth(token),
-                timeout=timeout,
-                follow_redirects=False,
-            )
+            return await self._http.request(method, url, follow_redirects=False, **options)
+        except (httpx.LocalProtocolError, UnicodeEncodeError) as error:
+            refused = type(error).__name__
         except httpx.HTTPError as error:
             logger.warning("sepay einvoice %s request failed: %s", method, type(error).__name__)
             raise ProviderTransient(retry_after=None) from error
-        return _response(raw)
+        logger.warning("sepay einvoice %s request failed: %s", method, refused)
+        raise ProviderTransient(retry_after=None)
 
 
 def _token_key(account: IssuerAccountView) -> tuple[str, Environment]:
@@ -227,20 +240,32 @@ def _token_key(account: IssuerAccountView) -> tuple[str, Environment]:
 
 
 def _parse_token(response: Response, now: datetime) -> _Token:
-    """The token of a ``/v1/token`` response; nothing can raise once the value is read."""
+    """The token of a ``/v1/token`` response.
+
+    The raw body is read only inside ``_usable_token``, so no frame of a refusal holds it.
+    """
     if response.status not in OK_STATUSES:
         logger.warning("sepay einvoice token request failed with HTTP %s", response.status)
         raise map_error(response.status, response.body, response.headers)
-    data = response.body.get("data") if isinstance(response.body, Mapping) else None
+    token = _usable_token(response.body, now)
+    if token is None:
+        raise ProviderAuthFailed("token response without a usable access token")
+    return token
+
+
+def _usable_token(body: Any, now: datetime) -> _Token | None:
+    """An RFC 6750 token and its expiry; nothing can raise once the value is read."""
+    data = body.get("data") if isinstance(body, Mapping) else None
     if not isinstance(data, Mapping):
-        raise ProviderAuthFailed("token response without an access token")
+        return None
     ttl = data.get("expires_in")
     if isinstance(ttl, bool) or not isinstance(ttl, int) or not 0 < ttl <= MAX_TOKEN_TTL_SECONDS:
         ttl = TOKEN_TTL_SECONDS
     expires_at = now + timedelta(seconds=ttl)
-    if not isinstance(data.get("access_token"), str) or not data["access_token"]:
-        raise ProviderAuthFailed("token response without an access token")
-    return _Token(data["access_token"], expires_at)
+    value = data.get("access_token")
+    if not isinstance(value, str) or ACCESS_TOKEN.fullmatch(value) is None:
+        return None
+    return _Token(value, expires_at)
 
 
 def _log(method: str, path: str, response: Response) -> None:
@@ -263,9 +288,37 @@ def _log(method: str, path: str, response: Response) -> None:
     )
 
 
+class _RefusedNumber(ValueError):
+    """A JSON number this adapter does not read: ``NaN``, an infinity or a huge exponent."""
+
+
+def _json_number(text: str) -> Decimal:
+    number = bounded_decimal(text)
+    if number is None:
+        raise _RefusedNumber
+    return number
+
+
+def _json_constant(name: str) -> NoReturn:
+    raise _RefusedNumber
+
+
 def _response(raw: httpx.Response) -> Response:
-    try:
-        body: Any = json.loads(raw.content, parse_float=Decimal) if raw.content else None
-    except (ValueError, RecursionError):
-        body = None
+    """The decoded response; a body that is not JSON is ``None``.
+
+    Numbers are read as ``Decimal``, never ``float``. A body with a refused number is an
+    unclear provider answer: ``ProviderTransient``, raised outside the decoder's frames,
+    which hold the whole body.
+    """
+    body: Any = None
+    refused = False
+    if raw.content:
+        try:
+            body = json.loads(raw.content, parse_float=_json_number, parse_constant=_json_constant)
+        except _RefusedNumber:
+            refused = True
+        except (ValueError, RecursionError):
+            body = None
+    if refused:
+        raise ProviderTransient(retry_after=None)
     return Response(status=raw.status_code, body=body, headers=dict(raw.headers))

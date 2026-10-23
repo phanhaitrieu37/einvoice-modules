@@ -1,8 +1,11 @@
 import asyncio
+import contextlib
 import dataclasses
+import json
 import logging
+import re
 import traceback
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import timedelta
 from types import FrameType
 from typing import Any
@@ -10,7 +13,7 @@ from typing import Any
 import httpx
 import pytest
 
-from invoice_module.adapters.sepay import SePayEInvoiceClient, SePayEInvoiceProvider
+from invoice_module.adapters.sepay import SePayEInvoiceClient, SePayEInvoiceProvider, client
 from invoice_module.adapters.sepay.client import Response
 from invoice_module.adapters.sepay.rate_limiter import ProcessRateLimiter
 from invoice_module.domain.enums import Environment
@@ -25,7 +28,9 @@ from invoice_module.secrets import EnvCredentialResolver
 
 pytestmark = pytest.mark.contract
 
-REFERENCE = "00000000-0000-4000-8000-00000000c0de"
+# The reference of the recorded create and check (``create_accepted.json``,
+# ``check_success.json``): the tracking code equals the reference.
+REFERENCE = "8f3e0182-dcd9-42b5-aed2-6dd5f194f1cb"
 # Prefix of every synthetic token the harness issues, and the synthetic client secret.
 TOKEN_VALUE = "synthetic-access-token-value"
 SECRETS = (TOKEN_VALUE, "synthetic-client-secret")
@@ -206,6 +211,8 @@ def assert_no_secret_in_any_frame(error: BaseException) -> list[str]:
             if any(secret in repr(value) for secret in SECRETS):
                 leaks.append(f"{frame.f_code.co_filename}:{frame.f_code.co_name}:{name}")
     assert leaks == []
+    for link in _chain(error):
+        assert all(secret not in str(link) and secret not in repr(link) for secret in SECRETS)
     rendered = [
         "".join(traceback.TracebackException.from_exception(error, capture_locals=True).format()),
         str(
@@ -289,17 +296,13 @@ async def test_token_absent_from_every_frame_local_after_failure(
         assert any("/httpx/" in file for file in files)
 
 
-_SOCKET_TOKEN_BODY = (
-    b'{"success": true, "data": {"access_token": "' + TOKEN_VALUE.encode() + b'-socket", '
-    b'"expires_in": 86400}}'
-)
-
-
-async def test_token_absent_from_frames_over_a_real_socket(
-    account: IssuerAccountView, creds: Any
-) -> None:
-    """A create that times out on a loopback socket: httpcore and h11 frames are inspected."""
-    received: list[bytes] = []
+@contextlib.asynccontextmanager
+async def _loopback(token: str, received: list[bytes]) -> AsyncIterator[SePayEInvoiceProvider]:
+    """A provider over a real socket: the token endpoint answers ``token``, any other
+    request waits until the client gives up (a create that times out)."""
+    token_body = json.dumps(
+        {"success": True, "data": {"access_token": token, "expires_in": 86400}}
+    ).encode()
     release = asyncio.Event()
 
     async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -317,33 +320,88 @@ async def test_token_absent_from_frames_over_a_real_socket(
                 return
             writer.write(
                 b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n"
-                + b"content-length: %d\r\n\r\n" % len(_SOCKET_TOKEN_BODY)
-                + _SOCKET_TOKEN_BODY
+                + b"content-length: %d\r\n\r\n" % len(token_body)
+                + token_body
             )
             await writer.drain()
 
     server = await asyncio.start_server(serve, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
-    live = dataclasses.replace(account, environment=Environment.LIVE)
     try:
         async with httpx.AsyncClient() as http:
-            client = SePayEInvoiceClient(
-                http,
-                EnvCredentialResolver({}),
-                SystemClock(),
-                ProcessRateLimiter(1000.0),
-                base_urls={Environment.LIVE: f"http://127.0.0.1:{port}"},
-                http_timeout_s=0.5,
+            yield SePayEInvoiceProvider(
+                SePayEInvoiceClient(
+                    http,
+                    EnvCredentialResolver({}),
+                    SystemClock(),
+                    ProcessRateLimiter(1000.0),
+                    base_urls={Environment.LIVE: f"http://127.0.0.1:{port}"},
+                    http_timeout_s=0.5,
+                )
             )
-            provider = SePayEInvoiceProvider(client)
-            with pytest.raises(ProviderTransient) as raised:
-                await provider.create(live, creds, {"reference_code": REFERENCE})
     finally:
         release.set()
         server.close()
+
+
+async def test_token_absent_from_frames_over_a_real_socket(
+    account: IssuerAccountView, creds: Any
+) -> None:
+    """A create that times out on a loopback socket: httpcore and h11 frames are inspected."""
+    received: list[bytes] = []
+    live = dataclasses.replace(account, environment=Environment.LIVE)
+    async with _loopback(f"{TOKEN_VALUE}-socket", received) as provider:
+        with pytest.raises(ProviderTransient) as raised:
+            await provider.create(live, creds, {"reference_code": REFERENCE})
     assert received == [b"/v1/token", b"/v1/invoices/create"]
     files = assert_no_secret_in_any_frame(raised.value)
     assert any("/httpcore/" in file for file in files)
+
+
+# Token shapes outside the RFC 6750 grammar. As a header value, h11 refuses the first four
+# and quotes the header in its message; a lone surrogate cannot be encoded at all.
+REFUSED_TOKEN_SUFFIXES = [
+    " ",
+    "\n",
+    "\x00",
+    "\r\nX-Injected: 1",
+    "\udc80",
+    "\u00f6",
+    "\u20ac",
+    "\t",
+    "?",
+]
+
+
+@pytest.mark.parametrize("suffix", REFUSED_TOKEN_SUFFIXES)
+async def test_token_outside_the_bearer_grammar_is_an_auth_failure_and_never_cached(
+    suffix: str, account: IssuerAccountView, creds: Any
+) -> None:
+    received: list[bytes] = []
+    live = dataclasses.replace(account, environment=Environment.LIVE)
+    async with _loopback(f"{TOKEN_VALUE}-socket{suffix}", received) as provider:
+        with pytest.raises(ProviderAuthFailed) as raised:
+            await provider.create(live, creds, {"reference_code": REFERENCE})
+        with pytest.raises(ProviderAuthFailed):
+            await provider.check_create(live, creds, REFERENCE)
+    assert received == [b"/v1/token", b"/v1/token"]
+    assert_no_secret_in_any_frame(raised.value)
+
+
+@pytest.mark.parametrize("suffix", [" ", "\n", "\x00", "\r\nX-Injected: 1", "\udc80"])
+async def test_refused_authorization_header_is_raised_without_the_library_error(
+    suffix: str, account: IssuerAccountView, creds: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A token that reaches the header and is refused there: nothing chains the refusal."""
+    monkeypatch.setattr(client, "ACCESS_TOKEN", re.compile(r".+", re.DOTALL))
+    received: list[bytes] = []
+    live = dataclasses.replace(account, environment=Environment.LIVE)
+    async with _loopback(f"{TOKEN_VALUE}-socket{suffix}", received) as provider:
+        with pytest.raises(ProviderTransient) as raised:
+            await provider.create(live, creds, {"reference_code": REFERENCE})
+    assert received == [b"/v1/token"]
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+    assert_no_secret_in_any_frame(raised.value)
 
 
 @pytest.mark.parametrize(
@@ -402,6 +460,42 @@ async def test_token_endpoint_network_error_is_transient(
         await h.provider.create(account, creds, {"reference_code": REFERENCE})
     assert raised.value.retry_after is None
     assert [r.url.path for r in h.requests] == ["/v1/token"]
+
+
+async def test_token_endpoint_body_that_cannot_be_decoded_is_transient(
+    harness: Callable[..., Any], account: IssuerAccountView, creds: Any
+) -> None:
+    def corrupt(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-encoding": "gzip"}, content=b"not gzip")
+
+    h = harness(lambda request: httpx.Response(200, json={}), token_handler=corrupt)
+    with pytest.raises(ProviderTransient) as raised:
+        await h.provider.create(account, creds, {"reference_code": REFERENCE})
+    assert raised.value.retry_after is None
+    assert [r.url.path for r in h.requests] == ["/v1/token"]
+
+
+@pytest.mark.parametrize("status", [400, 401])
+async def test_token_failure_log_has_the_status_but_no_provider_text(
+    status: int,
+    harness: Callable[..., Any],
+    account: IssuerAccountView,
+    creds: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    message = "Sai thông tin client_id hoặc client_secret"
+    body = {"success": False, "error": {"code": "UNAUTHORIZED", "message": message}}
+    h = harness(
+        lambda request: httpx.Response(200, json={}),
+        token_handler=lambda request: httpx.Response(status, json=body),
+    )
+    with pytest.raises(ProviderAuthFailed if status == 401 else ProviderRejected):
+        await h.provider.check_create(account, creds, REFERENCE)
+    text = caplog.text + "".join(repr(record.args) for record in caplog.records)
+    assert f"token request failed with HTTP {status}" in caplog.text
+    assert message not in text
+    assert "client_id" not in text
 
 
 @pytest.mark.parametrize("status", [301, 302, 307, 308])
@@ -479,9 +573,12 @@ async def test_timeouts_are_pinned_per_call_kind(
     creds: Any,
 ) -> None:
     """Token, create, check and lookup use ``http_timeout_s``; downloads the artifact one."""
-    success = recorded("check_success.json")["body"]
-    accepted = recorded("create_accepted.json")["body"]
     lookup = recorded("get_by_reference.json")["body"]
+    reference = lookup["data"]["reference_code"]
+    success = recorded("check_success.json")["body"]
+    success["data"]["reference_code"] = reference
+    accepted = recorded("create_accepted.json")["body"]
+    accepted["data"]["tracking_code"] = reference
     pdf = {"file_type": "pdf", "content": "JVBERi0xLjQ="}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -496,7 +593,6 @@ async def test_timeouts_are_pinned_per_call_kind(
         return httpx.Response(200, json=lookup)
 
     h = harness(handler, http_timeout_s=http_timeout_s, artifact_timeout_s=artifact_timeout_s)
-    reference = lookup["data"]["reference_code"]
     await h.provider.create(account, creds, {"reference_code": reference})
     await h.provider.check_create(account, creds, reference)
     await h.provider.find_by_reference(account, creds, reference)

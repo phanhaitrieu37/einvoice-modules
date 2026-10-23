@@ -1,6 +1,7 @@
 import dataclasses
 import inspect
 import json
+import time
 from collections.abc import Callable
 from datetime import date, datetime
 from decimal import Decimal
@@ -299,11 +300,17 @@ def test_float_or_bool_quantity_is_refused(account: IssuerAccountView, quantity:
 
 
 @pytest.mark.parametrize(
-    "quantity", ["NaN", "sNaN", "Infinity", "-Infinity", Decimal("NaN"), Decimal("Infinity")]
+    "quantity",
+    [
+        *("NaN", "sNaN", "Infinity", "-Infinity", Decimal("NaN"), Decimal("Infinity")),
+        *("1e1000000", Decimal("1E+1000000"), "1e999999999999999999", Decimal("1E+19")),
+    ],
 )
 def test_non_finite_quantity_is_refused(account: IssuerAccountView, quantity: object) -> None:
+    started = time.perf_counter()
     with pytest.raises(ValueError, match="quantity"):
         build_create_payload(account, _document(_line(quantity=quantity)), REFERENCE, ISSUED)
+    assert time.perf_counter() - started < 2
 
 
 @pytest.mark.parametrize(

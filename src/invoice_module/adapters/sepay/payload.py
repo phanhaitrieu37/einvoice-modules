@@ -41,14 +41,21 @@ NO_INVOICE_NUMBER = "0"
 _ISO_DATE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 # The one provider message the docs give an instruction for (pages
 # ``theo-doi-trang-thai-xuat-hoa-don`` and ``xu-ly-loi``): when ``message`` is this sentence,
-# "trạng thái hóa đơn chưa xác định. Không gửi lại yêu cầu - hãy liên hệ SePay". It is
-# matched exactly (after strip) at any job status and reported as an error code; no other
-# provider text is interpreted.
+# "trạng thái hóa đơn chưa xác định. Không gửi lại yêu cầu - hãy liên hệ SePay". After strip
+# the message is this sentence, or this sentence followed by "." and more text (the docs
+# example ``failed_unverified`` adds a second sentence); it is reported as an error code at
+# any job status. No other provider text is interpreted.
 PROVIDER_UNCONFIRMED_MESSAGE = (
     "Hệ thống chưa xác nhận được kết quả phát hành với nhà cung cấp hóa đơn"
 )
 PROVIDER_UNCONFIRMED = "provider_unconfirmed"
 LOOKUP_REFERENCE_MISMATCH = "lookup_reference_mismatch"
+# Largest decimal exponent believed in an amount or a quantity (``Decimal.adjusted``; VND
+# totals stay far below 10**19). An int conversion of a number like ``1e1000000`` stalls the
+# event loop, so a larger exponent is refused before any conversion.
+MAX_DECIMAL_EXPONENT = 18
+# A provider amount given as text: ASCII digits, an optional sign and fraction, nothing else.
+_AMOUNT_TEXT = re.compile(r"-?[0-9]+(\.[0-9]+)?")
 
 
 def build_create_payload(
@@ -132,12 +139,23 @@ def _quantity(value: object) -> int | str:
     """
     if isinstance(value, bool | float):
         raise TypeError("quantity must be a decimal string or an integer")
-    quantity = Decimal(str(value))
-    if not quantity.is_finite():
-        raise ValueError("quantity must be finite")
+    quantity = bounded_decimal(str(value))
+    if quantity is None:
+        raise ValueError("quantity must be finite and below 10**19")
     if quantity == quantity.to_integral_value():
         return int(quantity)
     return str(quantity)
+
+
+def bounded_decimal(text: str) -> Decimal | None:
+    """``text`` as a finite ``Decimal`` below 10**19 in magnitude, else ``None``."""
+    try:
+        number = Decimal(text)
+    except ArithmeticError:
+        return None
+    if not number.is_finite() or number.adjusted() > MAX_DECIMAL_EXPONENT:
+        return None
+    return number
 
 
 def _at(body: Any, path: str) -> Any:
@@ -193,11 +211,10 @@ def _amount(value: Any) -> int | None:
         return value
     if isinstance(value, float):
         raise TypeError("provider amounts must be parsed without float")
-    try:
-        amount = Decimal(str(value))
-    except ArithmeticError:
+    if isinstance(value, str) and _AMOUNT_TEXT.fullmatch(value) is None:
         return None
-    if not amount.is_finite() or amount != amount.to_integral_value():
+    amount = bounded_decimal(str(value))
+    if amount is None or amount != amount.to_integral_value():
         return None
     return int(amount)
 
@@ -220,7 +237,8 @@ def parse_accepted(body: Any) -> Accepted | None:
 
 
 def _unconfirmed(message: str | None) -> str | None:
-    if message is not None and message.strip() == PROVIDER_UNCONFIRMED_MESSAGE:
+    text = message.strip() if message is not None else ""
+    if text == PROVIDER_UNCONFIRMED_MESSAGE or text.startswith(PROVIDER_UNCONFIRMED_MESSAGE + "."):
         return PROVIDER_UNCONFIRMED
     return None
 
