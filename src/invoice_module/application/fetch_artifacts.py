@@ -56,7 +56,7 @@ class FetchArtifacts:
         async with self._uow_factory() as uow:
             claimed = await uow.documents.claim_artifacts_due(
                 self._clock.now(),
-                self._config.lease_seconds,
+                self._config.artifact_lease_seconds,
                 self._owner,
                 limit or self._config.batch_size,
             )

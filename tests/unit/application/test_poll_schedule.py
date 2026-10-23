@@ -70,3 +70,10 @@ def test_config_rejects_nonpositive_http_timeout():
         with pytest.raises(ValueError, match="http_timeout_s"):
             InvoiceModuleConfig(http_timeout_s=value)
     assert InvoiceModuleConfig(http_timeout_s=0.5).http_timeout_s == 0.5
+
+
+@pytest.mark.parametrize("value", [0, -1.0])
+def test_artifact_timeout_must_be_positive(value):
+    assert InvoiceModuleConfig().artifact_timeout_s == 90.0
+    with pytest.raises(ValueError, match="artifact_timeout_s"):
+        InvoiceModuleConfig(artifact_timeout_s=value)
