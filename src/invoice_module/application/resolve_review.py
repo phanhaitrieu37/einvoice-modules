@@ -382,6 +382,7 @@ class ResolveReview:
         Its status and approval stay; the next claim looks the reference up before it sends."""
         now = self._clock.now()
         await self._clear(uow, document, request)
+        await self._audit_attempts(uow, document, request, now)
         await uow.documents.operator_update(document.id, now, next_attempt_at=now, attempts=0)
         await uow.documents.grant_post(document.id)
         return document.status

@@ -28,7 +28,13 @@ from invoice_module.application.config import InvoiceModuleConfig
 from invoice_module.application.resolve_review import AmountMismatch
 from invoice_module.application.submit_draft import SubmitDraftCommand
 from invoice_module.domain.document import Buyer, SettledPayment
-from invoice_module.domain.enums import DeliveryMode, Environment
+from invoice_module.domain.enums import (
+    DeliveryMode,
+    DocumentStatus,
+    Environment,
+    ReviewReason,
+    ReviewResolution,
+)
 from invoice_module.domain.errors import (
     DocumentInFlight,
     InvalidLine,
@@ -43,6 +49,7 @@ from invoice_module.ports.provider import ProviderInvoice
 pytestmark = pytest.mark.integration
 
 AUTO, MANUAL = DeliveryMode.AUTO, DeliveryMode.MANUAL
+R, S, A = ReviewReason, DocumentStatus, ReviewResolution
 NOTE = "Checked at the provider portal by the operator"
 DATE_400 = rejected("issued_date_invalid")
 
@@ -1213,9 +1220,23 @@ async def test_quota_retry_after_topup_grants_exactly_one_post(world):
     world.provider.script_create(settled.reference, QUOTA, QUOTA, QUOTA)
     await world.issue()
     assert len(world.provider.posts()) == 1
+    assert (await world.doc(settled.document_id)).status == "queued"
+    assert resolve_module.allowed_resolutions(R.QUOTA_EXHAUSTED, S.QUEUED) == {A.RETRY}
     # Each retry is one more POST from the current count, also once the default budget is spent.
     for posts_before in (1, 2):
-        await world.resolve(settled.document_id, "retry", reason="QUOTA_EXHAUSTED")
+        before_retry = await world.doc(settled.document_id)
+        result = await world.resolve(settled.document_id, "retry", reason="QUOTA_EXHAUSTED")
+        [case] = [c for c in await world.cases(settled.document_id) if c.id == result.case_id]
+        assert case.details["previous_attempts"] == [
+            {
+                "attempts": before_retry.attempts,
+                "post_count": posts_before,
+                "post_limit": before_retry.post_limit,
+                "resolution": "retry",
+                "by": "operator-a",
+                "at": world.clock.now().isoformat(),
+            }
+        ]
         doc = await world.doc(settled.document_id)
         assert (doc.status, doc.next_attempt_at, doc.post_count, doc.post_limit) == (
             "queued",
@@ -1260,6 +1281,7 @@ async def test_quota_review_on_approved_keeps_approval(world):
         before.approved_reference_code,
     )
     assert (before.status, before.next_attempt_at) == ("approved", None)
+    assert resolve_module.allowed_resolutions(R.QUOTA_EXHAUSTED, S.APPROVED) == {A.RETRY}
     with pytest.raises(ResolutionNotAllowed):
         await world.resolve(settled.document_id, "acknowledge", note="Quota topped up")
     world.advance(timedelta(hours=1, seconds=1))
