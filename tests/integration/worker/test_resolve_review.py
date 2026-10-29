@@ -543,6 +543,30 @@ async def test_attach_draft_on_failed_rejects_total_not_equal_settled(world):
     assert await world.doc(settled.document_id) == before
 
 
+async def test_attach_draft_on_failed_refuses_a_goods_line_without_item_code(world):
+    settled = await failed_by(world, rejected("validation_error"))
+    before = await world.doc(settled.document_id)
+    [case_before] = await world.cases(settled.document_id)
+    cmd = world.draft_command(settled.host_ref_id, settled.intent_id)
+    line = {"name": "Corrected", "unit": "each", "quantity": Decimal("1"), "tax_rate": 0}
+    cmd = SubmitDraftCommand(
+        cmd.tenant_id,
+        cmd.merchant_id,
+        cmd.host_ref_type,
+        cmd.host_ref_id,
+        cmd.intent_id,
+        (line | {"unit_price_vnd": 60, "item_code": "SYN-ITEM-1"}, line | {"unit_price_vnd": 40}),
+        100,
+        delivery_mode=cmd.delivery_mode,
+    )
+    with pytest.raises(InvalidLine) as caught:
+        await world.resolve(settled.document_id, "attach_draft", draft=cmd)
+    assert (caught.value.line_index, caught.value.field) == (1, "item_code")
+    assert await world.doc(settled.document_id) == before
+    assert await world.cases(settled.document_id) == [case_before]
+    assert case_before.status == "open"
+
+
 async def test_attach_draft_keeps_duplicate_settlement_reason_open(world):
     _, second = await duplicate(world, second_amount=150, second_draft=100)
     assert sorted(await world.open_reasons(second.document_id)) == [

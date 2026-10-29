@@ -736,6 +736,13 @@ async def test_second_issued_date_invalid_opens_review(world):
     assert len(world.provider.posts()) == 2
     details = await world.reason_details(settled.document_id, "PROVIDER_REJECTED")
     assert details["after_date_resend"] is True
+    # The refused resend is the second POST of the reference.
+    assert details == {
+        "code": "issued_date_invalid",
+        "after_date_resend": True,
+        "post_count": 2,
+        "reference_code": settled.reference,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1093,6 +1100,40 @@ async def test_date_rejection_names_an_earlier_provider_rejection_of_the_post_ju
         "date_resend_skipped": skipped,
         "post_count": 2,
         "post_limit": 2,
+        "reference_code": settled.reference,
+    }
+
+
+async def test_date_rejection_ignores_a_provider_rejection_older_than_the_post_just_before(world):
+    settled = await world.settle()
+    # POST 1 is rejected; the operator retries.
+    world.provider.script_create(settled.reference, rejected("VALIDATION_ERROR"))
+    await world.issue()
+    world.advance(timedelta(minutes=1))
+    await world.resolve(settled.document_id, "retry")
+    # POST 2 goes unanswered and the budget runs out.
+    world.provider.script_create(settled.reference, TRANSIENT)
+    await world.issue()
+    for _ in range(4):
+        world.past_lease()
+        await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.post_count) == ("failed", 2)
+    assert await world.open_reasons(settled.document_id) == ["MAX_ATTEMPTS_EXCEEDED"]
+    world.advance(timedelta(minutes=1))
+    await world.resolve(settled.document_id, "retry")
+    # POST 3 is refused for its date: POST 2, not POST 1, is the one just before.
+    world.provider.script_create(settled.reference, rejected("issued_date_invalid"))
+    await world.issue()
+    for _ in range(4):
+        world.past_lease()
+        await world.issue()
+    assert len(world.provider.posts(settled.reference)) == 3
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
+        "code": "issued_date_invalid",
+        "date_resend_skipped": "earlier_post_unrecorded",
+        "post_count": 3,
+        "post_limit": 3,
         "reference_code": settled.reference,
     }
 
