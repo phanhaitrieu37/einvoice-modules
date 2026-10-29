@@ -80,7 +80,7 @@ def draft(payment, intent_id, amount=100, mode=DeliveryMode.AUTO):
     lines = (
         sample_lines()
         if amount == 100
-        else (LineInput("Service", "each", Decimal("1"), amount, 0),)
+        else (LineInput("Service", "each", Decimal("1"), amount, 0, item_code="TEST-ITEM-1"),)
     )
     return SubmitDraftCommand(
         payment.tenant_id,

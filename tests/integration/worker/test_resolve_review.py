@@ -1343,7 +1343,7 @@ async def test_repair_validates_money_edges_before_db(world, line, error):
         cmd.host_ref_type,
         cmd.host_ref_id,
         cmd.intent_id,
-        ({"name": "Corrected", "unit": "each"} | line,),
+        ({"name": "Corrected", "unit": "each", "item_code": "SYN-ITEM-1"} | line,),
         100,
         delivery_mode=cmd.delivery_mode,
     )

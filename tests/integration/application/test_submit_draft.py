@@ -35,6 +35,7 @@ def line_dict(name="Service", total=100):
         "quantity": Decimal("1"),
         "unit_price_vnd": total,
         "tax_rate": 0,
+        "item_code": "TEST-ITEM-1",
     }
 
 

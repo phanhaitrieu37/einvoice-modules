@@ -52,6 +52,7 @@ def sample_lines() -> tuple[LineInput, ...]:
             quantity=Decimal("1"),
             unit_price_vnd=100,
             tax_rate=0,
+            item_code="TEST-ITEM-1",
         ),
     )
 

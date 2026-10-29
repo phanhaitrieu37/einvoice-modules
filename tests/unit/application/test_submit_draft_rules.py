@@ -7,6 +7,7 @@ from invoice_module.application.submit_draft import SubmitDraft, SubmitDraftComm
 from invoice_module.domain.document import Buyer
 from invoice_module.domain.enums import DeliveryMode
 from invoice_module.domain.errors import InvalidLine, InvalidTaxCode, TotalMismatch
+from invoice_module.domain.money import LineInput
 
 
 class NeverOpened:
@@ -28,6 +29,7 @@ def command(**over):
                 "quantity": Decimal("1"),
                 "unit_price_vnd": 100,
                 "tax_rate": 0,
+                "item_code": "TEST-ITEM-1",
             },
         ),
         "declared_total_vnd": 100,
@@ -96,3 +98,26 @@ async def test_submit_draft_requires_delivery_mode():
     with pytest.raises(ValueError, match="later"):
         await SubmitDraft(NeverOpened(), None).execute(command(delivery_mode="later"))
     assert command(delivery_mode="manual").delivery_mode is DeliveryMode.MANUAL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "item_code", [None, "", "   ", 5], ids=["missing", "empty", "blank", "int"]
+)
+@pytest.mark.parametrize("form", ["mapping", "line_input"])
+async def test_goods_line_without_item_code_rejected_before_db(item_code, form):
+    valid = command().lines[0]
+    broken = dict(valid) | {"item_code": item_code}
+    if item_code is None:
+        broken.pop("item_code")
+    if form == "line_input":
+        broken = LineInput(**broken)
+    cmd = command(lines=(valid, broken), declared_total_vnd=200)
+    with pytest.raises(InvalidLine, match="item_code") as caught:
+        await SubmitDraft(NeverOpened(), None).execute(cmd)
+    assert (caught.value.line_index, caught.value.field) == (1, "item_code")
+
+
+def test_line_with_item_code_keeps_it_in_the_draft():
+    prepared = SubmitDraft._validate(command())
+    assert [line["item_code"] for line in prepared.line_values] == ["TEST-ITEM-1"]

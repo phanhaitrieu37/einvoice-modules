@@ -41,7 +41,7 @@ def vn(year: int, month: int, day: int, hour: int = 0, minute: int = 0, second: 
 
 
 def lines_for(amount: int, name: str = "Synthetic service") -> tuple[LineInput, ...]:
-    return (LineInput(name, "each", Decimal("1"), amount, 0),)
+    return (LineInput(name, "each", Decimal("1"), amount, 0, item_code="SYN-ITEM-1"),)
 
 
 @dataclass(frozen=True)
