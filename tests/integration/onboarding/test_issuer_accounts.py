@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import httpx
 import pytest
 from tests.integration.onboarding.world import ACTOR
@@ -84,9 +86,16 @@ async def test_register_idempotent_same_values(world):
         {"buyer_fallback_extra": {"type": "personal"}},
         {"issue_date_cross_day_action": "review"},
         {"credential_ref": "env:OTHER_CREDENTIAL"},
+        {"provider_account_id": "another-account"},
+        {"template_code": "2"},
+        {"buyer_fallback_name": "Another fallback buyer"},
+        {"seller_store_xid": "synthetic-store"},
     ],
-    ids=["payment_method", "series", "address", "extra", "cross_day", "credential"],
-)
+    ids=[
+        "payment_method", "series", "address", "extra", "cross_day", "credential",
+        "provider_account", "template", "fallback_name", "seller_store",
+    ],
+)  # fmt: skip
 async def test_register_conflict_different_values(world, change):
     command = world.command()
     first = await world.module.register_issuer_account.execute(command, ACTOR)
@@ -205,3 +214,62 @@ async def test_register_refuses_a_malformed_credential_ref_before_the_provider(w
         with pytest.raises(ValueError, match="credential_ref"):
             await world.register(credential_ref=ref)
     assert (world.provider_calls(), world.credentials.refs) == (0, [])
+
+
+class RacingProvider:
+    """The fake provider, but another operator registers the same merchant and environment
+    while this registration waits for the provider's answer."""
+
+    def __init__(self, world, competing) -> None:
+        self.world, self.competing = world, competing
+
+    async def describe_account(self, account, creds):
+        await self.world.module.register_issuer_account.execute(self.competing, "operator-b")
+        return await self.world.provider.describe_account(account, creds)
+
+
+@pytest.mark.parametrize("same", [True, False], ids=["same-settings", "other-settings"])
+async def test_register_lost_insert_race_compares_the_stored_settings(world, same):
+    command = world.command()
+    competing = command if same else world.command(merchant_id=command.merchant_id,
+                                                   payment_method="CK")  # fmt: skip
+    racing = world.build(RacingProvider(world, competing))
+    if same:
+        account = await racing.register_issuer_account.execute(command, ACTOR)
+        [row] = await world.rows()
+        assert account.id == row["id"]
+    else:
+        with pytest.raises(IssuerAccountConflict):
+            await racing.register_issuer_account.execute(command, ACTOR)
+        [row] = await world.rows()
+        assert row["payment_method"] == "CK"
+    # Both registrations asked the provider; only the competitor's row was stored.
+    assert world.provider_calls() == 2
+
+
+@pytest.mark.parametrize("actor", ["", "   ", None])
+async def test_register_and_status_change_require_an_actor(world, actor):
+    with pytest.raises(ValueError, match="actor"):
+        await world.module.register_issuer_account.execute(world.command(), actor)
+    assert (world.provider_calls(), await world.rows()) == (0, [])
+    account = await world.register()
+    with pytest.raises(ValueError, match="actor"):
+        await world.module.set_issuer_account_status.execute(account.id, ACTIVE, actor, "go")
+    assert (await world.row(account.id))["status"] == "draft"
+
+
+@pytest.mark.parametrize(
+    ("series", "accepted"), [("C27TSE", True), ("C26TSE", False)], ids=["vn-year", "utc-year"]
+)
+async def test_register_series_year_follows_the_vietnam_date(world, series, accepted):
+    # 31 December 2026, 17:30 UTC is already 1 January 2027 in Asia/Saigon.
+    world.clock.set(datetime(2026, 12, 31, 17, 30, tzinfo=UTC))
+    world.provider.set_account_facts(series=(series,))
+    if accepted:
+        account = await world.register()
+        assert (await world.row(account.id))["invoice_series_template"] == "C{YY}TSE"
+        return
+    with pytest.raises(IssuerAccountMismatch) as caught:
+        await world.register()
+    assert caught.value.reason == "invoice_series"
+    assert await world.rows() == []

@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -170,3 +170,27 @@ async def test_live_warns_before_tax_approval_date(world, caplog, environment, a
         if record.getMessage() == "invoice_issuer_readiness_warning"
     ]
     assert tuple(logged) == warnings
+
+
+@pytest.mark.parametrize(
+    ("approved", "warnings"),
+    [(date(2026, 10, 30), ()), (date(2026, 10, 31), ("before_tax_approval_date",))],
+    ids=["vn-same-day", "vn-before"],
+)
+async def test_tax_approval_date_compares_the_vietnam_date(world, approved, warnings):
+    account = await active_account(world, environment=Environment.LIVE)
+    # 29 October 2026, 17:30 UTC is already 30 October in Asia/Saigon.
+    world.clock.set(datetime(2026, 10, 29, 17, 30, tzinfo=UTC))
+    world.provider.set_account_facts(tax_authority_approved_date=approved)
+    result = await readiness(world, account, PASS)
+    assert result.warnings == warnings
+
+
+@pytest.mark.parametrize("actor", ["", "   ", None])
+async def test_readiness_requires_an_actor(world, actor):
+    account = await active_account(world)
+    calls = world.provider_calls()
+    with pytest.raises(ValueError, match="actor"):
+        await world.module.record_issuer_readiness.execute(account.id, str(PASS), actor)
+    assert world.provider_calls() == calls
+    assert await evidence_ref(world, account) is None
