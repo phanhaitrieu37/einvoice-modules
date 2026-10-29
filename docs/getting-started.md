@@ -10,7 +10,9 @@ runbook: the review queue, cancellation, artifacts, alerts and accounting approv
 
 The example host [`examples/invoice_host`](../examples/invoice_host) runs the whole flow on
 PostgreSQL with a fake provider and mounts the payment-module webhook router behind a real HTTP
-listener.
+listener. Its `onboard(payment, invoice, issuer_config, *, provider_account_id)` takes the SePay
+account id as a required keyword, because that id comes from SePay, not from the accountant's
+configuration file.
 
 What the module owns and what your host owns: the module records every `PaymentSettled`,
 freezes the draft your host submitted and issues exactly one original invoice for it at SePay
@@ -173,14 +175,17 @@ async def onboard_issuer(invoice, merchant_id, accounting: dict, provider_accoun
   year's series (docs `xuat-hoa-don-dien-tu`: the `C{YY}` part "phải khớp năm hiện tại"). The
   account is stored as `draft`. The same settings again return the stored account; other settings
   for the same merchant and environment raise `IssuerAccountConflict`.
-- `set_issuer_account_status` records the actor and the reason. `active` needs the cross-day
+- `set_issuer_account_status` requires an actor and a reason and writes both, with the old and
+  the new status, to the `invoice_issuer_account_status_changed` log line only: the account row
+  keeps the current status and `updated_at`, not who changed it, so keep that log line if you
+  need the history of status changes. `active` needs the cross-day
   policy, and a `live` account also needs readiness evidence; `disabled` stops new settlements
   from finding the account, so they open `ISSUER_ACCOUNT_UNAVAILABLE` (section 9). Disable the
   account when SePay reports it inactive, fix it at SePay, re-run readiness, activate it again.
 - **Readiness (live only).** Before a `live` account is activated, record the sandbox evidence
   file of the scenario run with `record_issuer_readiness.execute(account_id, evidence_path,
   actor)`. It refuses (`ReadinessRejected`) when the provider does not report the account as
-  `active: true` (docs `danh-sach-tai-khoan`: "Chỉ sử dụng tài khoản có active: true"), when the
+  `active: true` (docs `bat-dau-nhanh`, callout "Chọn tài khoản đúng": "Chỉ sử dụng tài khoản có active: true"), when the
   file is missing, when its `environment` is not `test`, or when s1, s2 or s4 did not pass, or s3
   neither passed nor is `INCONCLUSIVE` with `details.s3_variant` `not_triggerable` or
   `sync_reject`. It warns without blocking when the live account's
@@ -495,7 +500,7 @@ lý lỗi dựa trên error.code, không khớp theo chuỗi error.message").
 | `500 REGISTRATION_NOT_COMPLETE` | `PROVIDER_REJECTED`, account status |
 | `500 BILLING_IS_UNPAID` | `PROVIDER_REJECTED`, account status |
 | `500 EINVOICE_ACCOUNT_NOT_FOUND` | `PROVIDER_REJECTED`, account status |
-| `401` | New token; on a create no resend in the same claim, and the POST counts |
+| `401` (`TOKEN_EXPIRED`; docs `xu-ly-loi`: "Token quá 24 giờ. Lấy token mới") | New token; on a create no resend in the same claim, and the POST counts |
 | `5xx` without a known code | Transient: retry later, lookup first |
 | `404 EINVOICE_DOCUMENT_NOT_FOUND` on a lookup | No invoice under the reference (the code SePay really returns) |
 | `2xx` carrying `EINVOICE_DOCUMENT_EXISTED` | Not an acceptance: `PROVIDER_REJECTED` |
@@ -637,6 +642,7 @@ python -m invoice_module.cli approvals hold DOCUMENT_ID --actor "accountant-name
   content, `attach_draft` in the review queue (section 9), then approve again.
 - Results are JSON lines (`approved`, `already_approved`, `held`, `not_allowed:<reason>`,
   `in_flight`). Exit codes: `0` all approved (or held), `3` some document could not be, `2` a usage
-  error (missing `--actor` or `--note`, a blank value), `1` the database could not be used. The
-  database URL and its password are never printed.
+  error (missing `--actor` or `--note`, a blank value, a misspelt option), `1` the database
+  could not be used, or the command failed otherwise (only the error type is printed). The
+  database URL and its password are never printed, not even in a usage error.
 - The overdue alert is in section 12.

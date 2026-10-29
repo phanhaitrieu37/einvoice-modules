@@ -101,7 +101,7 @@ class RecordIssuerReadiness:
             raise IssuerAccountNotFound(str(account_id))
         creds = await self._credentials.client_credentials(account.credential_ref)
         facts = await self._provider.describe_account(account, creds)
-        # Docs ``danh-sach-tai-khoan``: "Chỉ sử dụng tài khoản có active: true".
+        # Docs ``bat-dau-nhanh`` ("Chọn tài khoản đúng"): "Chỉ sử dụng tài khoản có active: true".
         if facts.active is not True:
             raise ReadinessRejected("account_inactive")
         warnings: list[str] = []

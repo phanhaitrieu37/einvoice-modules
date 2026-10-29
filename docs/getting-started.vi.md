@@ -9,7 +9,9 @@ hoá đơn khi tiền về. Nửa sau là runbook cho operator: hàng đợi rev
 đơn, cảnh báo và duyệt của kế toán.
 
 Host mẫu [`examples/invoice_host`](../examples/invoice_host) chạy trọn luồng trên PostgreSQL
-với provider giả và gắn router webhook của payment-module sau một listener HTTP thật.
+với provider giả và gắn router webhook của payment-module sau một listener HTTP thật. Hàm
+`onboard(payment, invoice, issuer_config, *, provider_account_id)` của nó nhận mã tài khoản SePay
+qua keyword bắt buộc, vì mã đó do SePay cấp, không nằm trong file cấu hình của kế toán.
 
 Phần của module và phần của host: module ghi nhận mọi `PaymentSettled`, đóng băng bản nháp host
 đã nộp và phát hành đúng một hoá đơn gốc cho nó trên SePay eInvoice. Host giữ sản phẩm, giá,
@@ -168,14 +170,17 @@ async def onboard_issuer(invoice, merchant_id, accounting: dict, provider_accoun
   tài khoản, mẫu số hay ký hiệu của năm nay (docs `xuat-hoa-don-dien-tu`: phần `C{YY}` "phải
   khớp năm hiện tại"). Tài khoản được lưu ở `draft`. Gọi lại cùng cấu hình trả tài khoản đã lưu;
   cấu hình khác cho cùng merchant và môi trường ném `IssuerAccountConflict`.
-- `set_issuer_account_status` ghi actor và lý do. `active` cần chính sách qua ngày, tài khoản
+- `set_issuer_account_status` bắt buộc actor và lý do, và chỉ ghi chúng, cùng trạng thái cũ và
+  mới, vào dòng log `invoice_issuer_account_status_changed`: dòng tài khoản chỉ giữ trạng thái
+  hiện tại và `updated_at`, không giữ ai đã đổi, nên hãy giữ dòng log đó nếu cần lịch sử đổi
+  trạng thái. `active` cần chính sách qua ngày, tài khoản
   `live` cần thêm bằng chứng readiness; `disabled` khiến settlement mới không tìm thấy tài khoản
   nên mở `ISSUER_ACCOUNT_UNAVAILABLE` (mục 9). Khi SePay báo tài khoản không active: tắt tài
   khoản, sửa trên SePay, chạy lại readiness, bật lại.
 - **Readiness (chỉ live).** Trước khi bật tài khoản `live`, ghi file bằng chứng sandbox của lượt
   chạy kịch bản bằng `record_issuer_readiness.execute(account_id, evidence_path, actor)`. Lệnh
   từ chối (`ReadinessRejected`) khi provider không báo tài khoản `active: true` (docs
-  `danh-sach-tai-khoan`: "Chỉ sử dụng tài khoản có active: true"), khi thiếu file, khi
+  `bat-dau-nhanh`, khung "Chọn tài khoản đúng": "Chỉ sử dụng tài khoản có active: true"), khi thiếu file, khi
   `environment` của file khác `test`, hoặc khi s1, s2, s4 không PASS, hay s3 không PASS mà cũng
   không phải `INCONCLUSIVE` với `details.s3_variant` là `not_triggerable` hoặc `sync_reject`.
   Lệnh cảnh báo nhưng không chặn khi `tax_authority_approved_date` của tài khoản live sau hôm
@@ -480,7 +485,7 @@ Module quyết định theo `error.code` và HTTP status, không bao giờ theo 
 | `500 REGISTRATION_NOT_COMPLETE` | `PROVIDER_REJECTED`, trạng thái tài khoản |
 | `500 BILLING_IS_UNPAID` | `PROVIDER_REJECTED`, trạng thái tài khoản |
 | `500 EINVOICE_ACCOUNT_NOT_FOUND` | `PROVIDER_REJECTED`, trạng thái tài khoản |
-| `401` | Lấy token mới; trên create không gửi lại trong cùng lượt claim, và POST vẫn tính |
+| `401` (`TOKEN_EXPIRED`; docs `xu-ly-loi`: "Token quá 24 giờ. Lấy token mới") | Lấy token mới; trên create không gửi lại trong cùng lượt claim, và POST vẫn tính |
 | `5xx` không kèm mã nhận diện được | Tạm thời: thử lại sau, tra cứu trước |
 | `404 EINVOICE_DOCUMENT_NOT_FOUND` khi tra cứu | Không có hoá đơn dưới reference (mã SePay thật sự trả) |
 | `2xx` mang `EINVOICE_DOCUMENT_EXISTED` | Không phải tiếp nhận: `PROVIDER_REJECTED` |
@@ -619,6 +624,7 @@ python -m invoice_module.cli approvals hold DOCUMENT_ID --actor "accountant-name
   trong hàng đợi review (mục 9), rồi duyệt lại.
 - Kết quả là các dòng JSON (`approved`, `already_approved`, `held`, `not_allowed:<lý do>`,
   `in_flight`). Exit code: `0` mọi document đã duyệt (hoặc đã giữ), `3` có document không làm được,
-  `2` sai tham số (thiếu `--actor` hay `--note`, giá trị trắng), `1` không dùng được DB. URL DB và
-  mật khẩu không bao giờ được in ra.
+  `2` sai tham số (thiếu `--actor` hay `--note`, giá trị trắng, gõ sai tên tuỳ chọn), `1` không
+  dùng được DB hoặc lệnh lỗi vì lý do khác (chỉ in loại lỗi). URL DB và mật khẩu không bao giờ
+  được in ra, kể cả khi sai tham số.
 - Cảnh báo quá hạn ở mục 12.
