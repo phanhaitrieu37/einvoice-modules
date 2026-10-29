@@ -2,8 +2,9 @@
 
 Each command prints one JSON object per line on stdout. Exit codes: ``0`` when every document
 was approved (or already approved) or held, ``3`` when a document could not be, ``2`` on a
-usage error, ``1`` when the database could not be used. The database URL and its password
-are never printed, and nothing is logged to a file.
+usage error, ``1`` when the database could not be used or the command failed otherwise
+(only the error type is printed). The database URL and its password are never printed, not
+even in a usage error, and nothing is logged to a file.
 """
 
 import argparse
@@ -17,7 +18,7 @@ from typing import Any
 from uuid import UUID
 
 import sqlalchemy as sa
-from sqlalchemy.exc import NoResultFound
+from sqlalchemy.exc import NoResultFound, SQLAlchemyError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from invoice_module.adapters.sqlalchemy.tables import define_tables
@@ -32,6 +33,14 @@ DATABASE_URL_ENV = "INVOICE_DATABASE_URL"
 DEFAULT_TABLE_PREFIX = "inv_"
 EXIT_OK, EXIT_DATABASE, EXIT_USAGE, EXIT_NOT_DONE = 0, 1, 2, 3
 _PREFIX = re.compile(r"^[a-z_][a-z0-9_]*$")
+# What a wrong URL, a missing driver, a refused login or an unreachable server raises.
+_DATABASE_ERRORS: tuple[type[BaseException], ...] = (SQLAlchemyError, OSError, ImportError)
+try:
+    import asyncpg
+
+    _DATABASE_ERRORS += (asyncpg.PostgresError, asyncpg.InterfaceError)
+except ImportError:  # the postgres extra is not installed
+    pass
 
 
 class UsageError(Exception):
@@ -100,12 +109,15 @@ def _handler(command: Command) -> Callable[[argparse.Namespace], int]:
         except UsageError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_USAGE
+        # Driver errors (asyncpg raises its own on a refused login) may carry the URL or the
+        # password in their text, so at this boundary only the type is printed.
         try:
             return asyncio.run(_run(command, args, url))
-        except Exception as exc:
-            # Driver errors (asyncpg raises its own on a refused login) may carry the URL or
-            # the password in their text, so at this boundary only the type is printed.
+        except _DATABASE_ERRORS as exc:
             print(f"error: the database could not be used ({type(exc).__name__})", file=sys.stderr)
+            return EXIT_DATABASE
+        except Exception as exc:
+            print(f"error: the command failed ({type(exc).__name__})", file=sys.stderr)
             return EXIT_DATABASE
 
     return run

@@ -22,7 +22,9 @@ from tests.integration.worker.world import World
 
 from invoice_module.adapters.sqlalchemy.repositories.documents import snapshot_sha256
 from invoice_module.adapters.sqlalchemy.tables import define_tables
-from invoice_module.cli.__main__ import main
+from invoice_module.application.queries import ListPendingApprovals
+from invoice_module.cli import approvals
+from invoice_module.cli.__main__ import build_parser, main
 from invoice_module.domain.enums import DeliveryMode
 
 pytestmark = [pytest.mark.integration, pytest.mark.postgres]
@@ -338,3 +340,118 @@ def test_approve_with_expect_sha256_mismatch_not_allowed(db, capsys):
     assert lines(capsys.readouterr().out) == [{"document_id": document, "result": "approved"}]
     doc = db.doc(settled.document_id)
     assert (doc.status, doc.approved_snapshot_sha256) == ("approved", digest)
+
+
+def test_hold_in_flight_exits_three(db, capsys):
+    settled = db.awaiting()
+
+    async def lease(world: World) -> None:
+        await world.set_columns(
+            settled.document_id, lease_until=datetime.now(UTC) + timedelta(minutes=5)
+        )
+
+    db.run(lease)
+    capsys.readouterr()
+    code = db.cli("hold", str(settled.document_id), "--actor", ACTOR, "--note", "Wrong buyer")
+    assert code == 3
+    assert lines(capsys.readouterr().out) == [
+        {"document_id": str(settled.document_id), "result": "in_flight"}
+    ]
+    assert db.doc(settled.document_id).status == "awaiting_approval"
+
+
+def test_approve_in_flight_alone_exits_three(db, capsys):
+    settled = db.awaiting()
+
+    async def lease(world: World) -> None:
+        await world.set_columns(
+            settled.document_id, lease_until=datetime.now(UTC) + timedelta(minutes=5)
+        )
+
+    db.run(lease)
+    capsys.readouterr()
+    assert db.cli("approve", str(settled.document_id), "--actor", ACTOR) == 3
+    assert lines(capsys.readouterr().out) == [
+        {"document_id": str(settled.document_id), "result": "in_flight"}
+    ]
+    doc = db.doc(settled.document_id)
+    assert (doc.status, doc.approved_by) == ("awaiting_approval", None)
+
+
+SYNTHETIC_PASSWORD = "SYNTH-PW-MARKER-7f3a"
+LEAKY_URL = f"postgresql://synuser:{SYNTHETIC_PASSWORD}@127.0.0.1:1/synthetic"
+
+
+@pytest.mark.parametrize(
+    ("argv", "code", "shown"),
+    [
+        (["approvals", "list", "--database_url", LEAKY_URL], 2, "--database_url"),
+        (["approvals", "list", f"--database_url={LEAKY_URL}"], 2, "--database_url"),
+        (["approvals", "list", LEAKY_URL], 2, "unrecognized arguments"),
+        (["approvals", "show", LEAKY_URL, "--database-url", LEAKY_URL], 2, "document_id"),
+        (["approvals", "lst", "--database-url", LEAKY_URL], 2, "lst"),
+        (["approvals", "list", "--limit", LEAKY_URL], 2, "--limit"),
+        (["approvals", "list", "--database-url"], 2, "--database-url"),
+        (["approvals", "list", "--limit", LEAKY_URL.replace("synuser:", "synuser:\\")], 2,
+         "--limit"),
+        (["approvals", "list", f"synuser:{SYNTHETIC_PASSWORD}@127.0.0.1"], 2,
+         "unrecognized arguments"),
+        (["approvals", "list", "--database-url", LEAKY_URL.replace("postgresql", "nosuchdb")],
+         1, "the database could not be used"),
+        (["approvals", "list", "--database-url", LEAKY_URL], 1, "the database could not be used"),
+    ],
+    ids=[
+        "misspelt-option", "misspelt-option-equals", "stray-positional", "url-as-document-id",
+        "misspelt-action", "url-as-limit", "missing-value", "escaped-url-as-limit",
+        "userinfo-without-scheme", "invalid-scheme", "unreachable",
+    ],
+)  # fmt: skip
+def test_cli_never_prints_the_password_on_usage_or_connection_errors(capsys, argv, code, shown):
+    assert main(argv) == code
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert SYNTHETIC_PASSWORD not in output
+    assert "synuser" not in output
+    assert shown in captured.err
+
+
+def test_table_prefix_defaults_to_inv():
+    args = build_parser().parse_args(["approvals", "list"])
+    assert args.table_prefix == "inv_"
+
+
+def test_database_url_flag_wins_over_environment(db, capsys, monkeypatch):
+    settled = db.awaiting()
+    wrong = make_url(db.url).set(password="synthetic-wrong-password")
+    monkeypatch.setenv("INVOICE_DATABASE_URL", wrong.render_as_string(hide_password=False))
+    capsys.readouterr()
+    assert db.cli("list") == 0
+    [row] = lines(capsys.readouterr().out)
+    assert row["document_id"] == str(settled.document_id)
+    # Without the flag the environment is used.
+    assert main(["approvals", "list", "--table-prefix", db.prefix]) == 1
+    assert "the database could not be used" in capsys.readouterr().err
+
+
+def test_a_failure_outside_the_database_is_not_reported_as_one(db, capsys, monkeypatch):
+    async def broken(*args: Any, **kwargs: Any) -> Any:
+        raise ValueError("synthetic failure")
+
+    monkeypatch.setattr(ListPendingApprovals, "execute", broken)
+    capsys.readouterr()
+    assert db.cli("list") == 1
+    err = capsys.readouterr().err
+    assert "error: the command failed (ValueError)" in err
+    assert "database" not in err
+    assert "synthetic failure" not in err
+
+
+def test_a_database_error_carrying_the_url_prints_only_its_type(capsys, monkeypatch):
+    def refuse(url: str, **kwargs: Any) -> Any:
+        raise sa.exc.ArgumentError(f"could not use {url}")
+
+    monkeypatch.setattr(approvals, "create_async_engine", refuse)
+    assert main(["approvals", "list", "--database-url", LEAKY_URL]) == 1
+    captured = capsys.readouterr()
+    assert captured.err == "error: the database could not be used (ArgumentError)\n"
+    assert SYNTHETIC_PASSWORD not in captured.out + captured.err
