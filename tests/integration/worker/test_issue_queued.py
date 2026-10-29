@@ -25,7 +25,7 @@ from invoice_module.adapters.sepay.errors import map_error
 from invoice_module.adapters.sqlalchemy.repositories.documents import DocumentRepository
 from invoice_module.application.config import today_vn
 from invoice_module.domain.enums import DeliveryMode, DocumentStatus
-from invoice_module.ports.provider import ProviderInvoice
+from invoice_module.ports.provider import ProviderInvoice, ProviderRejected
 
 pytestmark = pytest.mark.integration
 
@@ -406,7 +406,11 @@ async def test_rejected_opens_provider_rejected_review(world, code, error):
     await world.issue()
     doc = await world.doc(settled.document_id)
     assert (doc.status, doc.last_error_code) == ("failed", error)
-    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {"code": code}
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
+        "code": code,
+        "post_count": 1,
+        "reference_code": settled.reference,
+    }
 
 
 @pytest.mark.parametrize(
@@ -431,7 +435,11 @@ async def test_account_status_rejections_open_provider_rejected_review(world, co
         error,
         False,
     )
-    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {"code": code}
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
+        "code": code,
+        "post_count": 1,
+        "reference_code": settled.reference,
+    }
     await world.drive(rounds=4, step=timedelta(hours=1))
     assert world.provider.ops() == ["create"]
 
@@ -458,7 +466,9 @@ async def test_issued_date_code_letter_case_decides_the_resend(world, answer):
         )
         assert (doc.post_count, doc.date_resend_at) == (1, None)
         assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
-            "code": "ISSUED_DATE_INVALID"
+            "code": "ISSUED_DATE_INVALID",
+            "post_count": 1,
+            "reference_code": settled.reference,
         }
     else:
         assert error.code == "issued_date_invalid"
@@ -798,6 +808,7 @@ async def test_date_rejection_after_unrecorded_post_reviews_without_resend(world
         "date_resend_skipped": "earlier_post_unrecorded",
         "post_count": 2,
         "post_limit": 2,
+        "reference_code": settled.reference,
     }
 
 
@@ -934,6 +945,7 @@ async def test_date_rejection_after_cross_day_block_and_retry_names_the_recorded
         "date_resend_skipped": "earlier_post_rejected",
         "post_count": 2,
         "post_limit": 2,
+        "reference_code": settled.reference,
     }
 
 
@@ -993,6 +1005,95 @@ async def test_date_rejection_names_an_earlier_rejection_only_for_the_post_just_
         "date_resend_skipped": "earlier_post_unrecorded",
         "post_count": rejected_post,
         "post_limit": rejected_post,
+        "reference_code": settled.reference,
+    }
+
+
+async def test_rotated_reference_does_not_inherit_a_date_rejection_of_the_old_one(world):
+    await world.set_cross_day("review")
+    world.clock.set(vn(2026, 10, 21, 23, 59, 59, 900_000))
+    settled = await world.settle()
+    world.provider.receive_delay(settled.reference, timedelta(milliseconds=200))
+    await world.issue()
+    block = await world.reason_details(settled.document_id, "ISSUE_DATE_CROSSED_DAY")
+    assert (block["after_date_rejection"], block["post_count"], block["reference_code"]) == (
+        True,
+        1,
+        settled.reference,
+    )
+    # The operator confirms the date; POST 2 of the old reference goes unanswered.
+    await world.resolve(settled.document_id, "retry")
+    world.provider.script_create(settled.reference, TRANSIENT)
+    await world.issue()
+    world.past_lease()
+    await world.issue()
+    assert (await world.doc(settled.document_id)).last_error_code == "max_attempts_exceeded"
+    await world.resolve(
+        settled.document_id, "retry_with_new_reference", note="Nothing under it at the portal"
+    )
+    rotated = (await world.doc(settled.document_id)).reference_code
+    assert rotated != settled.reference
+    # POST 1 of the new reference goes unanswered, POST 2 is refused for its date.
+    world.provider.script_create(rotated, TRANSIENT, rejected("issued_date_invalid"))
+    await world.issue()
+    for _ in range(4):
+        world.past_lease()
+        await world.issue()
+    assert len(world.provider.posts(rotated)) == 2
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
+        "code": "issued_date_invalid",
+        "date_resend_skipped": "earlier_post_unrecorded",
+        "post_count": 2,
+        "post_limit": 2,
+        "reference_code": rotated,
+    }
+
+
+@pytest.mark.parametrize("history", ["rejected_post", "refused_before_send"])
+async def test_date_rejection_names_an_earlier_provider_rejection_of_the_post_just_before(
+    world, history
+):
+    settled = await world.settle()
+    if history == "rejected_post":
+        # POST 1 is answered with a definitive rejection.
+        world.provider.script_create(settled.reference, rejected("VALIDATION_ERROR"))
+        await world.issue()
+        expected = {
+            "code": "VALIDATION_ERROR",
+            "post_count": 1,
+            "reference_code": settled.reference,
+        }
+        skipped = "earlier_post_rejected"
+    else:
+        # POST 1 goes unanswered; the next claim is refused before anything is sent.
+        world.provider.script_create(settled.reference, TRANSIENT)
+        await world.issue()
+        world.past_lease()
+
+        async def refuse_before_send() -> None:
+            raise ProviderRejected("BAD_REQUEST")
+
+        world.provider.on_next_prepare(refuse_before_send)
+        await world.issue()
+        expected = {"code": "BAD_REQUEST"}
+        skipped = "earlier_post_unrecorded"
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.post_count) == ("failed", 1)
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == expected
+    world.advance(timedelta(minutes=1))  # the next case opens strictly later
+    await world.resolve(settled.document_id, "retry")
+    world.provider.script_create(settled.reference, rejected("issued_date_invalid"))
+    await world.issue()
+    for _ in range(4):
+        world.past_lease()
+        await world.issue()
+    assert len(world.provider.posts(settled.reference)) == 2
+    assert await world.reason_details(settled.document_id, "PROVIDER_REJECTED") == {
+        "code": "issued_date_invalid",
+        "date_resend_skipped": skipped,
+        "post_count": 2,
+        "post_limit": 2,
+        "reference_code": settled.reference,
     }
 
 

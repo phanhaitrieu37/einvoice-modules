@@ -66,13 +66,13 @@ def test_business_days_skip_weekend():
 
 
 def test_config_rejects_nonpositive_http_timeout():
-    for value in (0, 0.0, -1.0):
+    for value in (0, 0.0, -1.0, float("nan"), float("inf"), float("-inf")):
         with pytest.raises(ValueError, match="http_timeout_s"):
             InvoiceModuleConfig(http_timeout_s=value)
     assert InvoiceModuleConfig(http_timeout_s=0.5).http_timeout_s == 0.5
 
 
-@pytest.mark.parametrize("value", [0, -1.0])
+@pytest.mark.parametrize("value", [0, -1.0, float("nan"), float("inf")])
 def test_artifact_timeout_must_be_positive(value):
     assert InvoiceModuleConfig().artifact_timeout_s == 90.0
     with pytest.raises(ValueError, match="artifact_timeout_s"):
