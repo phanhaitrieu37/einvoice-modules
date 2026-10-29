@@ -1,0 +1,10 @@
+[project]
+name = "invoice-host-example"
+version = "0"
+description = "Example host: payment-module settles orders, invoice-module issues one VAT invoice per settlement."
+requires-python = ">=3.12"
+dependencies = [
+    "payment-module[sqlalchemy,postgres,sepay,fastapi]",
+    "invoice-module[sqlalchemy,postgres,sepay,payment]",
+    "uvicorn",
+]

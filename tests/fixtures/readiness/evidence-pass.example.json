@@ -1,0 +1,5 @@
+{
+  "environment": "test",
+  "scenarios": {"s1": "PASS", "s2": "PASS", "s3": "PASS", "s4": "PASS"},
+  "details": {}
+}

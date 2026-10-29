@@ -7,6 +7,10 @@ from invoice_module.application.escalate_overdue import EscalateOverdue
 from invoice_module.application.fetch_artifacts import FetchArtifacts
 from invoice_module.application.hold_draft_invoice import HoldDraftInvoice
 from invoice_module.application.issue_queued import IssueQueued
+from invoice_module.application.issuer_accounts import (
+    RegisterIssuerAccount,
+    SetIssuerAccountStatus,
+)
 from invoice_module.application.mark_cancelled_externally import MarkCancelledExternally
 from invoice_module.application.poll_pending import PollPending
 from invoice_module.application.queries import (
@@ -15,6 +19,7 @@ from invoice_module.application.queries import (
     ListOpenReviews,
     ListPendingApprovals,
 )
+from invoice_module.application.readiness import RecordIssuerReadiness
 from invoice_module.application.resolve_review import ResolveReview
 from invoice_module.ports.artifacts import ArtifactStore
 from invoice_module.ports.clock import Clock
@@ -48,6 +53,9 @@ class InvoiceModule:
     list_open_reviews: ListOpenReviews
     list_pending_approvals: ListPendingApprovals
     get_draft_for_approval: GetDraftForApproval
+    register_issuer_account: RegisterIssuerAccount | None
+    set_issuer_account_status: SetIssuerAccountStatus
+    record_issuer_readiness: RecordIssuerReadiness | None
 
 
 def build_invoice_module(
@@ -106,4 +114,11 @@ def build_invoice_module(
         list_open_reviews=ListOpenReviews(uow_factory),
         list_pending_approvals=ListPendingApprovals(uow_factory, clock, settings),
         get_draft_for_approval=GetDraftForApproval(uow_factory),
+        register_issuer_account=(
+            RegisterIssuerAccount(uow_factory, provider, credentials, clock) if networked else None
+        ),
+        set_issuer_account_status=SetIssuerAccountStatus(uow_factory, clock),
+        record_issuer_readiness=(
+            RecordIssuerReadiness(uow_factory, provider, credentials, clock) if networked else None
+        ),
     )
