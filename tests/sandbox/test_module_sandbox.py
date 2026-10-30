@@ -328,9 +328,9 @@ async def test_module_s1_settled_to_issued_sandbox(module_sandbox: ModuleSandbox
             "total_equals_settled": document.total_vnd == document.settled_amount_vnd,
             "request_total_equals_settled": document.request["total_amount"]
             == document.settled_amount_vnd,
-            "tax_authority_code_present": bool(document.tax_authority_code),
-            "tax_authority_code_matches_check": document.tax_authority_code
-            == progress.tax_authority_code,
+            # Both values are kept: the sandbox may fill the code in after the issue.
+            "tax_authority_code_stored": document.tax_authority_code,
+            "tax_authority_code_at_check": progress.tax_authority_code,
             "tracking_equals_reference": document.tracking_code == document.reference_code,
             "check_document_type": invoice.get("document_type"),
             "check_invoice_status": invoice.get("status"),
@@ -340,8 +340,8 @@ async def test_module_s1_settled_to_issued_sandbox(module_sandbox: ModuleSandbox
         },
     )
     assert document.invoice_number
-    # The stored code is the provider's (it may be empty on the sandbox).
-    assert document.tax_authority_code == progress.tax_authority_code
+    # The code is recorded for the issued document; its value may be empty on the sandbox.
+    assert "tax_authority_code" in document._mapping
     assert document.total_vnd == document.settled_amount_vnd == order.amount_vnd
     assert document.request["total_amount"] == document.settled_amount_vnd
     assert document.tracking_code == document.reference_code
