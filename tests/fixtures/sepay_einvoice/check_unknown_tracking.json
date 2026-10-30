@@ -1,0 +1,19 @@
+{
+  "_recorded": "Sandbox status check of a random uuid4 tracking code that was never sent, 2026-10-31 (one GET).",
+  "body": {
+    "error": {
+      "code": "EINVOICE_CREATE_TRACKING_NOT_FOUND",
+      "message": "Không tìm thấy yêu cầu hóa đơn tương ứng với tracking code này"
+    },
+    "success": false
+  },
+  "headers": {
+    "content-length": null,
+    "content-type": "application/json; charset=UTF-8"
+  },
+  "request": {
+    "method": "GET",
+    "path": "/v1/invoices/create/check/{tracking_code}"
+  },
+  "status": 404
+}

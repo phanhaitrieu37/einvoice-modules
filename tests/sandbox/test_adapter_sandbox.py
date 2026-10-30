@@ -309,6 +309,31 @@ async def test_lookup_unknown_reference_shape(sandbox: Any) -> None:
     assert response.status == 404, response.status
 
 
+async def test_check_unknown_tracking_shape(sandbox: Any) -> None:
+    """One status check GET of a random tracking code: the provider's "no such job" response."""
+    tracking_code = str(uuid4())
+    creates_before = len(sandbox.creates())
+    response = await sandbox.client.request(
+        "GET",
+        _check_path(tracking_code),
+        account=sandbox.account,
+        creds=sandbox.creds,
+        accept=tuple(range(200, 600)),
+    )
+    checks = [c for c in sandbox.wire if c.path == _check_path(tracking_code)]
+    sandbox.evidence(
+        "check_unknown_tracking",
+        {
+            "gets": len(checks),
+            "status": response.status,
+            "content_type": checks[-1].content_type,
+            "body": response.body,
+        },
+    )
+    assert len(checks) == 1
+    assert len(sandbox.creates()) == creates_before
+
+
 async def test_fractional_quantity_create_as_serialised_today(sandbox: Any) -> None:
     """One create of the e2e line with quantity 1.5, sent exactly as the adapter builds it."""
     document = sandbox.document(SYNTHETIC_BUYER, quantity=Decimal("1.5"))
