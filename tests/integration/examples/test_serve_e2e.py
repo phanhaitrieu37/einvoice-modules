@@ -2,6 +2,7 @@
 secret is synthetic and nothing leaves 127.0.0.1."""
 
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -31,12 +32,18 @@ from examples.invoice_host.main import (
 )
 from sqlalchemy.ext.asyncio import create_async_engine
 from tests.conftest import unique_prefix
-from tests.contract.sepay_einvoice.conftest import all_phases, timeout_of, token_response
+from tests.contract.sepay_einvoice.conftest import (
+    all_phases,
+    make_account,
+    timeout_of,
+    token_response,
+)
 from tests.fakes.fake_einvoice_provider import FakeEInvoiceProvider
 
-from invoice_module.application.config import today_vn
+from invoice_module.application.config import InvoiceModuleConfig, today_vn
 from invoice_module.domain.enums import DeliveryMode
 from invoice_module.ports.clock import SystemClock
+from invoice_module.ports.provider import ClientCredentials
 
 pytestmark = [pytest.mark.integration, pytest.mark.postgres]
 
@@ -313,10 +320,10 @@ async def test_serve_issues_a_signed_local_order_and_wait_writes_its_evidence(
         never = tmp_path / "p5" / "never.json"
         clock = time.monotonic()
         code, _ = await command(
-            capsys, "wait", *common, "--intent-id", unpaid["intent_id"], "--timeout", "1",
+            capsys, "wait", *common, "--intent-id", unpaid["intent_id"], "--timeout", "2",
             "--interval", "0.2", "--out", str(never), "--expect-bank-reference", "LOCAL-NONE",
         )  # fmt: skip
-        assert 1 <= time.monotonic() - clock < 5
+        assert 2 <= time.monotonic() - clock < 2.6
         assert (code, never.exists()) == (3, False)
 
         # The host refusing the transfer (a wrong secret: HTTP 401) is a failed pay-local.
@@ -482,6 +489,18 @@ async def test_serve_refuses_a_database_onboarded_otherwise(setup, drop_tables, 
     stop.set()
     assert await task == 0
 
+    # The same account typed in lower case or with spaces around is the account onboarded
+    # (payment-module stores the bank code upper-cased).
+    retyped = {"bank_code": f" {BANK_CODE.lower()} ", "account_number": f" {BANK_ACCOUNT} "}
+    stop, out = asyncio.Event(), io.StringIO()
+    rerun = serve.ServeOptions(**{**options.__dict__, **retyped})
+    task = asyncio.create_task(
+        serve.run(rerun, fake_provider(), setup["environ"], stop=stop, out=out)
+    )
+    await started(task, out)
+    stop.set()
+    assert await task == 0
+
     async def refused(**changes) -> str:
         changed = serve.ServeOptions(**{**options.__dict__, **changes})
         with pytest.raises(serve.ServeError) as raised:
@@ -597,14 +616,29 @@ def test_listen_socket_binds_the_loopback_address_only():
             serve.listen_socket(port)
 
 
-async def test_sandbox_provider_waits_no_longer_than_the_module_http_timeout(tmp_path):
-    requests = []
-
+def sandbox_answer(requests: list[httpx.Request]):
     def answer(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if request.url.path == "/v1/token":
             return token_response()
+        if request.url.path.endswith("/download"):
+            kind = request.url.params["type"]
+            content = base64.b64encode(b"%PDF-1.4 synthetic" if kind == "pdf" else b"<HDon/>")
+            data = {"file_type": kind, "content": content.decode()}
+            return httpx.Response(200, json={"success": True, "data": data})
         return httpx.Response(200, json={"success": True, "data": {"items": []}})
+
+    return answer
+
+
+async def download_both(provider) -> None:
+    creds = ClientCredentials("synthetic-client", "synthetic-secret")
+    await provider.fetch_artifacts(make_account(), creds, "synthetic-reference", "unused")
+
+
+async def test_sandbox_provider_waits_no_longer_than_the_module_http_timeout(tmp_path):
+    requests = []
+    answer = sandbox_answer(requests)
 
     environ = serve.sandbox_environ({serve.PM_WEBHOOK_SECRET: "synthetic"}, INV_ENV)
     provider, http = serve.sandbox_provider(environ, transport=httpx.MockTransport(answer))
@@ -619,12 +653,38 @@ async def test_sandbox_provider_waits_no_longer_than_the_module_http_timeout(tmp
             await serve.discover_provider_account(
                 provider, ISSUER_CONFIG, environ, serve.SANDBOX_CREDENTIAL_REF
             )
+        await download_both(provider)
     finally:
         await http.aclose()
-    assert host.invoice.config.http_timeout_s == 20.0
-    assert [request.url.path for request in requests] == ["/v1/token", "/v1/provider-accounts"]
-    for request in requests:
-        assert timeout_of(request) == all_phases(host.invoice.config.http_timeout_s)
+    config = host.invoice.config
+    assert (config.http_timeout_s, config.artifact_timeout_s) == (20.0, 90.0)
+    assert [request.url.path for request in requests] == [
+        "/v1/token",
+        "/v1/provider-accounts",
+        "/v1/token",
+        *["/v1/invoices/synthetic-reference/download"] * 2,
+    ]
+    for request in requests[:3]:
+        assert timeout_of(request) == all_phases(config.http_timeout_s)
+    for request in requests[3:]:
+        assert timeout_of(request) == all_phases(config.artifact_timeout_s)
+
+
+async def test_sandbox_provider_takes_both_timeouts_from_the_given_config():
+    requests = []
+    environ = serve.sandbox_environ({serve.PM_WEBHOOK_SECRET: "synthetic"}, INV_ENV)
+    config = InvoiceModuleConfig(http_timeout_s=7.0, artifact_timeout_s=11.0)
+    transport = httpx.MockTransport(sandbox_answer(requests))
+    provider, http = serve.sandbox_provider(environ, config, transport=transport)
+    try:
+        await download_both(provider)
+    finally:
+        await http.aclose()
+    assert [timeout_of(request) for request in requests] == [
+        all_phases(7.0),
+        all_phases(11.0),
+        all_phases(11.0),
+    ]
 
 
 def test_serve_command_line_defaults_and_refusals(tmp_path, capsys):
@@ -684,6 +744,32 @@ async def test_a_mistyped_option_never_echoes_the_typed_database_url(capsys):
         assert raised.value.code == 2
         err = capsys.readouterr().err
         assert "SYNTHPW0MARKER" not in err and "error:" in err
+
+
+@pytest.mark.parametrize(
+    ("module", "argv"),
+    [
+        ("serve", ["--pm-env", "pm.env", "--inv-env", "inv.env", "--database-url", "postgresql://x",
+                   "--artifact-root", "a", "--pid-file", "p", "--bank-code", BANK_CODE,
+                   "--account-number", BANK_ACCOUNT]),
+        ("e2e", ["wait", "--database-url", "postgresql://x", "--intent-id", str(uuid4()),
+                 "--expect-bank-reference", "LOCAL-X", "--out", "o.json", "--timeout", "1"]),
+    ],
+)  # fmt: skip
+def test_python_m_parses_its_own_command_line_and_hides_a_typed_userinfo(module, argv, tmp_path):
+    """``python -m``: ``main`` reads ``sys.argv`` itself; a token glued to a short option is
+    reported as unrecognized without repeating it."""
+    env = {name: value for name, value in os.environ.items() if name != "DATABASE_URL"}
+    result = subprocess.run(
+        [sys.executable, "-m", f"examples.invoice_host.{module}", *argv,
+         "-xsynuser:SYNTHPW0MARKER@127.0.0.1"],
+        cwd=tmp_path, env={**env, "PYTHONPATH": str(ROOT)}, capture_output=True, text=True,
+        timeout=60, check=False,
+    )  # fmt: skip
+    assert result.returncode == 2
+    assert result.stderr.splitlines()[-1].endswith("error: unrecognized arguments: <hidden>")
+    for typed in ("SYNTHPW0MARKER", "synuser", "@127.0.0.1"):
+        assert typed not in result.stdout + result.stderr
 
 
 def test_order_line_total_is_the_amount_with_the_configured_tax():
