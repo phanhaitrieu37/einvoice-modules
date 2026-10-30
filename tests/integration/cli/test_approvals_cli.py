@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import asyncpg
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.engine import make_url
@@ -399,11 +400,19 @@ LEAKY_URL = f"postgresql://synuser:{SYNTHETIC_PASSWORD}@127.0.0.1:1/synthetic"
         (["approvals", "list", "--database-url", LEAKY_URL.replace("postgresql", "nosuchdb")],
          1, "the database could not be used"),
         (["approvals", "list", "--database-url", LEAKY_URL], 1, "the database could not be used"),
+        (["approvals", "list", "--database-url", LEAKY_URL.replace(":1/", ":notaport/")], 1,
+         "error: the database could not be used (ValueError)"),
+        (["approvals", "list", "--database-url", f"{LEAKY_URL}?synthetic_key=1"], 1,
+         "error: the database could not be used (TypeError)"),
+        (["approvals", "list", "--database-url",
+          LEAKY_URL.replace("postgresql", "postgresql+psycopg2")], 1,
+         "error: the database could not be used (ModuleNotFoundError)"),
     ],
     ids=[
         "misspelt-option", "misspelt-option-equals", "stray-positional", "url-as-document-id",
         "misspelt-action", "url-as-limit", "missing-value", "escaped-url-as-limit",
-        "userinfo-without-scheme", "invalid-scheme", "unreachable",
+        "userinfo-without-scheme", "invalid-scheme", "unreachable", "port-not-a-number",
+        "unknown-query-key", "missing-driver",
     ],
 )  # fmt: skip
 def test_cli_never_prints_the_password_on_usage_or_connection_errors(capsys, argv, code, shown):
@@ -444,6 +453,18 @@ def test_a_failure_outside_the_database_is_not_reported_as_one(db, capsys, monke
     assert "error: the command failed (ValueError)" in err
     assert "database" not in err
     assert "synthetic failure" not in err
+
+
+def test_a_lost_connection_is_reported_as_a_database_error(db, capsys, monkeypatch):
+    async def lost(*args: Any, **kwargs: Any) -> Any:
+        raise asyncpg.InterfaceError(f"connection to {LEAKY_URL} is closed")
+
+    monkeypatch.setattr(ListPendingApprovals, "execute", lost)
+    capsys.readouterr()
+    assert db.cli("list") == 1
+    captured = capsys.readouterr()
+    assert captured.err == "error: the database could not be used (InterfaceError)\n"
+    assert SYNTHETIC_PASSWORD not in captured.out + captured.err
 
 
 def test_a_database_error_carrying_the_url_prints_only_its_type(capsys, monkeypatch):

@@ -13,7 +13,8 @@ import json
 import os
 import re
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from typing import Any
 from uuid import UUID
 
@@ -45,6 +46,12 @@ except ImportError:  # the postgres extra is not installed
 
 class UsageError(Exception):
     pass
+
+
+class _MalformedDatabaseUrl(Exception):
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
 
 
 def add_parser(commands: Any) -> None:
@@ -113,14 +120,20 @@ def _handler(command: Command) -> Callable[[argparse.Namespace], int]:
         # password in their text, so at this boundary only the type is printed.
         try:
             return asyncio.run(_run(command, args, url))
+        except _MalformedDatabaseUrl as exc:
+            return _database_unusable(exc.kind)
         except _DATABASE_ERRORS as exc:
-            print(f"error: the database could not be used ({type(exc).__name__})", file=sys.stderr)
-            return EXIT_DATABASE
+            return _database_unusable(type(exc).__name__)
         except Exception as exc:
             print(f"error: the command failed ({type(exc).__name__})", file=sys.stderr)
             return EXIT_DATABASE
 
     return run
+
+
+def _database_unusable(kind: str) -> int:
+    print(f"error: the database could not be used ({kind})", file=sys.stderr)
+    return EXIT_DATABASE
 
 
 def _check_usage(args: argparse.Namespace) -> None:
@@ -145,9 +158,24 @@ def _database_url(args: argparse.Namespace) -> str:
     return url
 
 
-async def _run(command: Command, args: argparse.Namespace, url: str) -> int:
-    engine = create_async_engine(url, hide_parameters=True)
+@contextmanager
+def _url_errors_are_database_errors() -> Iterator[None]:
+    """A port that is not a number (``ValueError``) or a query key the driver does not take
+    (``TypeError``) fails while the engine opens: a wrong URL, not a failed command."""
     try:
+        yield
+    except (ValueError, TypeError) as exc:
+        raise _MalformedDatabaseUrl(type(exc).__name__) from exc
+
+
+async def _run(command: Command, args: argparse.Namespace, url: str) -> int:
+    with _url_errors_are_database_errors():
+        engine = create_async_engine(url, hide_parameters=True)
+    try:
+        # One connection before the command, so the URL is checked before any command code runs.
+        with _url_errors_are_database_errors():
+            async with engine.connect():
+                pass
         tables = define_tables(sa.MetaData(), args.table_prefix)
         module = build_invoice_module(
             SqlAlchemyInvoiceUnitOfWorkFactory(
