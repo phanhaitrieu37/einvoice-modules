@@ -34,8 +34,9 @@ from tests.conftest import unique_prefix
 from tests.integration.acceptance.conftest import TENANT, AcceptanceWorld, Order
 from tests.sandbox.conftest import CREDENTIAL_REF, SANDBOX_ITEM_CODE, Sandbox, mask_ids
 
+from invoice_module.adapters.sepay import payload
 from invoice_module.adapters.sepay.endpoints import ENDPOINTS
-from invoice_module.application.config import InvoiceModuleConfig, today_vn
+from invoice_module.application.config import today_vn
 from invoice_module.application.issuer_accounts import RegisterIssuerAccountCommand
 from invoice_module.domain.enums import CrossDayAction, DeliveryMode, Environment
 from invoice_module.domain.enums import IssuerAccountStatus as AccountStatus
@@ -153,6 +154,22 @@ class ModuleSandbox:
 
     def paths(self) -> list[str]:
         return [call.path for call in self.sandbox.wire]
+
+    def assert_module_timeouts(self, since: int) -> None:
+        """Every call sent since wire position ``since`` waited at most what the module's
+        lease assumes: ``http_timeout_s`` per API call, ``artifact_timeout_s`` per download."""
+        config = self.world.invoice.config
+        calls = self.sandbox.wire[since:]
+        assert calls
+        for call in calls:
+            seconds = (
+                config.artifact_timeout_s
+                if call.path.endswith("/download")
+                else config.http_timeout_s
+            )
+            assert call.timeout == dict.fromkeys(("connect", "read", "write", "pool"), seconds), (
+                call.path
+            )
 
     async def settle(
         self, mode: DeliveryMode = DeliveryMode.AUTO, lines: tuple[LineInput, ...] | None = None
@@ -292,17 +309,12 @@ async def test_module_s1_settled_to_issued_sandbox(module_sandbox: ModuleSandbox
     document = await module_sandbox.issued(order)
     minutes = (time.monotonic() - started) / 60
 
-    assert document.invoice_number
-    assert "tax_authority_code" in document._fields  # may be empty on the sandbox
-    assert document.total_vnd == document.settled_amount_vnd == order.amount_vnd
-    assert document.request["total_amount"] == document.settled_amount_vnd
-    assert document.tracking_code == document.reference_code
-    assert module_sandbox.creates() - creates_before == 1
     check = await sandbox.raw_get(
         ENDPOINTS["check_create"][1].replace("{tracking_code}", document.tracking_code)
     )
     invoice = check["data"]["invoice"]
-    config = InvoiceModuleConfig()
+    progress = payload.parse_progress(check)
+    config = module_sandbox.world.invoice.config
     fetch_started = time.monotonic()
     artifacts = await sandbox.provider.fetch_artifacts(
         sandbox.account, sandbox.creds, document.reference_code, document.provider_invoice_id
@@ -317,6 +329,8 @@ async def test_module_s1_settled_to_issued_sandbox(module_sandbox: ModuleSandbox
             "request_total_equals_settled": document.request["total_amount"]
             == document.settled_amount_vnd,
             "tax_authority_code_present": bool(document.tax_authority_code),
+            "tax_authority_code_matches_check": document.tax_authority_code
+            == progress.tax_authority_code,
             "tracking_equals_reference": document.tracking_code == document.reference_code,
             "check_document_type": invoice.get("document_type"),
             "check_invoice_status": invoice.get("status"),
@@ -325,6 +339,13 @@ async def test_module_s1_settled_to_issued_sandbox(module_sandbox: ModuleSandbox
             "creates": module_sandbox.creates() - creates_before,
         },
     )
+    assert document.invoice_number
+    # The stored code is the provider's (it may be empty on the sandbox).
+    assert document.tax_authority_code == progress.tax_authority_code
+    assert document.total_vnd == document.settled_amount_vnd == order.amount_vnd
+    assert document.request["total_amount"] == document.settled_amount_vnd
+    assert document.tracking_code == document.reference_code
+    assert module_sandbox.creates() - creates_before == 1
     assert minutes <= 10
     assert invoice.get("status") == "issued"
     assert artifacts.pdf.startswith(b"%PDF") and artifacts.xml
@@ -336,6 +357,7 @@ async def test_module_redelivery_100_times_one_provider_invoice(
 ) -> None:
     world = module_sandbox.world
     creates_before = module_sandbox.creates()
+    wire_before = len(module_sandbox.sandbox.wire)
     delivered_before = len(world.delivered.events)
     order, document = await module_sandbox.settle()
     event = world.delivered.events[delivered_before]
@@ -380,6 +402,7 @@ async def test_module_redelivery_100_times_one_provider_invoice(
     assert module_sandbox.creates() - creates_before == 1
     assert found is not None and found.state == "success"
     assert found.invoice_number == document.invoice_number
+    module_sandbox.assert_module_timeouts(wire_before)
 
 
 async def _lost_response_recovers(
@@ -416,8 +439,9 @@ async def _lost_response_recovers(
 async def test_module_lost_response_recovers_via_lookup_sandbox(
     module_sandbox: ModuleSandbox,
 ) -> None:
-    config = InvoiceModuleConfig()
+    config = module_sandbox.world.invoice.config
     assert (config.lease_seconds, config.http_timeout_s) == (60, 20.0)
+    wire_before = len(module_sandbox.sandbox.wire)
     order, document = await module_sandbox.settle()
     issue = module_sandbox.world.invoice.issue_queued
     assert issue is not None
@@ -437,6 +461,7 @@ async def test_module_lost_response_recovers_via_lookup_sandbox(
     assert issued.status == "issued"
     assert creates == 1
     assert found is not None and found.invoice_number == issued.invoice_number
+    module_sandbox.assert_module_timeouts(wire_before)
 
 
 async def test_module_manual_create_lost_response_recovers_sandbox(
@@ -478,12 +503,22 @@ async def test_module_manual_approve_then_create_sandbox(module_sandbox: ModuleS
     assert module_sandbox.paths()[paths_before:] == []  # no SePay call before the approval
     assert await module_sandbox.lookup(document.reference_code) is None
 
+    approved_at = len(module_sandbox.paths())
     await module_sandbox.world.invoice.approve_draft_invoice.execute(document.id, ACCOUNTANT)
     sent_on: date = today_vn(SystemClock().now())
     issued = await module_sandbox.issued(order)
+    worker_paths = module_sandbox.paths()[approved_at:]
     found = await module_sandbox.lookup(issued.reference_code)
     paths = module_sandbox.paths()[paths_before:]
     issue_calls = [path for path in paths if path.startswith("/v1/invoices/issue")]
+    lookup_path = ENDPOINTS["get_by_reference"][1].replace(
+        "{reference_code}", issued.reference_code
+    )
+    lookup_first = (
+        lookup_path in worker_paths
+        and CREATE_PATH in worker_paths
+        and worker_paths.index(lookup_path) < worker_paths.index(CREATE_PATH)
+    )
     record_evidence(
         "test_module_manual_approve_then_create_sandbox",
         {
@@ -494,10 +529,13 @@ async def test_module_manual_approve_then_create_sandbox(module_sandbox: ModuleS
             "issued_date_equals_lookup": bool(found and issued.issued_date == found.issued_date),
             "approved_at_present": issued.approved_at is not None,
             "approved_by_recorded": issued.approved_by == ACCOUNTANT,
+            "lookup_before_create": lookup_first,
         },
     )
     assert issued.status == "issued" and issued.invoice_number
     assert module_sandbox.creates() - creates_before == 1
+    assert worker_paths.count(CREATE_PATH) == 1
+    assert lookup_first, worker_paths
     assert issued.request["is_draft"] is False
     assert issued.issued_date == sent_on
     assert found is not None and found.state == "success"

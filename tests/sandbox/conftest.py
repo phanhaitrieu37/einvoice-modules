@@ -27,6 +27,7 @@ import pytest_asyncio
 from invoice_module.adapters.sepay import SePayEInvoiceClient, SePayEInvoiceProvider
 from invoice_module.adapters.sepay.rate_limiter import ProcessRateLimiter
 from invoice_module.adapters.sepay.redact import redact
+from invoice_module.application.config import InvoiceModuleConfig
 from invoice_module.domain.document import Buyer, DraftData, InvoiceDocument, freeze_document
 from invoice_module.domain.enums import CrossDayAction, Environment
 from invoice_module.domain.money import LineInput, compute_total
@@ -47,8 +48,9 @@ CREDENTIAL_REF = "env:SEPAY_EINVOICE_SANDBOX"
 VN_TZ = ZoneInfo("Asia/Saigon")
 POLL_DELAYS = (3, 5, 10, 20, 30, 60)
 POLL_BUDGET_S = 600
-# The sandbox once took over 20 s to serve an XML download; the probe client used 30 s.
-SANDBOX_HTTP_TIMEOUT_S = 60.0
+# The module's own timeouts: a create may not outlive the lease extended before it is sent
+# (``http_timeout_s``); downloads have their own, longer ``artifact_timeout_s``.
+MODULE_CONFIG = InvoiceModuleConfig()
 # The sandbox refuses a goods line without item_code; the host supplies one.
 SANDBOX_ITEM_CODE = "SANDBOX-PHOTOSHOP"
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -125,6 +127,8 @@ class WireCall:
     # Decoded JSON body of API calls other than the token request and downloads (kept in
     # memory only; evidence copies go through ``mask_ids``).
     body: Any = None
+    # The timeout the request was sent with (httpx's per-phase seconds).
+    timeout: dict[str, float] | None = None
 
 
 @dataclass(repr=False)
@@ -237,6 +241,7 @@ async def sandbox(
         path = response.request.url.path
         call = WireCall(response.request.method, path, response.status_code)
         call.content_type = response.headers.get("content-type")
+        call.timeout = dict(response.request.extensions["timeout"])
         if path != "/v1/token" and not path.endswith("/download"):
             try:
                 call.body = json.loads(response.content)
@@ -258,7 +263,8 @@ async def sandbox(
             resolver,
             SystemClock(),
             ProcessRateLimiter(2.0),
-            http_timeout_s=SANDBOX_HTTP_TIMEOUT_S,
+            http_timeout_s=MODULE_CONFIG.http_timeout_s,
+            artifact_timeout_s=MODULE_CONFIG.artifact_timeout_s,
         )
         provider = SePayEInvoiceProvider(client)
         bootstrap = _bootstrap_account(accounting_config, "")
