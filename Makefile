@@ -41,3 +41,4 @@ build:
 ci:
 	$(MAKE) lint
 	$(MAKE) test
+	$(MAKE) acceptance
