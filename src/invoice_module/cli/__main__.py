@@ -10,6 +10,9 @@ PROG = "python -m invoice_module.cli"
 HIDDEN = "<hidden>"
 # A value that cannot hold a database URL or a password stays readable in a usage error.
 _PLAIN_VALUE = re.compile(r"[\w.-]+")
+# An option name as typed before any ``=``; a dash token that is not one (``-xuser:pw@host``)
+# is a typed value as a whole.
+_OPTION_NAME = re.compile(r"-[\w-]*")
 _URL_LIKE = re.compile(r"\S*://\S*")
 
 
@@ -27,8 +30,15 @@ class _Parser(argparse.ArgumentParser):
         raise _UsageFailure(self.format_usage(), message)
 
 
+def _typed_value(token: str) -> str:
+    if not token.startswith("-"):
+        return token
+    name, _, value = token.partition("=")
+    return value if _OPTION_NAME.fullmatch(name) else token
+
+
 def _hide_typed_values(message: str, argv: Sequence[str]) -> str:
-    values = {token.partition("=")[2] if token.startswith("-") else token for token in argv}
+    values = {_typed_value(token) for token in argv}
     # argparse quotes a wrong value with repr(), which escapes backslashes and quotes, so the
     # quoted form is hidden as well as the typed one.
     forms = {
