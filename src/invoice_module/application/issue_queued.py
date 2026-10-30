@@ -57,8 +57,9 @@ logger = logging.getLogger(__name__)
 ISSUED_DATE_INVALID = IssueErrorCode.ISSUED_DATE_INVALID.value
 # Provider rejection code -> error recorded on the document; any other code is a validation
 # error. The code is matched exactly as the adapter passes it: only the synchronous 400 date
-# rejection arrives as ``issued_date_invalid``, while a 2xx carrying ``ISSUED_DATE_INVALID`` may
-# have queued a job and must not reach the resend path, so letter case is never normalised.
+# rejection arrives as ``issued_date_invalid`` and it takes the date path before this table is
+# read, while a 2xx carrying ``ISSUED_DATE_INVALID`` may have queued a job and must not reach the
+# resend path, so letter case is never normalised and that code stays a validation error.
 PROVIDER_CODE_TO_ERROR: Mapping[str, IssueErrorCode] = MappingProxyType(
     {
         "REGISTRATION_NOT_COMPLETE": IssueErrorCode.REGISTRATION_NOT_APPROVED,
@@ -68,7 +69,6 @@ PROVIDER_CODE_TO_ERROR: Mapping[str, IssueErrorCode] = MappingProxyType(
         "INVOICE_DATE_BEFORE_TAX_APPROVAL": IssueErrorCode.REGISTRATION_NOT_APPROVED,
         "SELLER_STORE_NOT_FOUND": IssueErrorCode.SELLER_STORE_INVALID,
         "SELLER_STORE_INACTIVE": IssueErrorCode.SELLER_STORE_INVALID,
-        ISSUED_DATE_INVALID: IssueErrorCode.ISSUED_DATE_INVALID,
     }
 )
 
@@ -276,7 +276,7 @@ class IssueQueued:
 
         ``after_date_rejection``: the provider refused the earlier POST for its date, a
         definitive answer, so any permission to resend that POST is spent; the details record
-        which POST of the reference it was.
+        which POST of which reference it was.
         """
         action = account.issue_date_cross_day_action
         if action != CrossDayAction.ISSUE and not await self._cross_day_confirmed(document):
@@ -291,7 +291,7 @@ class IssueQueued:
             values: dict[str, Any] = {}
             if after_date_rejection:
                 details["after_date_rejection"] = True
-                details["post_count"] = document.post_count
+                details |= _answered_post(document, document.post_count)
                 values["request_authorized_resend"] = False
             async with self._uow_factory() as uow:
                 state.ensure_transition(document.status, DocumentStatus.BLOCKED)
@@ -395,12 +395,14 @@ class IssueQueued:
                         {
                             "code": exc.code,
                             "after_date_resend": True,
-                            "post_count": document.post_count + 1,
+                            **_answered_post(document, document.post_count + 1),
                         },
                         request_authorized_resend=False,
                     )
                 return await self._date_rejected(document, account, creds)
-            return await self._rejected(document, exc.code)
+            return await self._rejected(
+                document, exc.code, document.post_count + guard.granted if guard.granted else None
+            )
         except ProviderAuthFailed:
             return await self._fail(
                 document,
@@ -542,7 +544,7 @@ class IssueQueued:
         assert current is not None
         if current.lease_generation != document.lease_generation:
             return self._lease_lost(document)
-        budget = {"post_count": current.post_count, "post_limit": current.post_limit}
+        budget = _answered_post(current, current.post_count) | {"post_limit": current.post_limit}
         if (
             current.post_count == 1
             and current.date_resend_at is None
@@ -570,12 +572,16 @@ class IssueQueued:
             return "date_resend_used"
         if current.post_count < 2:
             return "operator_grant_used"
+        # Only the POST right before this one, under the same reference, counts: any POST in
+        # between may be unanswered, and a rotated reference starts its count again.
+        previous = _answered_post(current, current.post_count - 1)
         async with self._uow_factory() as uow:
-            # Only the POST right before this one counts: any POST in between may be unanswered.
             rejected_before = await uow.review_cases.reason_recorded(
                 current.id,
                 ReviewReason.ISSUE_DATE_CROSSED_DAY.value,
-                {"after_date_rejection": True, "post_count": current.post_count - 1},
+                {"after_date_rejection": True} | previous,
+            ) or await uow.review_cases.reason_recorded(
+                current.id, ReviewReason.PROVIDER_REJECTED.value, previous
             )
         # Otherwise the POST before this one has no recorded answer.
         return "earlier_post_rejected" if rejected_before else "earlier_post_unrecorded"
@@ -661,12 +667,17 @@ class IssueQueued:
         self._count("invoice_quota_exhausted_total")
         return IssueResult(document.id, "quota")
 
-    async def _rejected(self, document: DocumentRow, code: str) -> IssueResult:
+    async def _rejected(self, document: DocumentRow, code: str, post: int | None) -> IssueResult:
+        """``post`` is the POST of the reference this rejection answered, ``None`` when no POST
+        was sent (the refusal came before the send boundary)."""
+        details: dict[str, Any] = {"code": code}
+        if post is not None:
+            details |= _answered_post(document, post)
         return await self._fail(
             document,
             PROVIDER_CODE_TO_ERROR.get(code, IssueErrorCode.VALIDATION_ERROR),
             ReviewReason.PROVIDER_REJECTED,
-            {"code": code},
+            details,
             request_authorized_resend=False,
         )
 
@@ -751,6 +762,11 @@ def _log_approval_invalidated(document: DocumentRow, entry: dict[str, Any] | Non
             "reason": entry["reason"],
         },
     )
+
+
+def _answered_post(document: DocumentRow, post_count: int) -> dict[str, Any]:
+    """Which POST of which reference a recorded provider answer belongs to."""
+    return {"post_count": post_count, "reference_code": document.reference_code}
 
 
 def failed_job_details(message: str | None) -> dict[str, Any]:

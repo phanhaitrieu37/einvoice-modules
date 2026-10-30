@@ -1,5 +1,6 @@
 """Operational settings of the invoice worker and the date rules it shares with the review queue."""
 
+import math
 import os
 import socket
 import uuid
@@ -33,10 +34,10 @@ class InvoiceModuleConfig:
     def __post_init__(self) -> None:
         # A client timeout never proves the provider stopped working on a request, so there is
         # no timeout/lease inequality to enforce here; the timeout only has to be a real wait.
-        if self.http_timeout_s <= 0:
-            raise ValueError("http_timeout_s must be positive")
-        if self.artifact_timeout_s <= 0:
-            raise ValueError("artifact_timeout_s must be positive")
+        if not math.isfinite(self.http_timeout_s) or self.http_timeout_s <= 0:
+            raise ValueError("http_timeout_s must be a positive finite number")
+        if not math.isfinite(self.artifact_timeout_s) or self.artifact_timeout_s <= 0:
+            raise ValueError("artifact_timeout_s must be a positive finite number")
         if not self.poll_schedule_s:
             raise ValueError("poll_schedule_s must not be empty")
 

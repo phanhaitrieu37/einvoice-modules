@@ -540,7 +540,7 @@ async def test_corrected_draft_resolves_case_opened_only_for_amount_mismatch(eng
             payment.host_ref_type,
             payment.host_ref_id,
             payment.intent_id,
-            (LineInput("Service", "each", Decimal("1"), amount, 0),),
+            (LineInput("Service", "each", Decimal("1"), amount, 0, item_code="TEST-ITEM-1"),),
             amount,
             delivery_mode=DeliveryMode.AUTO,
         )
@@ -603,7 +603,7 @@ async def test_amount_mismatch_blocks_with_review_and_no_snapshot(engine, inv_ta
             payment.host_ref_type,
             payment.host_ref_id,
             payment.intent_id,
-            (LineInput("Service", "each", Decimal("1"), 200, 0),),
+            (LineInput("Service", "each", Decimal("1"), 200, 0, item_code="TEST-ITEM-1"),),
             200,
             delivery_mode=DeliveryMode.AUTO,
         )
@@ -649,7 +649,7 @@ async def test_missing_issuer_account_blocks_with_receipt_matrix(
                 payment.host_ref_type,
                 payment.host_ref_id,
                 draft_intent,
-                (LineInput("Service", "each", Decimal("1"), amount, 0),),
+                (LineInput("Service", "each", Decimal("1"), amount, 0, item_code="TEST-ITEM-1"),),
                 amount,
                 delivery_mode=DeliveryMode.AUTO,
             )
@@ -788,7 +788,7 @@ async def test_matches_draft_by_intent_before_host_ref(engine, inv_tables):
             payment.host_ref_type,
             payment.host_ref_id,
             other_intent,
-            (LineInput("Wrong", "each", Decimal("1"), 200, 0),),
+            (LineInput("Wrong", "each", Decimal("1"), 200, 0, item_code="TEST-ITEM-1"),),
             200,
             delivery_mode=DeliveryMode.AUTO,
         )
@@ -800,7 +800,7 @@ async def test_matches_draft_by_intent_before_host_ref(engine, inv_tables):
             payment.host_ref_type,
             "other-host",
             payment.intent_id,
-            (LineInput("Right", "each", Decimal("1"), 100, 0),),
+            (LineInput("Right", "each", Decimal("1"), 100, 0, item_code="TEST-ITEM-1"),),
             100,
             delivery_mode=DeliveryMode.AUTO,
         )
@@ -829,7 +829,7 @@ async def test_host_ref_fallback_ignores_draft_bound_to_other_intent(engine, inv
             payment.host_ref_type,
             payment.host_ref_id,
             uuid4(),
-            (LineInput("Wrong", "each", Decimal("1"), 100, 0),),
+            (LineInput("Wrong", "each", Decimal("1"), 100, 0, item_code="TEST-ITEM-1"),),
             100,
             delivery_mode=DeliveryMode.AUTO,
         )
@@ -1049,7 +1049,7 @@ async def test_duplicate_settlement_with_amount_mismatch_keeps_one_open_case(eng
             "order",
             first.host_ref_id,
             second.intent_id,
-            (LineInput("Service", "each", Decimal("1"), 200, 0),),
+            (LineInput("Service", "each", Decimal("1"), 200, 0, item_code="TEST-ITEM-1"),),
             200,
             delivery_mode=DeliveryMode.AUTO,
         )

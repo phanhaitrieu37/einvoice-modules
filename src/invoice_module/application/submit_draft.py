@@ -48,16 +48,24 @@ class SubmitDraftResult:
 
 
 def build_line_inputs(lines: Sequence[LineInput | Mapping[str, Any]]) -> tuple[LineInput, ...]:
-    """Build lines at the ingestion boundary and preserve the source position in errors."""
+    """Build lines at the ingestion boundary and preserve the source position in errors.
+
+    Every line is sent as a goods line (``line_type`` 1), which the SePay sandbox refuses
+    without an ``item_code`` although the docs mark it optional, so a line without a
+    non-blank code is refused here, before any database work.
+    """
     built: list[LineInput] = []
     for index, value in enumerate(lines):
         if isinstance(value, LineInput):
-            built.append(value)
-            continue
-        try:
-            built.append(LineInput(**value))
-        except InvalidLine as exc:
-            raise InvalidLine(index, exc.field) from exc
+            line = value
+        else:
+            try:
+                line = LineInput(**value)
+            except InvalidLine as exc:
+                raise InvalidLine(index, exc.field) from exc
+        if not isinstance(line.item_code, str) or not line.item_code.strip():
+            raise InvalidLine(index, "item_code")
+        built.append(line)
     return tuple(built)
 
 

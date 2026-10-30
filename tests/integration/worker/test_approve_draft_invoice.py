@@ -45,7 +45,7 @@ async def test_approve_moves_awaiting_to_approved_with_actor(world, caplog):
             "order",
             host_ref,
             intent,
-            (LineInput("Synthetic service", "each", Decimal("1"), 100, 0),),
+            (LineInput("Synthetic service", "each", Decimal("1"), 100, 0, item_code="SYN-ITEM-1"),),
             100,
             buyer=BUYER,
             delivery_mode=MANUAL,
