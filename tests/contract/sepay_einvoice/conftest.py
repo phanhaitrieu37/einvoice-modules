@@ -5,6 +5,7 @@ removed); hand-built responses live in ``synthetic/`` and say so in their ``_syn
 field. Buyer values below are synthetic.
 """
 
+import asyncio
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -230,3 +231,127 @@ def harness(creds: ClientCredentials) -> Callable[..., Harness]:
         return Harness(client, SePayEInvoiceProvider(client), clock, events, requests)
 
     return build
+
+
+@dataclass(frozen=True)
+class Answer:
+    """An HTTP answer of ``LocalSePay``: the head goes out at once, then the body in ``chunks``
+    pieces, each sent ``gap_s`` after the previous one."""
+
+    status: int
+    body: Any
+    chunks: int = 1
+    gap_s: float = 0.0
+
+    def encoded(self) -> bytes:
+        return json.dumps(self.body).encode()
+
+
+@dataclass
+class Exchange:
+    """One request seen by ``LocalSePay`` and how long its connection stayed open (loop time)."""
+
+    method: str
+    path: str
+    body: bytes
+    opened: float
+    closed: float | None = None
+    # False when the client left before the whole answer was sent.
+    completed: bool = False
+
+
+class LocalSePay:
+    """A real-socket HTTP/1.1 stand-in for the sandbox host on 127.0.0.1, for answers that
+    trickle in. ``transport()`` sends every request of a client to it whatever the URL's
+    host, so the client keeps its sandbox base URL; one request per connection."""
+
+    def __init__(self, answer: Callable[[str, str, bytes], Answer]) -> None:
+        self._answer = answer
+        self._server: asyncio.Server | None = None
+        self.exchanges: list[Exchange] = []
+
+    async def __aenter__(self) -> "LocalSePay":
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        assert self._server is not None
+        self._server.close()
+        await self._server.wait_closed()
+
+    def transport(self) -> httpx.AsyncBaseTransport:
+        assert self._server is not None
+        return _ToLocal(self._server.sockets[0].getsockname()[1])
+
+    def seen(self, method: str, path: str) -> list[Exchange]:
+        return [e for e in self.exchanges if (e.method, e.path) == (method, path)]
+
+    @staticmethod
+    def most_open_at_once(exchanges: list[Exchange]) -> int:
+        """The largest number of these exchanges whose connections were open together."""
+        edges = sorted(
+            [(e.opened, 1) for e in exchanges]
+            + [(e.closed if e.closed is not None else float("inf"), -1) for e in exchanges]
+        )
+        open_now = most = 0
+        for _, step in edges:
+            open_now += step
+            most = max(most, open_now)
+        return most
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        loop = asyncio.get_running_loop()
+        exchange: Exchange | None = None
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+            method, path, _ = head.split(b"\r\n", 1)[0].decode("ascii").split(" ")
+            length = 0
+            for line in head.split(b"\r\n")[1:]:
+                name, _, value = line.partition(b":")
+                if name.strip().lower() == b"content-length":
+                    length = int(value)
+            body = await reader.readexactly(length) if length else b""
+            exchange = Exchange(method, path, body, loop.time())
+            self.exchanges.append(exchange)
+            answer = self._answer(method, path, body)
+            content = answer.encoded()
+            writer.write(
+                f"HTTP/1.1 {answer.status} X\r\nContent-Type: application/json\r\n"
+                f"Content-Length: {len(content)}\r\nConnection: close\r\n\r\n".encode()
+            )
+            await writer.drain()
+            step = -(-len(content) // answer.chunks)
+            for start in range(0, len(content), step):
+                if answer.gap_s and await _left(reader, answer.gap_s):
+                    break
+                writer.write(content[start : start + step])
+                await writer.drain()
+            else:
+                exchange.completed = True
+            exchange.closed = loop.time()
+        except (ConnectionError, asyncio.IncompleteReadError):
+            if exchange is not None:
+                exchange.closed = loop.time()
+        finally:
+            writer.close()
+
+
+async def _left(reader: asyncio.StreamReader, seconds: float) -> bool:
+    """Whether the client closed its connection within ``seconds``; it sends nothing more
+    after its request, so a read only ends at the connection's end."""
+    try:
+        async with asyncio.timeout(seconds):
+            await reader.read(1)
+    except TimeoutError:
+        return False
+    return True
+
+
+class _ToLocal(httpx.AsyncHTTPTransport):
+    def __init__(self, port: int) -> None:
+        super().__init__()
+        self._port = port
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        request.url = request.url.copy_with(scheme="http", host="127.0.0.1", port=self._port)
+        return await super().handle_async_request(request)
