@@ -340,8 +340,8 @@ async def test_module_s1_settled_to_issued_sandbox(module_sandbox: ModuleSandbox
         },
     )
     assert document.invoice_number
-    # The code is recorded for the issued document; its value may be empty on the sandbox.
-    assert "tax_authority_code" in document._mapping
+    # The stored code is the one the check answered, or empty when the sandbox filled it later.
+    assert document.tax_authority_code in (None, progress.tax_authority_code)
     assert document.total_vnd == document.settled_amount_vnd == order.amount_vnd
     assert document.request["total_amount"] == document.settled_amount_vnd
     assert document.tracking_code == document.reference_code
