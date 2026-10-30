@@ -164,3 +164,10 @@ def test_core_has_no_optional_imports() -> None:
             )
             assert not relative_imports
     assert scanned > 0
+
+
+def test_check_create_may_find_no_job_and_artifacts_need_no_provider_id() -> None:
+    """SePay answers "no such job" for an unknown tracking code and never reports an invoice id."""
+    assert get_type_hints(EInvoiceProvider.check_create)["return"] == ProviderProgress | None
+    hints = get_type_hints(EInvoiceProvider.fetch_artifacts)
+    assert hints["provider_invoice_id"] == str | None

@@ -15,6 +15,7 @@ import httpx
 import pytest
 
 from invoice_module.adapters.sepay import endpoints, payload
+from invoice_module.adapters.sepay.errors import CHECK_TRACKING_NOT_FOUND
 from invoice_module.adapters.sepay.payload import (
     build_create_payload,
     parse_accepted,
@@ -431,6 +432,79 @@ async def test_provider_find_by_reference_none_on_404(
     failing = harness(lambda request: httpx.Response(500, json={}))
     with pytest.raises(ProviderTransient):
         await failing.provider.find_by_reference(account, creds, REFERENCE)
+
+
+def test_recorded_unknown_tracking_fixture_is_404_with_envelope(recorded: Loader) -> None:
+    record = recorded("check_unknown_tracking.json")
+    assert record["status"] == 404
+    assert record["request"] == {"method": "GET", "path": endpoints.ENDPOINTS["check_create"][1]}
+    assert record["headers"]["content-type"].startswith("application/json")
+    assert record["body"]["success"] is False
+    assert record["body"]["error"]["code"] == CHECK_TRACKING_NOT_FOUND
+    assert isinstance(record["body"]["error"]["message"], str)
+    assert "data" not in record["body"]
+
+
+@pytest.mark.parametrize("status", [404, 500])
+async def test_provider_check_create_none_when_no_job(
+    status: int,
+    harness: Callable[..., Any],
+    recorded: Loader,
+    account: IssuerAccountView,
+    creds: Any,
+) -> None:
+    """Replays the sandbox answer for a tracking code it never received; the code decides."""
+    h = harness(lambda request: _json(recorded("check_unknown_tracking.json"), status))
+    assert await h.provider.check_create(account, creds, REFERENCE) is None
+    assert [r.url.path for r in h.calls("/v1/invoices/")] == [
+        f"/v1/invoices/create/check/{REFERENCE}"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("response", "error"),
+    [
+        (
+            httpx.Response(404, json={"success": False, "error": {"code": "NOT_FOUND"}}),
+            ProviderRejected,
+        ),
+        (httpx.Response(404, text="<html>Not Found</html>"), ProviderRejected),
+        (
+            httpx.Response(
+                500, json={"success": False, "error": {"code": "EINVOICE_DRAFT_NOT_FOUND"}}
+            ),
+            ProviderTransient,
+        ),
+        (httpx.Response(500, json={}), ProviderTransient),
+        (
+            httpx.Response(
+                200, json={"success": False, "error": {"code": CHECK_TRACKING_NOT_FOUND}}
+            ),
+            ProviderTransient,
+        ),
+        (
+            httpx.Response(
+                404, json={"success": True, "error": {"code": CHECK_TRACKING_NOT_FOUND}}
+            ),
+            ProviderRejected,
+        ),
+        (
+            httpx.Response(500, json={"success": False, "error": {"code": "BILLING_IS_UNPAID"}}),
+            ProviderRejected,
+        ),
+    ],
+)
+async def test_provider_check_create_other_not_found_answers_are_not_no_job(
+    response: httpx.Response,
+    error: type[Exception],
+    harness: Callable[..., Any],
+    account: IssuerAccountView,
+    creds: Any,
+) -> None:
+    """Only the recorded code in an error envelope means "no such job"."""
+    h = harness(lambda request: response)
+    with pytest.raises(error):
+        await h.provider.check_create(account, creds, REFERENCE)
 
 
 @pytest.mark.parametrize(

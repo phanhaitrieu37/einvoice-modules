@@ -16,6 +16,7 @@ from tests.fakes.fake_einvoice_provider import (
     CRASH_AFTER_RECEIVE,
     CRASH_BEFORE_SEND,
     LOST_RESPONSE,
+    NO_JOB,
     QUOTA,
     TRANSIENT,
     rejected,
@@ -207,16 +208,19 @@ async def test_provider_received_but_response_lost_recovers_via_lookup_before_re
 async def test_provider_received_but_response_lost_recovers_via_409(world):
     settled = await world.settle()
     world.provider.script_create(settled.reference, CRASH_AFTER_RECEIVE)
-    world.provider.script_lookup(settled.reference, None)  # the lookup lags behind the create
+    # Neither the lookup nor the status check sees the create yet.
+    world.provider.script_lookup(settled.reference, None)
+    world.provider.script_check(settled.reference, NO_JOB)
     with pytest.raises(Crash):
         await world.issue()
     await restart(world)
     await converge(world)
     doc = await assert_converged(world, settled)
     assert doc.status == "issued" and len(posts(world, settled)) == 2
-    assert world.provider.ops()[:4] == [
+    assert world.provider.ops()[:5] == [
         "create",
         "find_by_reference",
+        "check_create",
         "create",
         "find_by_reference",
     ]

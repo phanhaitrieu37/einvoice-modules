@@ -9,7 +9,12 @@ from urllib.parse import quote
 from invoice_module.adapters.sepay import payload
 from invoice_module.adapters.sepay.client import Response, SePayEInvoiceClient
 from invoice_module.adapters.sepay.endpoints import ENDPOINTS, PROVIDER_ACCOUNT_DETAIL, endpoint
-from invoice_module.adapters.sepay.errors import ISSUED_DATE_INVALID, error_code, map_error
+from invoice_module.adapters.sepay.errors import (
+    CHECK_TRACKING_NOT_FOUND,
+    ISSUED_DATE_INVALID,
+    error_code,
+    map_error,
+)
 from invoice_module.domain.document import InvoiceDocument
 from invoice_module.ports.provider import (
     Accepted,
@@ -27,6 +32,7 @@ from invoice_module.ports.provider import (
 )
 
 NOT_FOUND = 404
+SERVER_ERROR = 500
 ARTIFACT_KINDS = ("pdf", "xml")
 PDF_MAGIC = b"%PDF"
 # Largest page of provider accounts the API serves (docs ``danh-sach-tai-khoan``).
@@ -81,13 +87,26 @@ class SePayEInvoiceProvider:
 
     async def check_create(
         self, account: IssuerAccountView, creds: ClientCredentials, tracking_code: str
-    ) -> ProviderProgress:
-        """The job of ``tracking_code``; an error envelope or a job of another reference is
-        an unclear answer."""
+    ) -> ProviderProgress | None:
+        """The job of ``tracking_code``; ``None`` when the provider has no such job.
+
+        "No such job" is the error envelope with ``EINVOICE_CREATE_TRACKING_NOT_FOUND``
+        (recorded as 404; docs: "Không tìm thấy yêu cầu tương ứng với tracking_code"), matched
+        by code on a 404 or a 500. Any other 404 or 500 maps like an error response; an error
+        envelope in a 2xx or a job of another reference is an unclear answer.
+        """
         method, template = endpoint("check_create")
         response = await self._client.request(
-            method, _path(template, tracking_code=tracking_code), account=account, creds=creds
+            method,
+            _path(template, tracking_code=tracking_code),
+            account=account,
+            creds=creds,
+            accept=(NOT_FOUND, SERVER_ERROR),
         )
+        if response.status in (NOT_FOUND, SERVER_ERROR):
+            if _is_failure(response.body) and error_code(response.body) == CHECK_TRACKING_NOT_FOUND:
+                return None
+            raise map_error(response.status, response.body, response.headers)
         returned = payload.response_data(response.body).get("reference_code")
         if _is_failure(response.body) or (returned is not None and returned != tracking_code):
             raise ProviderTransient(retry_after=None)
@@ -123,7 +142,7 @@ class SePayEInvoiceProvider:
         account: IssuerAccountView,
         creds: ClientCredentials,
         reference_code: str,
-        provider_invoice_id: str,
+        provider_invoice_id: str | None,
     ) -> Artifacts:
         """PDF and XML as bytes (the download returns base64 ``data.content``).
 

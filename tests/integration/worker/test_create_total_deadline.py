@@ -11,7 +11,7 @@ import json
 
 import httpx
 import pytest
-from tests.contract.sepay_einvoice.conftest import Answer, LocalSePay
+from tests.contract.sepay_einvoice.conftest import RECORDED, Answer, LocalSePay, read_json
 from tests.integration.worker.world import World
 
 from invoice_module.adapters.sepay import SePayEInvoiceClient, SePayEInvoiceProvider
@@ -30,6 +30,9 @@ CONFIG = InvoiceModuleConfig(lease_seconds=3, http_timeout_s=1.0)
 CHUNKS, GAP_S = 8, 0.6
 TOKEN = {"success": True, "data": {"access_token": "synthetic-token", "expires_in": 86400}}
 NOT_FOUND = {"success": False, "error": {"code": "EINVOICE_DOCUMENT_NOT_FOUND"}}
+# The recorded status check answer for a tracking code the provider never received.
+NO_JOB = read_json(RECORDED / "check_unknown_tracking.json")
+CHECK = "/v1/invoices/create/check/"
 
 
 def sandbox(method: str, path: str, body: bytes) -> Answer:
@@ -39,6 +42,8 @@ def sandbox(method: str, path: str, body: bytes) -> Answer:
         accepted = {"tracking_code": json.loads(body)["reference_code"]}
         return Answer(202, {"success": True, "data": accepted}, chunks=CHUNKS, gap_s=GAP_S)
     assert method == "GET" and path.startswith("/v1/invoices/"), path
+    if path.startswith(CHECK):
+        return Answer(NO_JOB["status"], NO_JOB["body"])
     return Answer(404, NOT_FOUND)
 
 
@@ -92,9 +97,11 @@ async def test_a_trickled_create_ends_before_its_lease_and_never_overlaps_anothe
     assert [json.loads(post.body)["reference_code"] for post in posts] == [settled.reference] * 2
     assert posts[0].completed is False
     assert posts[0].closed is not None and posts[0].closed - started < CONFIG.lease_seconds
-    # The second worker looked the reference up after the first POST ended, then sent its own.
+    # The second worker looked the reference up and checked its job after the first POST ended,
+    # then sent its own.
     [lookup] = server.seen("GET", f"/v1/invoices/{settled.reference}")
-    assert posts[0].closed <= lookup.opened < posts[1].opened
+    [check] = server.seen("GET", f"{CHECK}{settled.reference}")
+    assert posts[0].closed <= lookup.opened < check.opened < posts[1].opened
     assert later == [IssueResult(settled.document_id, "backoff")]
     document = await world.doc(settled.document_id)
     assert (document.status, document.reference_code) == ("queued", settled.reference)

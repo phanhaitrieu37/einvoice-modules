@@ -682,7 +682,7 @@ async def test_retry_failed_manual_lookup_none_returns_to_approved(world, approv
             "accountant-a",
         )
         await world.issue()
-        assert world.provider.ops()[-2:] == ["find_by_reference", "create"]
+        assert world.provider.ops()[-3:] == ["find_by_reference", "check_create", "create"]
         assert len(world.provider.posts()) == 2
     else:
         assert (doc.status, doc.approved_at) == ("queued", None)
@@ -1270,8 +1270,9 @@ async def test_quota_retry_after_topup_grants_exactly_one_post(world):
         )
         before = len(world.provider.calls)
         await world.issue()
-        # The quota answer created nothing, so the lookup finds nothing and one POST follows.
-        assert world.provider.ops()[before:] == ["find_by_reference", "create"]
+        # The quota answer created nothing, so the lookup and the check find nothing and one
+        # POST follows.
+        assert world.provider.ops()[before:] == ["find_by_reference", "check_create", "create"]
     before = len(world.provider.calls)
     for _ in range(12):
         world.advance(timedelta(hours=2))
@@ -1326,7 +1327,7 @@ async def test_quota_review_on_approved_keeps_approval(world):
     assert await world.open_reasons(settled.document_id) == []
     world.provider.calls.clear()
     await world.issue()
-    assert world.provider.ops() == ["find_by_reference", "create"]
+    assert world.provider.ops() == ["find_by_reference", "check_create", "create"]
     doc = await world.doc(settled.document_id)
     assert (doc.status, doc.approved_by) == ("approved", "accountant-a")
     assert await world.open_reasons(settled.document_id) == ["QUOTA_EXHAUSTED"]

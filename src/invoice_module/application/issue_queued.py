@@ -4,8 +4,9 @@ record the outcome with a compare-and-set on the claim's lease generation.
 Every POST goes through the send-boundary hook, where ``mark_post`` is the only grant of one
 transport request; the reference has a POST budget (two automatic POSTs by default, one more
 per operator grant), so no path can send a third automatic create for a reference. Any POST
-whose outcome is unknown is followed by a lookup before anything else is sent. The reference
-code never changes here.
+whose outcome is unknown is followed by a lookup before anything else is sent, and by a status
+check of its job when the lookup finds nothing: the lookup does not see an invoice whose job is
+still running. The reference code never changes here.
 """
 
 import logging
@@ -242,6 +243,27 @@ class IssueQueued:
             if found.state != "failed" or not document.request_authorized_resend:
                 return await self._apply_lookup(document, found)
             lookup_state = "failed"  # an operator allowed a resend after this known failure
+        elif document.post_count > 0:
+            # The tracking code is the reference code: a job the provider accepted is found here
+            # before its invoice reaches the lookup.
+            try:
+                job = await self._provider.check_create(account, creds, document.reference_code)
+            except ProviderTransient as exc:
+                return await self._backoff(document, exc.retry_after)
+            except ProviderRejected:
+                # A refused check is an unclear answer, never a reason to resend.
+                return await self._backoff(document, None)
+            except ProviderAuthFailed:
+                return await self._fail(
+                    document,
+                    IssueErrorCode.AUTH_FAILED,
+                    ReviewReason.AUTH_FAILED,
+                    {"phase": "check"},
+                )
+            if job is not None:
+                if job.state != "failed" or not document.request_authorized_resend:
+                    return await self._to_pending(document, document.reference_code)
+                lookup_state = "failed"
         if document.post_count >= document.post_limit:
             return await self._fail(
                 document,

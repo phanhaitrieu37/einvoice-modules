@@ -32,6 +32,10 @@ QUOTA_CODE = "QUOTA_HAS_BEEN_USERD_UP"
 ACCOUNT_STATUS_CODES = frozenset(
     {"REGISTRATION_NOT_COMPLETE", "BILLING_IS_UNPAID", "EINVOICE_ACCOUNT_NOT_FOUND"}
 )
+# A status check of a tracking code the provider never received (recorded sandbox answer,
+# ``check_unknown_tracking.json``; docs: "Không tìm thấy yêu cầu tương ứng với tracking_code").
+# The sandbox has answered other not-found cases with HTTP 500, so only the code is matched.
+CHECK_TRACKING_NOT_FOUND = "EINVOICE_CREATE_TRACKING_NOT_FOUND"
 # Longest ``Retry-After`` honoured, in seconds; the docs do not document the header at all.
 MAX_RETRY_AFTER_S = 86400
 
