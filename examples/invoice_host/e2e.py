@@ -7,13 +7,18 @@
         --expect-bank-reference REF --out FILE --timeout 1800
 
 ``place-order`` creates the order, its payment intent and its invoice draft in one
-transaction and prints one JSON line with ``intent_id``, ``payment_reference`` and
-``amount_vnd``: the transfer to make. The draft line is the accountant's first product line
-(name, unit, tax rate) with the unit price that makes the total, tax included, exactly N.
+transaction and prints one JSON line with ``intent_id``, ``payment_reference``,
+``amount_vnd`` and ``expires_at``: the transfer to make. The intent expires 30 minutes after
+it is placed; a transfer that arrives later does not settle it, so make the SePay Test
+transfer within that window (or place a new order). The draft line is the accountant's first
+product line (name, unit, tax rate) with the unit price that makes the total, tax included,
+exactly N.
 
-``pay-local`` stands in for SePay Test: it signs a transfer for the intent with
+``pay-local`` stands in for SePay Test: it signs a transfer into the intent's receiving
+account (its bank code and number, as onboarded by ``serve``) with
 ``SEPAY_TEST_WEBHOOK_SECRET`` read from the payment env file in this process (never printed),
-posts it to the host and prints the generated ``bank_reference`` (always ``LOCAL-...``).
+posts it to the host and prints the generated ``bank_reference`` (always ``LOCAL-...``). Any
+answer but HTTP 200 exits 2.
 
 ``wait`` watches only the given intent until its settlement's original invoice is issued with
 its PDF and XML, then writes a JSON summary. The settlement's bank transaction reference must
@@ -21,7 +26,8 @@ equal ``--expect-bank-reference`` (both trimmed and upper-cased, as payment-modu
 it): a ``LOCAL-`` reference is a locally signed transfer (``source=local_signed``), any other
 is the reference read from the real SePay Test transaction (``source=sepay_test``). Exit 0
 with the file written; 3 when the timeout passes first; 4 when the reference is missing or
-different. Nothing is written unless the exit code is 0.
+different. Nothing is written unless the exit code is 0. A usage error exits 2 without
+repeating a typed value that could hold the database URL.
 """
 
 from __future__ import annotations
@@ -39,14 +45,21 @@ from uuid import UUID, uuid4
 
 import httpx
 import sqlalchemy as sa
+from payment_module.adapters.sepay.provider import SIGNATURE_HEADER, TIMESTAMP_HEADER, sign
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from invoice_module.cli.__main__ import _Parser
 from invoice_module.domain.enums import DeliveryMode
 from invoice_module.domain.money import LineInput, compute_total
 from tools.einvoice_probe.envfile import load_env_file
 
 from .main import TENANT, HostTables, Onboarded, build, define_host_tables, place_order
-from .serve import PM_WEBHOOK_SECRET, default_accounting_config, read_issuer_config
+from .serve import (
+    PM_WEBHOOK_SECRET,
+    default_accounting_config,
+    parse_hiding_values,
+    read_issuer_config,
+)
 from .sign_webhook import LOCAL_REFERENCE_PREFIX, signed_delivery
 
 EXIT_TIMEOUT, EXIT_UNKNOWN_SOURCE, EXIT_USAGE = 3, 4, 2
@@ -129,8 +142,30 @@ async def place(
         "intent_id": str(intent.id),
         "payment_reference": intent.payment_reference,
         "amount_vnd": intent.amount.value,
+        "expires_at": intent.expires_at.isoformat(),
         "order_id": order_id,
     }
+
+
+def signed_transfer(
+    secret: str,
+    bank_code: str,
+    account_number: str,
+    amount_vnd: int,
+    code: str,
+    *,
+    reference_code_prefix: str = LOCAL_REFERENCE_PREFIX,
+) -> tuple[bytes, dict[str, str], str]:
+    """``signed_delivery`` into ``bank_code``'s account ``account_number``: that helper always
+    names Vietcombank as the gateway, and the gateway is part of the account a webhook
+    settles into, so the body names ``bank_code`` and is signed again."""
+    raw, headers, bank_reference = signed_delivery(
+        secret, account_number, amount_vnd, code, code, reference_code_prefix=reference_code_prefix
+    )
+    body = json.loads(raw) | {"gateway": bank_code}
+    raw = json.dumps(body).encode()
+    headers = {**headers, SIGNATURE_HEADER: sign(raw, secret, int(headers[TIMESTAMP_HEADER]))}
+    return raw, headers, bank_reference
 
 
 async def pay_local(
@@ -154,6 +189,7 @@ async def pay_local(
                     sa.select(
                         intents.c.amount_vnd,
                         intents.c.payment_reference,
+                        accounts.c.bank_code,
                         accounts.c.account_number,
                         connections.c.locator,
                     )
@@ -166,9 +202,8 @@ async def pay_local(
         await engine.dispose()
     if row is None:
         raise UsageError(f"no intent {intent_id}")
-    code = row.payment_reference
-    raw, headers, bank_reference = signed_delivery(
-        secret, row.account_number, row.amount_vnd, code, code
+    raw, headers, bank_reference = signed_transfer(
+        secret, row.bank_code, row.account_number, row.amount_vnd, row.payment_reference
     )
     url = f"{base_url.rstrip('/')}/webhooks/sepay/{row.locator}"
     async with httpx.AsyncClient() as client:
@@ -284,7 +319,7 @@ async def wait(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m examples.invoice_host.e2e")
+    parser = _Parser(prog="python -m examples.invoice_host.e2e")
     commands = parser.add_subparsers(dest="command", required=True)
 
     def command(name: str) -> argparse.ArgumentParser:
@@ -313,7 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
 async def run(argv: Sequence[str]) -> int:
     """One command; prints its JSON line (``place-order``, ``pay-local``) and returns the
     exit code."""
-    args = build_parser().parse_args(list(argv))
+    args = parse_hiding_values(build_parser(), list(argv))
     try:
         if args.command == "place-order":
             config = read_issuer_config(args.accounting_config or default_accounting_config())

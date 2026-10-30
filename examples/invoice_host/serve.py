@@ -2,6 +2,7 @@
 
     python -m examples.invoice_host.serve --pm-env PM_ENV_FILE --inv-env INV_ENV_FILE \\
         --database-url "$DATABASE_URL" --port 8787 \\
+        --bank-code BANK --account-number NUMBER \\
         --artifact-root .evidence/p5/artifacts --pid-file .evidence/p5/serve.pid
 
 Both env files are read inside this process and never printed: the payment-module file gives
@@ -10,9 +11,15 @@ file gives the sandbox credentials named by ``env:SEPAY_EINVOICE_SANDBOX`` and m
 ``SEPAY_EINVOICE_ENVIRONMENT=test``. ``DATABASE_URL`` names a PostgreSQL that is already
 running; this process never starts one. On the first run the tables are created and the
 payment side and the sandbox issuer account (from the accountant's configuration file) are
-onboarded; a later run reuses them. Once listening on ``127.0.0.1:PORT`` the process prints
+onboarded; a later run reuses them. ``--bank-code`` and ``--account-number`` name the account
+SePay Test reports the transfers into (the webhook's ``gateway`` and ``accountNumber``, for
+example ``ACB`` and the account number shown on SePay Test); a webhook for any other account
+settles nothing. Once listening on ``127.0.0.1:PORT`` the process prints
 ``READY locator=<locator>`` (SePay Test posts to ``/webhooks/sepay/<locator>``). SIGTERM or
-SIGINT stops the workers and the listener, deletes the pid file and exits 0.
+SIGINT stops the workers and the listener, deletes the pid file and exits 0. A refused start
+(the port already in use, a pid file naming a running process, a database onboarded for
+another account, a wrong env file) prints ``serve: error: ...`` and exits 1; a usage error
+exits 2 without repeating a typed value that could hold the database URL.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ import contextlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping
@@ -38,7 +46,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from invoice_module.adapters.sepay import SePayEInvoiceClient, SePayEInvoiceProvider
 from invoice_module.adapters.sepay.rate_limiter import ProcessRateLimiter
-from invoice_module.application.config import today_vn
+from invoice_module.application.config import InvoiceModuleConfig, today_vn
+from invoice_module.cli.__main__ import _hide_typed_values, _Parser, _UsageFailure
 from invoice_module.domain.enums import CrossDayAction, Environment
 from invoice_module.ports.clock import SystemClock
 from invoice_module.ports.provider import EInvoiceProvider, IssuerAccountView
@@ -51,11 +60,13 @@ from .server import create_app, run_workers
 DEFAULT_PORT = 8787
 LISTEN_HOST = "127.0.0.1"
 SANDBOX_CREDENTIAL_REF = "env:SEPAY_EINVOICE_SANDBOX"
-# The payment-module env file names the SePay Test webhook secret this way; ``onboard``
-# stores the connection's reference as ``env:SEPAY_WEBHOOK_SECRET``, resolved in-process.
+# The payment-module env file names the SePay Test webhook secret this way; the connection
+# stores the reference ``env:SEPAY_TEST_WEBHOOK_SECRET``, resolved in-process.
 PM_WEBHOOK_SECRET = "SEPAY_TEST_WEBHOOK_SECRET"
-CONNECTION_SECRET = "SEPAY_WEBHOOK_SECRET"
-SANDBOX_HTTP_TIMEOUT_S = 60.0
+WEBHOOK_SECRET_REF = f"env:{PM_WEBHOOK_SECRET}"
+# What ``build`` gives the invoice module: the adapter must not wait longer for an answer
+# than the lease the module extends before each send (``http_timeout_s``).
+MODULE_CONFIG = InvoiceModuleConfig()
 
 
 @dataclass(frozen=True)
@@ -64,6 +75,8 @@ class ServeOptions:
     issuer_config: Mapping[str, Any]
     artifact_root: Path
     pid_file: Path
+    bank_code: str
+    account_number: str
     port: int = DEFAULT_PORT
     provider_account_id: str | None = None
     credential_ref: str = SANDBOX_CREDENTIAL_REF
@@ -103,18 +116,25 @@ def sandbox_environ(pm_env: Mapping[str, str], inv_env: Mapping[str, str]) -> di
         raise ServeError("the invoice env file must declare SEPAY_EINVOICE_ENVIRONMENT=test")
     if not pm_env.get(PM_WEBHOOK_SECRET):
         raise ServeError(f"the payment env file has no {PM_WEBHOOK_SECRET}")
-    return {**inv_env, CONNECTION_SECRET: pm_env[PM_WEBHOOK_SECRET]}
+    return {**inv_env, PM_WEBHOOK_SECRET: pm_env[PM_WEBHOOK_SECRET]}
 
 
-def sandbox_provider(environ: Mapping[str, str]) -> tuple[SePayEInvoiceProvider, httpx.AsyncClient]:
-    """The SePay adapter on the sandbox base URL (the client refuses any other for ``test``)."""
-    http = httpx.AsyncClient()
+def sandbox_provider(
+    environ: Mapping[str, str],
+    config: InvoiceModuleConfig = MODULE_CONFIG,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> tuple[SePayEInvoiceProvider, httpx.AsyncClient]:
+    """The SePay adapter on the sandbox base URL (the client refuses any other for ``test``),
+    with the module's own HTTP and download timeouts."""
+    http = httpx.AsyncClient(transport=transport)
     client = SePayEInvoiceClient(
         http,
         EnvCredentialResolver(environ),
         SystemClock(),
         ProcessRateLimiter(2.0),
-        http_timeout_s=SANDBOX_HTTP_TIMEOUT_S,
+        http_timeout_s=config.http_timeout_s,
+        artifact_timeout_s=config.artifact_timeout_s,
     )
     return SePayEInvoiceProvider(client), http
 
@@ -166,9 +186,11 @@ async def ensure_onboarded(
     options: ServeOptions,
     provider_account_id: Callable[[], Any],
 ) -> str:
-    """The webhook locator; onboards both modules the first time."""
+    """The webhook locator; onboards both modules the first time. A later run must name the
+    same receiving account, or SePay Test's transfers would settle nothing."""
     merchants = tables.payment.merchants
     connections = tables.payment.provider_connections
+    receiving = tables.payment.receiving_accounts
     accounts = tables.invoice.issuer_accounts
     async with engine.connect() as db:
         merchant_id = await db.scalar(
@@ -183,8 +205,20 @@ async def ensure_onboarded(
                     accounts.c.merchant_id == merchant_id, accounts.c.status == "active"
                 )
             )
+            account = (
+                await db.execute(
+                    sa.select(receiving.c.bank_code, receiving.c.account_number).where(
+                        receiving.c.merchant_id == merchant_id
+                    )
+                )
+            ).first()
             if locator is None or issuer is None:
                 raise ServeError("the database holds a half-onboarded host; use a fresh database")
+            wanted = (options.bank_code.strip().upper(), options.account_number.strip())
+            if account is None or tuple(account) != wanted:
+                raise ServeError(
+                    "the database is not onboarded for this receiving account; use a fresh database"
+                )
             return str(locator)
     onboarded = await onboard(
         host.payment,
@@ -192,6 +226,9 @@ async def ensure_onboarded(
         options.issuer_config,
         provider_account_id=await provider_account_id(),
         credential_ref=options.credential_ref,
+        bank_code=options.bank_code,
+        account_number=options.account_number,
+        webhook_secret_ref=WEBHOOK_SECRET_REF,
     )
     return str(onboarded.connection.locator)
 
@@ -215,6 +252,14 @@ def pid_file(path: Path) -> Iterator[None]:
         with contextlib.suppress(FileNotFoundError, ValueError):
             if int(path.read_text().strip()) == os.getpid():
                 path.unlink()
+
+
+def listen_socket(port: int) -> socket.socket:
+    """The listening socket on ``127.0.0.1:port``, bound before anything else starts."""
+    try:
+        return socket.create_server((LISTEN_HOST, port))
+    except OSError as exc:
+        raise ServeError(f"could not listen on {LISTEN_HOST}:{port} ({exc.strerror})") from None
 
 
 def _alive(pid: int) -> bool:
@@ -251,7 +296,7 @@ async def run(
         return await discover()
 
     tables = define_host_tables(options.table_prefix)
-    with pid_file(options.pid_file):
+    with pid_file(options.pid_file), listen_socket(options.port) as sock:
         engine = create_async_engine(options.database_url)
         try:
             async with engine.begin() as db:
@@ -266,13 +311,13 @@ async def run(
                     log_level="warning",
                 )
             )
-            serving = asyncio.create_task(listener.serve())
+            serving = asyncio.create_task(listener.serve(sockets=[sock]))
             workers = asyncio.create_task(run_workers(host.payment, host.invoice, stop))
             try:
                 while not listener.started and not serving.done():
                     await asyncio.sleep(0.02)
                 if not listener.started:
-                    raise ServeError(f"could not listen on {LISTEN_HOST}:{options.port}")
+                    raise ServeError(f"the listener on {LISTEN_HOST}:{options.port} did not start")
                 print(f"READY locator={locator}", file=out, flush=True)
                 stopped = asyncio.create_task(stop.wait())
                 await asyncio.wait({stopped, serving}, return_when=asyncio.FIRST_COMPLETED)
@@ -288,20 +333,38 @@ async def run(
     return 0
 
 
+def parse_hiding_values(parser: argparse.ArgumentParser, argv: list[str] | None) -> Any:
+    """``parser.parse_args``; a usage error exits 2 without repeating a typed value that could
+    hold the database URL or its password (the module CLI's rule). ``parser`` must be a
+    ``_Parser``."""
+    typed = list(sys.argv[1:] if argv is None else argv)
+    try:
+        return parser.parse_args(typed)
+    except _UsageFailure as exc:
+        print(exc.usage, end="", file=sys.stderr)
+        print(f"{parser.prog}: error: {_hide_typed_values(exc.message, typed)}", file=sys.stderr)
+        raise SystemExit(2) from None
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="python -m examples.invoice_host.serve")
+    parser = _Parser(prog="python -m examples.invoice_host.serve")
     parser.add_argument("--pm-env", type=Path, required=True)
     parser.add_argument("--inv-env", type=Path, required=True)
     parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--bank-code", required=True)
+    parser.add_argument("--account-number", required=True)
     parser.add_argument("--artifact-root", type=Path, required=True)
     parser.add_argument("--pid-file", type=Path, required=True)
     parser.add_argument("--accounting-config", type=Path, default=None)
     parser.add_argument("--provider-account-id", default=None)
     parser.add_argument("--table-prefix", default="")
-    args = parser.parse_args(argv)
+    args = parse_hiding_values(parser, argv)
     if not args.database_url:
-        parser.error("--database-url (or DATABASE_URL) is required")
+        parser.print_usage(sys.stderr)
+        message = "--database-url (or DATABASE_URL) is required"
+        print(f"{parser.prog}: error: {message}", file=sys.stderr)
+        raise SystemExit(2)
     return args
 
 
@@ -315,6 +378,8 @@ async def _main(args: argparse.Namespace) -> int:
         issuer_config=issuer_config,
         artifact_root=args.artifact_root,
         pid_file=args.pid_file,
+        bank_code=args.bank_code,
+        account_number=args.account_number,
         port=args.port,
         provider_account_id=args.provider_account_id,
         table_prefix=args.table_prefix,

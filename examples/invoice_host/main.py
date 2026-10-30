@@ -153,8 +153,15 @@ async def onboard(
     *,
     provider_account_id: str,
     credential_ref: str = EINVOICE_CREDENTIAL_REF,
+    bank_code: str = "VCB",
+    account_number: str = ACCOUNT_NUMBER,
+    webhook_secret_ref: str = WEBHOOK_SECRET_REF,
 ) -> Onboarded:
     """Payment side in the order readiness requires, then the issuer account (test).
+
+    ``bank_code`` and ``account_number`` name the account the transfers arrive in: a webhook
+    settles only when its ``gateway`` and ``accountNumber`` name that account.
+    ``webhook_secret_ref`` names the secret the connection's webhooks are signed with.
 
     ``issuer_config`` has the shape of the accountant's configuration file
     (``template_code``, ``invoice_series_template``, ``payment_method``,
@@ -163,10 +170,10 @@ async def onboard(
     test = PaymentEnvironment.TEST
     merchant = await payment.register_merchant.execute(TENANT, "branch-1", ADMIN)
     account = await payment.register_receiving_account.execute(
-        TENANT, merchant.id, test, "VCB", ACCOUNT_NUMBER, "CONG TY SHOP", ADMIN
+        TENANT, merchant.id, test, bank_code, account_number, "CONG TY SHOP", ADMIN
     )
     connection = await payment.register_connection.execute(
-        TENANT, merchant.id, "sepay", test, WEBHOOK_SECRET_REF, ADMIN
+        TENANT, merchant.id, "sepay", test, webhook_secret_ref, ADMIN
     )
     await payment.bind_connection_account.execute(TENANT, connection.id, account.id, ADMIN)
     draft = await payment.create_reference_profile.execute(
