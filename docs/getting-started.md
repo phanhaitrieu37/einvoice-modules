@@ -502,7 +502,8 @@ lý lỗi dựa trên error.code, không khớp theo chuỗi error.message").
 | `500 EINVOICE_ACCOUNT_NOT_FOUND` | `PROVIDER_REJECTED`, account status |
 | `401` (`TOKEN_EXPIRED`; docs `xu-ly-loi`: "Token quá 24 giờ. Lấy token mới") | New token; on a create no resend in the same claim, and the POST counts |
 | `5xx` without a known code | Transient: retry later, lookup first |
-| `404 EINVOICE_DOCUMENT_NOT_FOUND` on a lookup | No invoice under the reference (the code SePay really returns) |
+| `404 EINVOICE_DOCUMENT_NOT_FOUND` on a lookup | No invoice under the reference (the code SePay really returns), but not proof the create was never received: the lookup does not see a job that is still pending, so before any resend the job is checked by reference |
+| `404 EINVOICE_CREATE_TRACKING_NOT_FOUND` on a status check (matched by code, also on a `500`) | No job under the reference: only this answer, after a lookup that found nothing, lets the resend through |
 | `2xx` carrying `EINVOICE_DOCUMENT_EXISTED` | Not an acceptance: `PROVIDER_REJECTED` |
 
 ### Corrections after issue (accountant's table)

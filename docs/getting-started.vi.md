@@ -487,7 +487,8 @@ Module quyết định theo `error.code` và HTTP status, không bao giờ theo 
 | `500 EINVOICE_ACCOUNT_NOT_FOUND` | `PROVIDER_REJECTED`, trạng thái tài khoản |
 | `401` (`TOKEN_EXPIRED`; docs `xu-ly-loi`: "Token quá 24 giờ. Lấy token mới") | Lấy token mới; trên create không gửi lại trong cùng lượt claim, và POST vẫn tính |
 | `5xx` không kèm mã nhận diện được | Tạm thời: thử lại sau, tra cứu trước |
-| `404 EINVOICE_DOCUMENT_NOT_FOUND` khi tra cứu | Không có hoá đơn dưới reference (mã SePay thật sự trả) |
+| `404 EINVOICE_DOCUMENT_NOT_FOUND` khi tra cứu | Không có hoá đơn dưới reference (mã SePay thật sự trả), nhưng không chứng minh create chưa tới SePay: tra cứu không thấy job còn đang xử lý, nên trước mọi lần gửi lại module kiểm tra job theo reference |
+| `404 EINVOICE_CREATE_TRACKING_NOT_FOUND` khi kiểm tra trạng thái (khớp theo mã, cả khi là `500`) | Không có job dưới reference: chỉ câu trả lời này, sau một lần tra cứu không thấy gì, mới cho gửi lại |
 | `2xx` mang `EINVOICE_DOCUMENT_EXISTED` | Không phải tiếp nhận: `PROVIDER_REJECTED` |
 
 ### Sửa sai sau khi phát hành (bảng của kế toán)
