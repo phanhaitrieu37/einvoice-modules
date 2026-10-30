@@ -1,11 +1,15 @@
 """The ``approvals`` command line, run in process through ``main(argv)`` on real PostgreSQL.
 
 ``main`` runs its own event loop, so these tests are synchronous and seed the database in
-separate event loops through the worker test world.
+separate event loops through the worker test world. The usage-error tests at the end also run
+``python -m invoice_module.cli`` in a subprocess, the way an operator types it.
 """
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -476,3 +480,56 @@ def test_a_database_error_carrying_the_url_prints_only_its_type(capsys, monkeypa
     captured = capsys.readouterr()
     assert captured.err == "error: the database could not be used (ArgumentError)\n"
     assert SYNTHETIC_PASSWORD not in captured.out + captured.err
+
+
+def run_module(*argv: str) -> subprocess.CompletedProcess[str]:
+    """``python -m invoice_module.cli ARGV``: ``main`` reads ``sys.argv`` itself."""
+    env = {name: value for name, value in os.environ.items() if name != approvals.DATABASE_URL_ENV}
+    return subprocess.run(
+        [sys.executable, "-m", "invoice_module.cli", *argv],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+        check=False,
+    )
+
+
+def leaky_url(password: str) -> str:
+    return LEAKY_URL.replace(SYNTHETIC_PASSWORD, password)
+
+
+SCHEMELESS = f"synuser:{SYNTHETIC_PASSWORD}@127.0.0.1/synthetic"
+LIBPQ_DSN = f"host=127.0.0.1 user=synuser password={SYNTHETIC_PASSWORD}"
+# argparse prints a wrong value with repr(): a space keeps the URL pattern from reaching the
+# host, and the backslash or quotes make the quoted form differ from the typed one.
+SPACE_BACKSLASH = leaky_url(f"{SYNTHETIC_PASSWORD} x\\tail")
+SPACE_QUOTES = leaky_url(f"{SYNTHETIC_PASSWORD} x'\"tail")
+
+
+@pytest.mark.parametrize(
+    ("argv", "shown"),
+    [
+        (["approvals", "show", SCHEMELESS], "document_id"),
+        (["approvals", "show", LIBPQ_DSN], "document_id"),
+        (["approvals", "list", "--database_url", LIBPQ_DSN], "--database_url"),
+        (["approvals", "list", "--database_url", leaky_url(f"{SYNTHETIC_PASSWORD} tail")],
+         "--database_url"),
+        (["approvals", "list", "--limit", SPACE_BACKSLASH], "--limit"),
+        (["approvals", SPACE_BACKSLASH], "invalid choice"),
+        (["approvals", "show", SPACE_QUOTES], "document_id"),
+    ],
+    ids=[
+        "userinfo-without-scheme-as-document-id", "libpq-dsn-as-document-id",
+        "libpq-dsn-after-misspelt-option", "space-in-password-after-misspelt-option",
+        "space-backslash-password-as-limit", "space-backslash-password-as-action",
+        "space-quotes-password-as-document-id",
+    ],
+)  # fmt: skip
+def test_the_module_entry_point_never_prints_the_password(argv, shown):
+    result = run_module(*argv)
+    output = result.stdout + result.stderr
+    assert result.returncode == 2
+    assert shown in result.stderr
+    for secret in (SYNTHETIC_PASSWORD, "synuser", "@127.0.0.1"):
+        assert secret not in output

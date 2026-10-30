@@ -29,9 +29,16 @@ class _Parser(argparse.ArgumentParser):
 
 def _hide_typed_values(message: str, argv: Sequence[str]) -> str:
     values = {token.partition("=")[2] if token.startswith("-") else token for token in argv}
-    for value in sorted(values, key=len, reverse=True):
-        if value and not _PLAIN_VALUE.fullmatch(value):
-            message = message.replace(value, HIDDEN)
+    # argparse quotes a wrong value with repr(), which escapes backslashes and quotes, so the
+    # quoted form is hidden as well as the typed one.
+    forms = {
+        form
+        for value in values
+        if value and not _PLAIN_VALUE.fullmatch(value)
+        for form in (repr(value), value)
+    }
+    for form in sorted(forms, key=len, reverse=True):
+        message = message.replace(form, HIDDEN)
     return _URL_LIKE.sub(HIDDEN, message)
 
 
