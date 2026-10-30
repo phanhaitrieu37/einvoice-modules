@@ -167,6 +167,19 @@ async def test_every_settlement_has_receipt_and_traceable_state(world):
     refused_reference = str(await world.settlement_of(ordinary[-1]))
     world.provider.script_create(refused_reference, rejected("validation_error"))
     await world.drive(rounds=6)
+    # Of the concurrent pair, exactly one payment is held for the operator as a duplicate.
+    reviews = world.inv.review_cases
+    pair = []
+    for order in (left, right):
+        document = await world.original(order)
+        reasons = await world.rows(
+            sa.select(reviews.c.reason).where(
+                reviews.c.document_id == document.id, reviews.c.status == "open"
+            )
+        )
+        pair.append((document.status, sorted(row.reason for row in reasons)))
+    held_pair = [entry for entry in pair if "DUPLICATE_SETTLEMENT" in entry[1]]
+    assert held_pair == [("blocked", ["DUPLICATE_SETTLEMENT"])], pair
     # The sequential duplicate is waived by an operator; the concurrent one stays open.
     held = await world.original(second)
     await world.invoice.resolve_review.execute(
