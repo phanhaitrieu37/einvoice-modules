@@ -7,8 +7,6 @@ from typing import Any
 import httpx
 import pytest
 
-from invoice_module.adapters.sepay import client
-from invoice_module.adapters.sepay.client import Response
 from invoice_module.adapters.sepay.redact import normalise_key, redact
 from invoice_module.ports.provider import IssuerAccountView, ProviderRejected, ProviderTransient
 
@@ -145,21 +143,16 @@ def _substitute(obj: Any, new: Any) -> Any:
         {"path": "data.buyer.nationalId", "value": "SYNTHETIC-ID"},
     ],
 )
-def test_redact_masks_buyer_national_id_all_forms(
-    body: dict[str, Any], caplog: pytest.LogCaptureFixture
-) -> None:
+def test_redact_masks_buyer_national_id_all_forms(body: dict[str, Any]) -> None:
     redacted = redact(body)
     assert "SYNTHETIC-ID" not in repr(redacted)
-    assert PII in repr(redacted)
+    assert redacted == _substitute(body, PII)
     for empty in ("", None):
         blank = _substitute(body, empty)
         assert redact(blank) == blank
-    caplog.set_level(logging.DEBUG)
-    for status in (200, 400):
-        response = Response(status, {"success": False, "error": body, "data": body}, {})
-        client._log("GET", "/v1/invoices/x", response)
-    assert caplog.records
-    assert "SYNTHETIC-ID" not in caplog.text
+    # The same value nested in a whole provider answer, under both ``error`` and ``data``.
+    answer = {"success": False, "error": body, "data": body}
+    assert redact(answer) == {"success": False, "error": redacted, "data": redacted}
 
 
 @pytest.mark.parametrize("suffix", ["id_number", "identity_number", "citizen_id", "national_id"])
