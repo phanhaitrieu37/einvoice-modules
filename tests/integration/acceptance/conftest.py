@@ -50,6 +50,9 @@ from invoice_module.builder import InvoiceModule, build_invoice_module
 from invoice_module.domain.enums import DeliveryMode
 from invoice_module.domain.money import LineInput, compute_total
 from invoice_module.integrations.payment_module import FanOutPublisher, PaymentSettledConsumer
+from invoice_module.ports.clock import Clock
+from invoice_module.ports.credentials import CredentialResolver
+from invoice_module.ports.provider import EInvoiceProvider
 
 TENANT, ADMIN, ORDER = "tenant-acceptance", "admin-acceptance", "order"
 SECRET_REF = "env:ACCEPTANCE_WEBHOOK_SECRET"
@@ -89,17 +92,31 @@ class _Delivered:
 
 
 class AcceptanceWorld:
-    def __init__(self, engine: AsyncEngine, prefix: str, root: Path) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        prefix: str,
+        root: Path,
+        *,
+        provider: EInvoiceProvider | None = None,
+        clock: Clock | None = None,
+        credentials: CredentialResolver | None = None,
+    ) -> None:
+        """The fake provider on a ``FakeClock`` unless a provider (and its clock and
+        credentials) is given, as the sandbox tests do with the real adapter."""
         self.engine = engine
         self.metadata = sa.MetaData()
         self.pm = define_payment_tables(self.metadata, f"{prefix}pm_")
         self.inv = define_invoice_tables(self.metadata, f"{prefix}inv_")
-        self.clock = FakeClock(datetime.now(UTC))
-        self.provider = FakeEInvoiceProvider(self.clock)
-        year = today_vn(self.clock.now()).year % 100
-        self.provider.set_account_facts(series=(f"C{year:02d}TSE",))
+        if provider is None:
+            self.clock: Any = FakeClock(datetime.now(UTC))
+            self.provider: Any = FakeEInvoiceProvider(self.clock)
+            year = today_vn(self.clock.now()).year % 100
+            self.provider.set_account_facts(series=(f"C{year:02d}TSE",))
+        else:
+            self.clock, self.provider = clock or SystemClock(), provider
         self.metrics = RecordingMetrics()
-        self.credentials = StaticCredentials()
+        self.credentials = credentials or StaticCredentials()
         self.store = FileArtifactStore(root)
         self.sessions = async_sessionmaker(engine, expire_on_commit=False)
         self.invoice = self.build_invoice()
