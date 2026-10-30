@@ -518,12 +518,13 @@ SPACE_QUOTES = leaky_url(f"{SYNTHETIC_PASSWORD} x'\"tail")
         (["approvals", "list", "--limit", SPACE_BACKSLASH], "--limit"),
         (["approvals", SPACE_BACKSLASH], "invalid choice"),
         (["approvals", "show", SPACE_QUOTES], "document_id"),
+        (["approvals", "list", f"--database-url{LEAKY_URL}"], "unrecognized arguments"),
     ],
     ids=[
         "userinfo-without-scheme-as-document-id", "libpq-dsn-as-document-id",
         "libpq-dsn-after-misspelt-option", "space-in-password-after-misspelt-option",
         "space-backslash-password-as-limit", "space-backslash-password-as-action",
-        "space-quotes-password-as-document-id",
+        "space-quotes-password-as-document-id", "url-glued-to-option",
     ],
 )  # fmt: skip
 def test_the_module_entry_point_never_prints_the_password(argv, shown):
