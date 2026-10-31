@@ -468,8 +468,10 @@ lease fencing discards it; a `retry` whose lookup finds nothing queues the docum
 error: the document stays in review; the module **never** changes the reference by itself and has
 no time limit. Reconcile the old reference at the SePay portal, then call
 `retry_with_new_reference` with a `note` recording what you found (required; the database
-refuses a blank note). The module checks once more that the lookup finds nothing right before
-the change. A `PROVIDER_TIMEOUT` with `details.last_poll_error = "transient_error"` means the
+refuses a blank note). Right before the change the module checks once more that the lookup finds
+nothing and, once a POST was sent under the reference, that its status check finds no job: the
+lookup does not see a job that is still running, and any job answer refuses the change
+(`ReferenceStillExists`). A `PROVIDER_TIMEOUT` with `details.last_poll_error = "transient_error"` means the
 last checks got no usable answer (for example a check that kept echoing another reference).
 `STALE_REFERENCE_FOUND` (the sweep found a record under a replaced reference): settle it at the
 portal following the accountant's table below, then `acknowledge`.
@@ -495,15 +497,15 @@ lý lỗi dựa trên error.code, không khớp theo chuỗi error.message").
 | `400 SELLER_STORE_INACTIVE` | `PROVIDER_REJECTED` (`seller_store_invalid`) |
 | `422 INVOICE_DATE_BEFORE_TAX_APPROVAL` | `PROVIDER_REJECTED` (`registration_not_approved`); production only |
 | `422 REGISTRATION_NOT_TAX_APPROVED` | `PROVIDER_REJECTED` (`registration_not_approved`) |
-| `409 EINVOICE_DOCUMENT_EXISTED` | Every `409` on a create: lookup by reference; never success by itself |
+| `409 EINVOICE_DOCUMENT_EXISTED` | Every `409` on a create: lookup by reference, and the job's status check when the lookup finds nothing (a job answer goes to polling); never success by itself |
 | `500 QUOTA_HAS_BEEN_USERD_UP` | `QUOTA_EXHAUSTED`, no automatic resend |
 | `500 REGISTRATION_NOT_COMPLETE` | `PROVIDER_REJECTED`, account status |
 | `500 BILLING_IS_UNPAID` | `PROVIDER_REJECTED`, account status |
 | `500 EINVOICE_ACCOUNT_NOT_FOUND` | `PROVIDER_REJECTED`, account status |
 | `401` (`TOKEN_EXPIRED`; docs `xu-ly-loi`: "Token quá 24 giờ. Lấy token mới") | New token; on a create no resend in the same claim, and the POST counts |
 | `5xx` without a known code | Transient: retry later, lookup first |
-| `404 EINVOICE_DOCUMENT_NOT_FOUND` on a lookup | No invoice under the reference (the code SePay really returns), but not proof the create was never received: the lookup does not see a job that is still pending, so before any resend the job is checked by reference |
-| `404 EINVOICE_CREATE_TRACKING_NOT_FOUND` on a status check (matched by code, also on a `500`) | No job under the reference: only this answer, after a lookup that found nothing, lets the resend through |
+| `404 EINVOICE_DOCUMENT_NOT_FOUND` on a lookup | No invoice under the reference (the code SePay really returns), but not proof the create was never received: the lookup does not see a job that is still pending, so the job is checked by reference before any resend, before a `409` opens a review, and before `retry_with_new_reference` replaces the reference |
+| `404 EINVOICE_CREATE_TRACKING_NOT_FOUND` on a status check (matched by code, also on a `500`) | No job under the reference: after a lookup that found nothing, this answer lets the resend through; a job that ended `Failed` is resent only with an operator's `retry` permission, and an unconfirmed outcome never |
 | `2xx` carrying `EINVOICE_DOCUMENT_EXISTED` | Not an acceptance: `PROVIDER_REJECTED` |
 
 ### Corrections after issue (accountant's table)

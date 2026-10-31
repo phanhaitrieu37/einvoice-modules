@@ -453,7 +453,9 @@ của lease bỏ qua nó; `retry` mà tra cứu không thấy gì thì xếp hà
 `DOCUMENT_EXISTED_UNRESOLVED`, `PROVIDER_TIMEOUT` và tra cứu không thấy gì sau lỗi: document ở lại
 review; module **không bao giờ** tự đổi reference và không có thời hạn. Đối soát reference cũ tại
 cổng SePay, rồi gọi `retry_with_new_reference` với `note` ghi kết quả đối soát (bắt buộc; DB từ chối
-note trống). Module kiểm lại một lần nữa rằng tra cứu không thấy gì ngay trước khi đổi.
+note trống). Ngay trước khi đổi, module kiểm lại một lần nữa rằng tra cứu không thấy gì và, nếu
+reference đã từng được gửi POST, kiểm tra trạng thái không thấy job nào: tra cứu không thấy job còn
+đang chạy, và có bất kỳ câu trả lời job nào thì từ chối đổi (`ReferenceStillExists`).
 `PROVIDER_TIMEOUT` với `details.last_poll_error = "transient_error"` nghĩa là các lần kiểm cuối
 không nhận được câu trả lời dùng được (ví dụ lần kiểm cứ trả về reference khác).
 `STALE_REFERENCE_FOUND` (sweep thấy bản ghi dưới reference đã thay): xử lý tại cổng theo bảng của
@@ -480,15 +482,15 @@ Module quyết định theo `error.code` và HTTP status, không bao giờ theo 
 | `400 SELLER_STORE_INACTIVE` | `PROVIDER_REJECTED` (`seller_store_invalid`) |
 | `422 INVOICE_DATE_BEFORE_TAX_APPROVAL` | `PROVIDER_REJECTED` (`registration_not_approved`); chỉ production |
 | `422 REGISTRATION_NOT_TAX_APPROVED` | `PROVIDER_REJECTED` (`registration_not_approved`) |
-| `409 EINVOICE_DOCUMENT_EXISTED` | Mọi `409` trên create: tra cứu theo reference; tự nó không bao giờ là thành công |
+| `409 EINVOICE_DOCUMENT_EXISTED` | Mọi `409` trên create: tra cứu theo reference, và kiểm tra trạng thái job khi tra cứu không thấy gì (có job thì chuyển sang poll); tự nó không bao giờ là thành công |
 | `500 QUOTA_HAS_BEEN_USERD_UP` | `QUOTA_EXHAUSTED`, không tự gửi lại |
 | `500 REGISTRATION_NOT_COMPLETE` | `PROVIDER_REJECTED`, trạng thái tài khoản |
 | `500 BILLING_IS_UNPAID` | `PROVIDER_REJECTED`, trạng thái tài khoản |
 | `500 EINVOICE_ACCOUNT_NOT_FOUND` | `PROVIDER_REJECTED`, trạng thái tài khoản |
 | `401` (`TOKEN_EXPIRED`; docs `xu-ly-loi`: "Token quá 24 giờ. Lấy token mới") | Lấy token mới; trên create không gửi lại trong cùng lượt claim, và POST vẫn tính |
 | `5xx` không kèm mã nhận diện được | Tạm thời: thử lại sau, tra cứu trước |
-| `404 EINVOICE_DOCUMENT_NOT_FOUND` khi tra cứu | Không có hoá đơn dưới reference (mã SePay thật sự trả), nhưng không chứng minh create chưa tới SePay: tra cứu không thấy job còn đang xử lý, nên trước mọi lần gửi lại module kiểm tra job theo reference |
-| `404 EINVOICE_CREATE_TRACKING_NOT_FOUND` khi kiểm tra trạng thái (khớp theo mã, cả khi là `500`) | Không có job dưới reference: chỉ câu trả lời này, sau một lần tra cứu không thấy gì, mới cho gửi lại |
+| `404 EINVOICE_DOCUMENT_NOT_FOUND` khi tra cứu | Không có hoá đơn dưới reference (mã SePay thật sự trả), nhưng không chứng minh create chưa tới SePay: tra cứu không thấy job còn đang xử lý, nên module kiểm tra job theo reference trước mọi lần gửi lại, trước khi một `409` mở review, và trước khi `retry_with_new_reference` thay reference |
+| `404 EINVOICE_CREATE_TRACKING_NOT_FOUND` khi kiểm tra trạng thái (khớp theo mã, cả khi là `500`) | Không có job dưới reference: sau một lần tra cứu không thấy gì, câu trả lời này cho gửi lại; job đã kết thúc `Failed` chỉ gửi lại khi operator cho phép bằng `retry`, còn kết quả chưa xác nhận thì không bao giờ |
 | `2xx` mang `EINVOICE_DOCUMENT_EXISTED` | Không phải tiếp nhận: `PROVIDER_REJECTED` |
 
 ### Sửa sai sau khi phát hành (bảng của kế toán)
