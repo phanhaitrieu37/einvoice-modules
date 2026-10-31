@@ -150,7 +150,7 @@ async def test_retry_calls_find_by_reference_first(world):
     settled = await failed_by(world, rejected("validation_error"))
     before = len(world.provider.calls)
     await world.resolve(settled.document_id, "retry")
-    assert world.provider.ops()[before:] == ["find_by_reference"]
+    assert world.provider.ops()[before:] == ["find_by_reference", "check_create"]
 
 
 async def test_retry_found_issued_marks_issued_without_post(world):
@@ -388,7 +388,7 @@ async def test_rotation_refused_while_the_job_is_still_running(world):
     assert world.provider.effective_creates == {settled.reference: 1}
 
 
-@pytest.mark.parametrize("state", ["pending", "success", "failed", "draft", "cancelled"])
+@pytest.mark.parametrize("state", ["pending", "success", "draft", "cancelled"])
 async def test_rotation_refused_when_the_check_answers_with_a_job(world, state):
     settled = await failed_by(world, CONFLICT)
     world.provider.script_check(settled.reference, ProviderProgress(state=state))
@@ -1791,3 +1791,172 @@ async def test_attach_draft_refused_when_lookup_cancelled(world):
     assert (await world.doc(settled.document_id)).document == before.document
     await world.drive(rounds=3, step=timedelta(hours=1))
     assert len(world.provider.posts()) == 1
+
+
+async def failed_job_without_record(world, mode=AUTO):
+    """Accepted, then the job ended ``Failed`` and left no invoice: the lookup answers 404 while
+    the status check still reports the failed job. SePay's error-handling guide (``xu-ly-loi``)
+    describes exactly this case as safe to resend: "Failed không đồng nghĩa với việc chưa có hóa
+    đơn nào được tạo. Kiểm tra trước khi gửi lại: Gọi Chi tiết hóa đơn với reference_code của
+    bạn. Trả về 404: chưa có hóa đơn nào được ghi nhận, có thể gửi lại." """
+    settled = await settled_in(world, mode)
+    world.provider.new_invoice(
+        settled.reference, final_state="failed", message="Synthetic", without_record=True
+    )
+    await world.issue()
+    world.advance(timedelta(seconds=3))
+    await world.poll()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.post_count) == ("failed", 1)
+    assert await world.open_reasons(settled.document_id) == ["PROVIDER_REJECTED"]
+    return settled
+
+
+async def test_retry_after_a_failed_job_the_lookup_cannot_see_resends_exactly_once(world):
+    settled = await failed_job_without_record(world)
+    seen = len(world.provider.calls)
+    result = await world.resolve(settled.document_id, "retry")
+    assert world.provider.ops()[seen:] == ["find_by_reference", "check_create"]
+    doc = await world.doc(settled.document_id)
+    assert (result.document_status, doc.status, doc.request, doc.request_frozen_at) == (
+        "queued",
+        "queued",
+        None,
+        None,
+    )
+    assert (doc.operator_retry_at, doc.post_limit, doc.reference_code) == (
+        world.clock.now(),
+        2,
+        settled.reference,
+    )
+    assert await world.open_reasons(settled.document_id) == []
+    await world.drive(rounds=4, step=timedelta(seconds=3))
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.reference_code) == ("issued", settled.reference)
+    assert len(world.provider.posts(settled.reference)) == 2
+    assert world.provider.effective_creates == {settled.reference: 1}
+    assert await world.open_reasons(settled.document_id) == []
+
+
+async def test_retry_of_a_manual_document_after_a_failed_job_needs_a_new_approval(world):
+    settled = await failed_job_without_record(world, MANUAL)
+    await world.resolve(settled.document_id, "retry")
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.request, doc.operator_retry_at) == ("queued", None, world.clock.now())
+    await world.drive(rounds=2, step=timedelta(seconds=3))
+    assert len(world.provider.posts()) == 1
+    await world.approve(settled)
+    await world.drive(rounds=4, step=timedelta(seconds=3))
+    assert (await world.doc(settled.document_id)).status == "issued"
+    assert len(world.provider.posts()) == 2
+    assert world.provider.effective_creates == {settled.reference: 1}
+
+
+@pytest.mark.parametrize("state", ["pending", "success", "draft", "cancelled"])
+async def test_retry_with_a_blind_lookup_polls_a_job_the_check_still_knows(world, state):
+    settled = await failed_by(world, CONFLICT)
+    before = await world.doc(settled.document_id)
+    world.provider.script_check(settled.reference, ProviderProgress(state=state))
+    seen = len(world.provider.calls)
+    result = await world.resolve(settled.document_id, "retry")
+    assert world.provider.ops()[seen:] == ["find_by_reference", "check_create"]
+    doc = await world.doc(settled.document_id)
+    assert (result.document_status, doc.status, doc.tracking_code) == (
+        "pending_provider",
+        "pending_provider",
+        settled.reference,
+    )
+    assert (doc.pending_since, doc.poll_count, doc.next_attempt_at) == (
+        world.clock.now(),
+        0,
+        world.clock.now(),
+    )
+    # Polled, never resent: no POST is granted and the frozen request stays.
+    assert (doc.post_limit, doc.request, doc.request_authorized_resend) == (
+        before.post_limit,
+        before.request,
+        False,
+    )
+    assert await world.open_reasons(settled.document_id) == []
+    assert len(world.provider.posts()) == 1
+
+
+async def test_retry_with_no_job_keeps_the_request_and_the_issue_loop_checks_again(world):
+    settled = await failed_by(world, CONFLICT)
+    before = await world.doc(settled.document_id)
+    seen = len(world.provider.calls)
+    result = await world.resolve(settled.document_id, "retry")
+    assert world.provider.ops()[seen:] == ["find_by_reference", "check_create"]
+    doc = await world.doc(settled.document_id)
+    assert (result.document_status, doc.request, doc.operator_retry_at) == (
+        "queued",
+        before.request,
+        None,
+    )
+    assert doc.post_limit == before.post_count + 1
+
+
+@pytest.mark.parametrize("answer", [TRANSIENT, "refused"])
+async def test_retry_with_an_unclear_check_raises_and_writes_nothing(world, answer):
+    settled = await failed_by(world, CONFLICT)
+    world.provider.script_check(
+        settled.reference, check_rejected("BAD_REQUEST") if answer == "refused" else answer
+    )
+    before = await world.doc(settled.document_id)
+    error = ProviderRejected if answer == "refused" else ProviderTransient
+    with pytest.raises(error):
+        await world.resolve(settled.document_id, "retry")
+    await assert_untouched(world, settled, before, "DOCUMENT_EXISTED_UNRESOLVED")
+    [case] = await world.cases(settled.document_id)
+    assert "previous_attempts" not in case.details
+
+
+async def test_retry_refused_when_the_check_reports_an_unconfirmed_failure(world):
+    settled = await failed_by(world, CONFLICT)
+    world.provider.unconfirmed(settled.reference, "failed")
+    before = await world.doc(settled.document_id)
+    with pytest.raises(ResolutionNotAllowed, match="provider_unconfirmed"):
+        await world.resolve(settled.document_id, "retry")
+    await assert_untouched(world, settled, before, "DOCUMENT_EXISTED_UNRESOLVED")
+
+
+async def test_retry_of_a_reference_never_sent_does_not_check(world):
+    settled = await failed_by(world, AUTH_FAILED_BEFORE_SEND)
+    seen = len(world.provider.calls)
+    await world.resolve(settled.document_id, "retry")
+    assert world.provider.ops()[seen:] == ["find_by_reference"]
+
+
+async def test_rotation_after_a_failed_job_the_lookup_cannot_see_replaces_the_reference(world):
+    settled = await failed_job_without_record(world)
+    seen = len(world.provider.calls)
+    result = await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    assert world.provider.ops()[seen:] == ["find_by_reference", "check_create"]
+    assert (result.document_status, result.case_resolved) == ("queued", True)
+    rotated = result.reference_code
+    assert rotated != settled.reference
+    await world.drive(rounds=4, step=timedelta(seconds=3))
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.reference_code) == ("issued", rotated)
+    assert [call.reference_code for call in world.provider.posts()] == [settled.reference, rotated]
+    assert world.provider.effective_creates == {rotated: 1}
+
+
+async def test_rotation_allowed_when_the_check_confirms_a_failed_job(world):
+    settled = await failed_by(world, CONFLICT)
+    world.provider.script_check(
+        settled.reference, ProviderProgress(state="failed", provider_message="Synthetic")
+    )
+    result = await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    assert result.reference_code != settled.reference
+    assert result.document_status == "queued"
+
+
+async def test_rotation_refused_when_the_lookup_still_shows_the_failed_job(world):
+    settled = await failed_after_async_failure(world)
+    before = await world.doc(settled.document_id)
+    seen = len(world.provider.calls)
+    with pytest.raises(ReferenceStillExists):
+        await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    assert world.provider.ops()[seen:] == ["find_by_reference"]
+    await assert_untouched(world, settled, before, "PROVIDER_REJECTED")

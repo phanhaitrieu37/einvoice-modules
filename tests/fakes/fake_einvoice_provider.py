@@ -111,6 +111,9 @@ class FakeInvoice:
     provider_invoice_id: str | None = None
     # A failed record that does not consume the reference lets a new create succeed.
     consumes_reference: bool = True
+    # A job that ended Failed without an invoice: the lookup answers 404 (``None``) while the
+    # status check still reports the job.
+    lookup_404_when_failed: bool = False
 
 
 @dataclass
@@ -209,13 +212,20 @@ class FakeEInvoiceProvider:
         final_state: str = "success",
         message: str | None = None,
         total_amount_vnd: int | None = None,
+        without_record: bool = False,
     ) -> None:
-        """How the next invoice created for ``reference_code`` behaves."""
+        """How the next invoice created for ``reference_code`` behaves.
+
+        ``without_record`` (with ``final_state="failed"``): the job fails and leaves no invoice,
+        as SePay's error-handling guide describes for a ``Failed`` job whose lookup answers 404
+        ("chưa có hóa đơn nào được ghi nhận, có thể gửi lại"): the lookup answers ``None``, the
+        status check still reports the failed job and the reference may be sent again."""
         self._new_invoice[reference_code] = {
             "pending_polls": pending_polls,
             "state": final_state,
             "provider_message": message,
             "total_amount_vnd": total_amount_vnd,
+            "without_record": without_record,
         }
 
     def receive_delay(self, reference_code: str, *delays: timedelta) -> None:
@@ -415,6 +425,8 @@ class FakeEInvoiceProvider:
                 reference_code in self._lookup_lags and invoice.pending_polls > 0
             ):
                 return None
+            if invoice.lookup_404_when_failed and invoice.pending_polls == 0:
+                return None
             state = "pending" if invoice.pending_polls > 0 else invoice.state
             return ProviderInvoice(
                 reference_code=reference_code,
@@ -502,6 +514,9 @@ class FakeEInvoiceProvider:
             provider_message=settings.get("provider_message"),
             invoice_number=self._next_number() if state == "success" else None,
         )
+        if settings.get("without_record") and state == "failed":
+            invoice.lookup_404_when_failed = True
+            invoice.consumes_reference = False
         self.invoices[reference_code] = invoice
         if state == "success":  # a job that ends Failed leaves no invoice behind
             self.effective_creates[reference_code] += 1

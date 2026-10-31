@@ -7,7 +7,12 @@ transaction; the write then checks that the generation did not move since the re
 
 The reference code changes only through ``retry_with_new_reference``, which needs the operator's
 note recording the reconciliation at the provider portal, a lookup that finds nothing and, once a
-POST was sent under the reference, a status check that finds no job.
+POST was sent under the reference, a status check that finds no job or a job that failed with a
+confirmed outcome.
+
+A ``retry`` whose lookup finds nothing also checks the job once a POST was sent: the provider's
+error-handling guide says a ``Failed`` job whose lookup answers 404 left no invoice and may be
+resent, while a job still known in any other state is polled, never resent.
 """
 
 import logging
@@ -34,6 +39,7 @@ from invoice_module.application.issuance import (
     finalize_issued,
     missing_issued_facts,
 )
+from invoice_module.application.issue_queued import PROVIDER_UNCONFIRMED
 from invoice_module.application.submit_draft import (
     SubmitDraft,
     SubmitDraftCommand,
@@ -63,6 +69,7 @@ from invoice_module.ports.provider import (
     EInvoiceProvider,
     IssuerAccountView,
     ProviderInvoice,
+    ProviderProgress,
 )
 from invoice_module.ports.unit_of_work import InvoiceUnitOfWork, InvoiceUnitOfWorkFactory
 
@@ -223,6 +230,7 @@ class ResolveReview:
         request = _Request(**(request.__dict__ | {"draft_data": draft_data}))
 
         lookup: ProviderInvoice | None = None
+        job: ProviderProgress | None = None
         if document.status == S.FAILED and resolution in (
             A.RETRY,
             A.ATTACH_DRAFT,
@@ -230,10 +238,12 @@ class ResolveReview:
         ):
             lookup = await self._lookup(document)
             found = lookup.state if lookup is not None else None
-            if resolution == A.RETRY_WITH_NEW_REFERENCE and (
-                lookup is not None or await self._job_exists(document)
-            ):
-                raise ReferenceStillExists(document.reference_code)
+            if resolution == A.RETRY_WITH_NEW_REFERENCE:
+                if lookup is not None:
+                    raise ReferenceStillExists(document.reference_code)
+                job = await self._check_job(document)
+                if job is not None and not _confirmed_failed(job):
+                    raise ReferenceStillExists(document.reference_code)
             if resolution == A.ATTACH_DRAFT and found in ("success", "pending", "cancelled"):
                 raise ResolutionNotAllowed(f"provider_record_{found}")
             if (
@@ -247,10 +257,15 @@ class ResolveReview:
             if resolution == A.RETRY and found == "cancelled":
                 # The same reference can only answer 409 now.
                 raise ResolutionNotAllowed("provider_record_cancelled")
+            if resolution == A.RETRY and lookup is None:
+                job = await self._check_job(document)
+                if job is not None and job.state == "failed" and not _confirmed_failed(job):
+                    # The provider could not confirm this outcome and asked not to resend it.
+                    raise ResolutionNotAllowed("provider_unconfirmed")
 
         async with self._uow_factory() as uow:
             current = await self._lock(uow, document, case_id, request)
-            status = await self._apply(uow, current, request, lookup)
+            status = await self._apply(uow, current, request, lookup, job)
             await uow.commit()
         if resolution == A.RETRY_WITH_NEW_REFERENCE:
             status = await self._requeue_rotated(document, request)
@@ -337,18 +352,17 @@ class ResolveReview:
         creds = await self._credentials.client_credentials(account.credential_ref)
         return await self._provider.find_by_reference(account, creds, document.reference_code)
 
-    async def _job_exists(self, document: DocumentRow) -> bool:
-        """Whether the provider still has a job under the reference. The lookup does not see a
-        job that is still running, so a reference that was ever sent is also checked by its
-        tracking code (the reference code) before it may be replaced: any answer but "no such
-        job" keeps it."""
+    async def _check_job(self, document: DocumentRow) -> ProviderProgress | None:
+        """The job under the reference, checked by its tracking code (the reference code): the
+        lookup does not see a job that is still running, nor one that failed without leaving an
+        invoice. ``None`` when no POST was ever sent or the provider has no such job; an unclear
+        answer raises the provider error and nothing is written."""
         if document.post_count == 0:
-            return False
+            return None
         assert self._provider is not None and self._credentials is not None
         account = await self._account(document)
         creds = await self._credentials.client_credentials(account.credential_ref)
-        job = await self._provider.check_create(account, creds, document.reference_code)
-        return job is not None
+        return await self._provider.check_create(account, creds, document.reference_code)
 
     async def _lock(
         self, uow: InvoiceUnitOfWork, read: DocumentRow, case_id: UUID, request: _Request
@@ -373,6 +387,7 @@ class ResolveReview:
         document: DocumentRow,
         request: _Request,
         lookup: ProviderInvoice | None,
+        job: ProviderProgress | None,
     ) -> DocumentStatus:
         resolution = request.resolution
         if resolution in (A.WAIVE, A.ACKNOWLEDGE):
@@ -388,7 +403,7 @@ class ResolveReview:
         if resolution == A.ATTACH_DRAFT:
             return await self._attach(uow, document, request)
         if document.status == S.FAILED:
-            return await self._retry_failed(uow, document, request, lookup)
+            return await self._retry_failed(uow, document, request, lookup, job)
         return await self._retry_blocked(uow, document, request)
 
     async def _retry_quota(
@@ -409,6 +424,7 @@ class ResolveReview:
         document: DocumentRow,
         request: _Request,
         lookup: ProviderInvoice | None,
+        job: ProviderProgress | None,
     ) -> DocumentStatus:
         now = self._clock.now()
         if lookup is not None and lookup.state == "success":
@@ -443,14 +459,17 @@ class ResolveReview:
                 raise ResolutionNotAllowed(f"finalize_{result.value}")
             await uow.documents.bump_generation(document.id)
             return S.ISSUED
-        if lookup is not None and lookup.state == "pending":
+        pending_job = lookup is None and job is not None and job.state != "failed"
+        if (lookup is not None and lookup.state == "pending") or pending_job:
+            # A job the provider still knows is polled, never resent: the poll loop decides.
             await self._clear(uow, document, request)
             state.ensure_transition(document.status, S.PENDING_PROVIDER)
+            tracking = lookup.tracking_code if lookup is not None else document.reference_code
             await uow.documents.operator_update(
                 document.id,
                 now,
                 status=S.PENDING_PROVIDER.value,
-                tracking_code=lookup.tracking_code or document.tracking_code,
+                tracking_code=tracking or document.tracking_code,
                 pending_since=now,
                 poll_count=0,
                 next_attempt_at=now,
@@ -465,7 +484,7 @@ class ResolveReview:
             raise ResolutionNotAllowed("duplicate_hold_active")
         await self._clear(uow, document, request)
         await self._audit_attempts(uow, document, request, now)
-        if lookup is None:
+        if lookup is None and job is None:
             # The earlier outcome is unknown: keep the frozen request; the worker looks the
             # reference up again before it resends it (or refreezes for a new day).
             if document.delivery_mode == DeliveryMode.MANUAL and approval_valid(document):
@@ -473,8 +492,9 @@ class ResolveReview:
             else:
                 status = await self._requeue(uow, document, now, request.case_id, target=S.QUEUED)
         else:
-            # A known failed record: a new request is frozen and sent once; the permission to
-            # resend survives a crash between that freeze and the POST.
+            # A known failed record, or a job that failed with a confirmed outcome and left no
+            # invoice: a new request is frozen and sent once; the permission to resend survives
+            # a crash between that freeze and the POST.
             status = await self._requeue(
                 uow,
                 document,
@@ -741,6 +761,12 @@ class ResolveReview:
 
 
 _NOTE_REQUIRED = frozenset({A.WAIVE, A.ACKNOWLEDGE, A.RETRY_WITH_NEW_REFERENCE})
+
+
+def _confirmed_failed(job: ProviderProgress) -> bool:
+    """A ``Failed`` job whose outcome the provider confirmed; an unconfirmed one may still
+    become a signed invoice and is never resent or replaced."""
+    return job.state == "failed" and job.error_code != PROVIDER_UNCONFIRMED
 
 
 def _unconfirmed(case: ReviewCaseRow, reason: ReviewReason) -> bool:
