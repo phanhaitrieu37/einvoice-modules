@@ -328,6 +328,23 @@ async def test_conflict_with_an_unclear_check_backs_off_and_spends_the_grant(wor
     assert await world.cases(settled.document_id) == []
 
 
+async def test_conflict_with_a_check_auth_failure_opens_auth_review_and_spends_the_grant(world):
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, CONFLICT)
+    world.provider.script_check(settled.reference, AUTH_FAILED)
+    await world.set_columns(settled.document_id, request_authorized_resend=True)
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (result.outcome, doc.status, doc.last_error_code, doc.request_authorized_resend) == (
+        "failed",
+        "failed",
+        "auth_failed",
+        False,
+    )
+    assert world.provider.ops() == ["create", "find_by_reference", "check_create"]
+    assert await world.reason_details(settled.document_id, "AUTH_FAILED") == {"phase": "check"}
+
+
 async def test_unconfirmed_job_is_never_resent_even_with_operator_permission(world):
     settled = await lost_create(world, TRANSIENT)
     unconfirmed = ProviderProgress(
