@@ -6,7 +6,8 @@ generation so a stale worker write loses its compare-and-set. Provider lookups r
 transaction; the write then checks that the generation did not move since the read.
 
 The reference code changes only through ``retry_with_new_reference``, which needs the operator's
-note recording the reconciliation at the provider portal and a lookup that finds nothing.
+note recording the reconciliation at the provider portal, a lookup that finds nothing and, once a
+POST was sent under the reference, a status check that finds no job.
 """
 
 import logging
@@ -229,7 +230,9 @@ class ResolveReview:
         ):
             lookup = await self._lookup(document)
             found = lookup.state if lookup is not None else None
-            if resolution == A.RETRY_WITH_NEW_REFERENCE and lookup is not None:
+            if resolution == A.RETRY_WITH_NEW_REFERENCE and (
+                lookup is not None or await self._job_exists(document)
+            ):
                 raise ReferenceStillExists(document.reference_code)
             if resolution == A.ATTACH_DRAFT and found in ("success", "pending", "cancelled"):
                 raise ResolutionNotAllowed(f"provider_record_{found}")
@@ -333,6 +336,19 @@ class ResolveReview:
         account = await self._account(document)
         creds = await self._credentials.client_credentials(account.credential_ref)
         return await self._provider.find_by_reference(account, creds, document.reference_code)
+
+    async def _job_exists(self, document: DocumentRow) -> bool:
+        """Whether the provider still has a job under the reference. The lookup does not see a
+        job that is still running, so a reference that was ever sent is also checked by its
+        tracking code (the reference code) before it may be replaced: any answer but "no such
+        job" keeps it."""
+        if document.post_count == 0:
+            return False
+        assert self._provider is not None and self._credentials is not None
+        account = await self._account(document)
+        creds = await self._credentials.client_credentials(account.credential_ref)
+        job = await self._provider.check_create(account, creds, document.reference_code)
+        return job is not None
 
     async def _lock(
         self, uow: InvoiceUnitOfWork, read: DocumentRow, case_id: UUID, request: _Request

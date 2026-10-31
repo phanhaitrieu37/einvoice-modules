@@ -14,9 +14,12 @@ from tests.fakes.fake_einvoice_provider import (
     CRASH_AFTER_MARK,
     CRASH_AFTER_RECEIVE,
     CRASH_BEFORE_SEND,
+    LOST_RESPONSE,
+    NO_JOB,
     QUOTA,
     TRANSIENT,
     FakeInvoice,
+    check_rejected,
     failed_invoice,
     rejected,
 )
@@ -44,7 +47,12 @@ from invoice_module.domain.errors import (
     ResolutionNotAllowed,
     ScopeMismatch,
 )
-from invoice_module.ports.provider import ProviderInvoice, ProviderProgress
+from invoice_module.ports.provider import (
+    ProviderInvoice,
+    ProviderProgress,
+    ProviderRejected,
+    ProviderTransient,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -234,7 +242,7 @@ async def test_retry_with_new_reference_requires_reconciliation_note(world):
             await world.resolve(settled.document_id, "retry_with_new_reference", note=note)
     doc = await world.doc(settled.document_id)
     assert doc.reference_code == settled.reference
-    assert world.provider.ops() == ["create", "find_by_reference"]
+    assert world.provider.ops() == ["create", "find_by_reference", "check_create"]
     case = await world.open_case(settled.document_id)
     table = world.tables.review_cases
     with pytest.raises(IntegrityError, match="review_cases_note_ck"):
@@ -345,6 +353,94 @@ async def test_rotation_after_reconciliation_total_creates_at_most_one(world):
     [case] = await world.cases(settled.document_id)
     previous = [entry["reference_code"] for entry in case.details["previous_references"]]
     assert previous == [settled.reference]
+
+
+async def test_rotation_refused_while_the_job_is_still_running(world):
+    """The lookup is blind to a running job and the checks before it raced the second POST:
+    the rotation's own check finds the job, so one invoice is issued, never two."""
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, LOST_RESPONSE)
+    world.provider.new_invoice(settled.reference, pending_polls=3)
+    world.provider.lag_lookup(settled.reference)
+    await world.issue()
+    world.past_lease()
+    # Both checks run before the provider has registered the job.
+    world.provider.script_check(settled.reference, NO_JOB, NO_JOB)
+    await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.last_error_code) == ("failed", "document_existed_unresolved")
+    assert await world.reason_details(settled.document_id, "DOCUMENT_EXISTED_UNRESOLVED") == {
+        "provider_state": "none"
+    }
+    before = await world.doc(settled.document_id)
+    seen = len(world.provider.calls)
+    with pytest.raises(ReferenceStillExists):
+        await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    assert world.provider.ops()[seen:] == ["find_by_reference", "check_create"]
+    assert await world.doc(settled.document_id) == before
+    assert await world.open_reasons(settled.document_id) == ["DOCUMENT_EXISTED_UNRESOLVED"]
+    # The operator retries instead: the worker finds the job and the poll loop issues it.
+    await world.resolve(settled.document_id, "retry")
+    await world.drive(rounds=4, step=timedelta(seconds=3))
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.reference_code) == ("issued", settled.reference)
+    assert len(world.provider.posts()) == 2
+    assert world.provider.effective_creates == {settled.reference: 1}
+
+
+@pytest.mark.parametrize("state", ["pending", "success", "failed", "draft", "cancelled"])
+async def test_rotation_refused_when_the_check_answers_with_a_job(world, state):
+    settled = await failed_by(world, CONFLICT)
+    world.provider.script_check(settled.reference, ProviderProgress(state=state))
+    before = await world.doc(settled.document_id)
+    seen = len(world.provider.calls)
+    with pytest.raises(ReferenceStillExists):
+        await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    assert world.provider.ops()[seen:] == ["find_by_reference", "check_create"]
+    await assert_untouched(world, settled, before, "DOCUMENT_EXISTED_UNRESOLVED")
+    assert (await world.doc(settled.document_id)).reference_code == settled.reference
+
+
+@pytest.mark.parametrize("answer", [TRANSIENT, "refused"])
+async def test_rotation_refused_when_the_check_gives_no_answer(world, answer):
+    settled = await failed_by(world, CONFLICT)
+    world.provider.script_check(
+        settled.reference, check_rejected("BAD_REQUEST") if answer == "refused" else answer
+    )
+    before = await world.doc(settled.document_id)
+    error = ProviderRejected if answer == "refused" else ProviderTransient
+    with pytest.raises(error):
+        await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    await assert_untouched(world, settled, before, "DOCUMENT_EXISTED_UNRESOLVED")
+    assert (await world.doc(settled.document_id)).reference_code == settled.reference
+
+
+async def test_rotation_with_no_job_replaces_the_reference(world):
+    settled = await failed_by(world, CONFLICT)
+    seen = len(world.provider.calls)
+    result = await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    assert world.provider.ops()[seen:] == ["find_by_reference", "check_create"]
+    assert result.reference_code != settled.reference
+    assert result.document_status == "queued"
+
+
+async def test_rotation_of_a_reference_never_sent_does_not_check(world):
+    settled = await failed_by(world, AUTH_FAILED_BEFORE_SEND)
+    assert (await world.doc(settled.document_id)).post_count == 0
+    seen = len(world.provider.calls)
+    result = await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    assert world.provider.ops()[seen:] == ["find_by_reference"]
+    assert result.reference_code != settled.reference
+
+
+async def test_rotation_refused_while_an_unconfirmed_job_is_still_known(world):
+    settled = await failed_unconfirmed(world)
+    before = await world.doc(settled.document_id)
+    world.provider.script_lookup(settled.reference, None)
+    world.provider.unconfirmed(settled.reference, "failed")
+    with pytest.raises(ReferenceStillExists):
+        await world.resolve(settled.document_id, "retry_with_new_reference", note=NOTE)
+    await assert_untouched(world, settled, before, "PROVIDER_REJECTED")
 
 
 async def test_operator_change_invalidates_stale_worker_cas(world):
@@ -1596,7 +1692,9 @@ async def test_retry_with_new_reference_while_provider_unconfirmed_follows_the_l
     settled = await failed_unconfirmed(world)
     before = await world.doc(settled.document_id)
     if lookup == "none":
+        # Nothing under the reference at all: no invoice and no job.
         world.provider.script_lookup(settled.reference, None)
+        world.provider.script_check(settled.reference, NO_JOB)
     elif lookup == "failed":
         world.provider.script_lookup(settled.reference, failed_invoice(settled.reference, None))
     else:
