@@ -22,7 +22,7 @@ from invoice_module.application.issuance import (
     finalize_issued,
     missing_issued_facts,
 )
-from invoice_module.application.issue_queued import failed_job_details
+from invoice_module.application.issue_queued import PROVIDER_UNCONFIRMED, failed_job_details
 from invoice_module.domain.enums import DocumentStatus, IssueErrorCode, ReviewReason
 from invoice_module.ports.clock import Clock
 from invoice_module.ports.credentials import CredentialResolver
@@ -42,9 +42,6 @@ from invoice_module.ports.unit_of_work import InvoiceUnitOfWorkFactory
 logger = logging.getLogger(__name__)
 
 _TRANSIENT_DELAY = timedelta(seconds=3)
-# Set by the adapter on a status check, in any state, when the provider says it could not
-# confirm the outcome and asks not to resend: the code is read, never the message.
-PROVIDER_UNCONFIRMED = "provider_unconfirmed"
 # ``check_status`` recorded when the provider has no job under the tracking code.
 CHECK_NO_JOB = "no_job"
 

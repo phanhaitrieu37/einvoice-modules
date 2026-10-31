@@ -163,8 +163,9 @@ class FakeEInvoiceProvider:
         self._lookup_scripts.setdefault(reference_code, deque()).extend(results)
 
     def script_check(self, reference_code: str, *results: Any) -> None:
-        """Each item is ``TRANSIENT``, ``AUTH_FAILED``, ``NO_JOB``, ``check_rejected(code)`` or
-        a ``ProviderProgress`` returned once."""
+        """Each item is ``TRANSIENT``, ``AUTH_FAILED``, ``NO_JOB``, ``check_rejected(code)``,
+        an exception raised as it is (for example ``ProviderTransient(retry_after=...)``) or a
+        ``ProviderProgress`` returned once."""
         self._check_scripts.setdefault(reference_code, deque()).extend(results)
 
     def unconfirmed(
@@ -374,6 +375,8 @@ class FakeEInvoiceProvider:
                 raise ProviderAuthFailed("forbidden")
             if scripted is NO_JOB:
                 return None
+            if isinstance(scripted, Exception):
+                raise scripted
             if isinstance(scripted, tuple) and scripted[0] == "check_rejected":
                 raise ProviderRejected(scripted[1])
             if scripted is not None:

@@ -6,7 +6,8 @@ transport request; the reference has a POST budget (two automatic POSTs by defau
 per operator grant), so no path can send a third automatic create for a reference. Any POST
 whose outcome is unknown is followed by a lookup before anything else is sent, and by a status
 check of its job when the lookup finds nothing: the lookup does not see an invoice whose job is
-still running. The reference code never changes here.
+still running. A 409 whose lookup finds nothing checks the job the same way before any review.
+The reference code never changes here.
 """
 
 import logging
@@ -46,6 +47,7 @@ from invoice_module.ports.provider import (
     IssuerAccountView,
     ProviderAuthFailed,
     ProviderInvoice,
+    ProviderProgress,
     ProviderRejected,
     ProviderTransient,
     QuotaExhausted,
@@ -56,6 +58,9 @@ from invoice_module.ports.unit_of_work import InvoiceUnitOfWorkFactory
 logger = logging.getLogger(__name__)
 
 ISSUED_DATE_INVALID = IssueErrorCode.ISSUED_DATE_INVALID.value
+# Set by the adapter on a status check, in any state, when the provider says it could not
+# confirm the outcome and asks not to resend: the code is read, never the message.
+PROVIDER_UNCONFIRMED = "provider_unconfirmed"
 # Provider rejection code -> error recorded on the document; any other code is a validation
 # error. The code is matched exactly as the adapter passes it: only the synchronous 400 date
 # rejection arrives as ``issued_date_invalid`` and it takes the date path before this table is
@@ -246,22 +251,17 @@ class IssueQueued:
         elif document.post_count > 0:
             # The tracking code is the reference code: a job the provider accepted is found here
             # before its invoice reaches the lookup.
-            try:
-                job = await self._provider.check_create(account, creds, document.reference_code)
-            except ProviderTransient as exc:
-                return await self._backoff(document, exc.retry_after)
-            except ProviderRejected:
-                # A refused check is an unclear answer, never a reason to resend.
-                return await self._backoff(document, None)
-            except ProviderAuthFailed:
-                return await self._fail(
-                    document,
-                    IssueErrorCode.AUTH_FAILED,
-                    ReviewReason.AUTH_FAILED,
-                    {"phase": "check"},
-                )
+            job = await self._check_job(document, account, creds)
+            if isinstance(job, IssueResult):
+                return job
             if job is not None:
-                if job.state != "failed" or not document.request_authorized_resend:
+                if (
+                    job.state != "failed"
+                    or job.error_code == PROVIDER_UNCONFIRMED
+                    or not document.request_authorized_resend
+                ):
+                    # An unconfirmed outcome is never resent (docs: "Không gửi lại yêu cầu"):
+                    # the poll loop opens its review.
                     return await self._to_pending(document, document.reference_code)
                 lookup_state = "failed"
         if document.post_count >= document.post_limit:
@@ -525,6 +525,13 @@ class IssueQueued:
         except ProviderTransient as exc:
             return await self._backoff(document, exc.retry_after, request_authorized_resend=False)
         if found is None:
+            # A 409 means the reference is taken or in use: a job still running is invisible to
+            # the lookup, so its status check decides before any review.
+            job = await self._check_job(document, account, creds, request_authorized_resend=False)
+            if isinstance(job, IssueResult):
+                return job
+            if job is not None:
+                return await self._to_pending(document, document.reference_code)
             details: dict[str, Any] = {"provider_state": "none"}
         elif found.state == "failed":
             details = {"provider_state": "failed"}
@@ -630,7 +637,34 @@ class IssueQueued:
             request_authorized_resend=False,
         )
 
-    async def _transient(self, document: DocumentRow, retry_after: timedelta | None) -> IssueResult:
+    async def _check_job(
+        self,
+        document: DocumentRow,
+        account: IssuerAccountView,
+        creds: ClientCredentials,
+        **values: Any,
+    ) -> ProviderProgress | IssueResult | None:
+        """The status check of the job under the reference; ``None`` means no such job. An
+        unclear answer backs off within the attempt budget and an auth failure opens a review:
+        both come back as the claim's result, and neither ever lets a resend through."""
+        try:
+            return await self._provider.check_create(account, creds, document.reference_code)
+        except ProviderTransient as exc:
+            return await self._transient(document, exc.retry_after, **values)
+        except ProviderRejected:
+            return await self._transient(document, None, **values)
+        except ProviderAuthFailed:
+            return await self._fail(
+                document,
+                IssueErrorCode.AUTH_FAILED,
+                ReviewReason.AUTH_FAILED,
+                {"phase": "check"},
+                **values,
+            )
+
+    async def _transient(
+        self, document: DocumentRow, retry_after: timedelta | None, **values: Any
+    ) -> IssueResult:
         if document.attempts >= self._config.issue_max_attempts:
             return await self._fail(
                 document,
@@ -640,8 +674,9 @@ class IssueQueued:
                     "attempts": document.attempts,
                     "issue_max_attempts": self._config.issue_max_attempts,
                 },
+                **values,
             )
-        return await self._backoff(document, retry_after)
+        return await self._backoff(document, retry_after, **values)
 
     async def _backoff(
         self, document: DocumentRow, retry_after: timedelta | None, **values: Any

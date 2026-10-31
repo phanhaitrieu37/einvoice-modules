@@ -9,16 +9,19 @@ from datetime import date, timedelta
 import pytest
 from tests.fakes.fake_einvoice_provider import (
     AUTH_FAILED,
+    CONFLICT,
     CRASH_AFTER_RECEIVE,
     LOST_RESPONSE,
     NO_JOB,
+    PROVIDER_UNCONFIRMED,
     TRANSIENT,
     check_rejected,
 )
 from tests.fakes.recording import Crash
 
+from invoice_module.application.config import InvoiceModuleConfig
 from invoice_module.domain.enums import DeliveryMode
-from invoice_module.ports.provider import ProviderInvoice, ProviderProgress
+from invoice_module.ports.provider import ProviderInvoice, ProviderProgress, ProviderTransient
 
 pytestmark = pytest.mark.integration
 
@@ -217,3 +220,208 @@ async def test_lookup_lag_hides_only_a_pending_job(world):
     await world.poll()
     found = await world.provider.find_by_reference(None, None, settled.reference)
     assert isinstance(found, ProviderInvoice) and found.state == "success"
+
+
+async def test_job_is_checked_at_the_post_budget_limit(world):
+    """The last automatic POST loses its answer while its job runs: the check still decides."""
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, TRANSIENT, LOST_RESPONSE)
+    world.provider.new_invoice(settled.reference, pending_polls=1)
+    world.provider.lag_lookup(settled.reference)
+    assert [result.outcome for result in await world.issue()] == ["backoff"]
+    world.past_lease()
+    # No job yet: the second (last) POST goes out and its answer is lost.
+    assert [result.outcome for result in await world.issue()] == ["backoff"]
+    world.past_lease()
+    doc = await world.doc(settled.document_id)
+    assert (doc.post_count, doc.post_limit) == (2, 2)
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert result.outcome == "pending_provider"
+    assert world.provider.ops() == [
+        "create",
+        "find_by_reference",
+        "check_create",
+        "create",
+        "find_by_reference",
+        "check_create",
+    ]
+    assert (doc.status, doc.tracking_code, doc.post_count) == (
+        "pending_provider",
+        settled.reference,
+        2,
+    )
+    assert await world.cases(settled.document_id) == []
+    world.advance(timedelta(seconds=3))
+    await world.poll()
+    assert (await world.doc(settled.document_id)).status == "issued"
+    assert len(world.provider.posts(settled.reference)) == 2
+    assert world.provider.effective_creates[settled.reference] == 1
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        ProviderProgress(state="pending"),
+        ProviderProgress(state="success"),
+        ProviderProgress(state="failed"),
+        ProviderProgress(state="failed", error_code=PROVIDER_UNCONFIRMED),
+    ],
+    ids=["pending", "success", "failed", "unconfirmed"],
+)
+async def test_conflict_with_a_blind_lookup_goes_to_the_poll_when_the_job_answers(world, answer):
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, CONFLICT)
+    world.provider.script_check(settled.reference, answer)
+    now = world.clock.now()
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert result.outcome == "pending_provider"
+    assert world.provider.ops() == ["create", "find_by_reference", "check_create"]
+    assert (doc.status, doc.tracking_code, doc.post_count, doc.request_authorized_resend) == (
+        "pending_provider",
+        settled.reference,
+        1,
+        False,
+    )
+    assert doc.pending_since == now
+    assert await world.cases(settled.document_id) == []
+
+
+async def test_conflict_with_no_job_at_the_provider_opens_the_review(world):
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, CONFLICT)
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (result.outcome, doc.status, doc.last_error_code) == (
+        "failed",
+        "failed",
+        "document_existed_unresolved",
+    )
+    assert world.provider.ops() == ["create", "find_by_reference", "check_create"]
+    details = await world.reason_details(settled.document_id, "DOCUMENT_EXISTED_UNRESOLVED")
+    assert details == {"provider_state": "none"}
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [ProviderTransient(retry_after=timedelta(minutes=7)), check_rejected("BAD_REQUEST")],
+    ids=["transient", "refused"],
+)
+async def test_conflict_with_an_unclear_check_backs_off_and_spends_the_grant(world, answer):
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, CONFLICT)
+    world.provider.script_check(settled.reference, answer)
+    await world.set_columns(settled.document_id, request_authorized_resend=True)
+    now = world.clock.now()
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert result.outcome == "backoff"
+    assert world.provider.ops() == ["create", "find_by_reference", "check_create"]
+    assert (doc.status, doc.last_error_code, doc.request_authorized_resend) == (
+        "queued",
+        "transient_error",
+        False,
+    )
+    expected_delay = timedelta(minutes=7) if isinstance(answer, Exception) else timedelta(seconds=2)
+    assert doc.next_attempt_at == now + expected_delay
+    assert await world.cases(settled.document_id) == []
+
+
+async def test_unconfirmed_job_is_never_resent_even_with_operator_permission(world):
+    settled = await lost_create(world, TRANSIENT)
+    unconfirmed = ProviderProgress(
+        state="failed", error_code=PROVIDER_UNCONFIRMED, provider_message="Synthetic"
+    )
+    world.provider.script_check(settled.reference, unconfirmed, unconfirmed)
+    await world.set_columns(settled.document_id, request_authorized_resend=True)
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert result.outcome == "pending_provider"
+    assert world.provider.ops() == ["create", "find_by_reference", "check_create"]
+    assert (doc.status, doc.request_authorized_resend) == ("pending_provider", False)
+    world.advance(timedelta(seconds=3))
+    await world.poll()
+    doc = await world.doc(settled.document_id)
+    assert (doc.status, doc.last_error_code) == ("failed", "provider_failed")
+    details = await world.reason_details(settled.document_id, "PROVIDER_REJECTED")
+    assert details["unconfirmed"] is True
+    assert len(world.provider.posts()) == 1
+
+
+@pytest.mark.parametrize("answer", [TRANSIENT, check_rejected("BAD_REQUEST")])
+async def test_a_check_that_never_answers_ends_in_the_max_attempts_review(world, answer):
+    world.config = InvoiceModuleConfig(issue_max_attempts=3)
+    world.restart()
+    settled = await lost_create(world, TRANSIENT)
+    world.provider.script_check(settled.reference, *[answer] * 10)
+    outcomes = []
+    for _ in range(10):
+        doc = await world.doc(settled.document_id)
+        if doc.status != "queued":
+            break
+        world.clock.set(max(doc.next_attempt_at, world.clock.now()))
+        outcomes += [result.outcome for result in await world.issue()]
+    doc = await world.doc(settled.document_id)
+    # The claim that spends the last attempt opens the review itself.
+    assert outcomes == ["backoff", "failed"]
+    assert world.provider.ops().count("check_create") == 2
+    assert (doc.status, doc.last_error_code, doc.attempts) == (
+        "failed",
+        "max_attempts_exceeded",
+        3,
+    )
+    details = await world.reason_details(settled.document_id, "MAX_ATTEMPTS_EXCEEDED")
+    assert details == {"attempts": 3, "issue_max_attempts": 3}
+    assert len(world.provider.posts()) == 1
+
+
+async def test_transient_check_honours_retry_after(world):
+    settled = await lost_create(world, TRANSIENT)
+    world.provider.script_check(
+        settled.reference, ProviderTransient(retry_after=timedelta(minutes=7))
+    )
+    now = world.clock.now()
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert result.outcome == "backoff"
+    assert doc.next_attempt_at == now + timedelta(minutes=7)
+    assert len(world.provider.posts()) == 1
+
+
+@pytest.mark.parametrize("state", ["success", "draft", "cancelled", "pending"])
+async def test_unfailed_job_is_polled_even_with_operator_permission(world, state):
+    settled = await lost_create(world, TRANSIENT)
+    world.provider.script_check(settled.reference, ProviderProgress(state=state))
+    await world.set_columns(settled.document_id, request_authorized_resend=True)
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert result.outcome == "pending_provider"
+    assert world.provider.ops() == ["create", "find_by_reference", "check_create"]
+    assert (doc.status, doc.tracking_code, doc.request_authorized_resend) == (
+        "pending_provider",
+        settled.reference,
+        False,
+    )
+    assert len(world.provider.posts()) == 1
+
+
+async def test_failed_job_with_permission_at_the_budget_limit_is_labelled_failed(world):
+    settled = await lost_create(world, TRANSIENT)
+    world.provider.script_check(settled.reference, ProviderProgress(state="failed"))
+    await world.set_columns(settled.document_id, post_count=2, request_authorized_resend=True)
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert (result.outcome, doc.status, doc.last_error_code) == (
+        "failed",
+        "failed",
+        "max_attempts_exceeded",
+    )
+    assert world.provider.ops() == ["create", "find_by_reference", "check_create"]
+    details = await world.reason_details(settled.document_id, "MAX_ATTEMPTS_EXCEEDED")
+    assert details == {
+        "post_count": 2,
+        "post_limit": 2,
+        "lookup_state": "failed",
+        "date_resend_used": False,
+    }
