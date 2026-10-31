@@ -371,6 +371,11 @@ cùng reference, cho phép đúng **một** POST nữa tính từ số POST hi�
 nào, ví dụ sau `AUTH_FAILED` khi lấy token); chúng không khôi phục lượt tự gửi lại do ngày. POST
 đó bị từ chối hay lại mất kết quả thì document quay lại review. Sau một lần đổi reference bị
 crash giữa chừng, `retry` đầu tiên cho một POST; thất bại thì `retry` lần nữa.
+Khi tra cứu không thấy gì sau một POST, `retry` kiểm tra job theo reference trước: job `Failed` có
+kết quả đã xác nhận không để lại hoá đơn (SePay `xu-ly-loi`: tra cứu `404`, "có thể gửi lại") và
+được gửi lại đúng một lần với request mới, job ở trạng thái khác được poll (`pending_provider`,
+không POST), kết quả chưa xác nhận bị từ chối (`provider_unconfirmed`), còn lần kiểm không có câu
+trả lời rõ thì báo lỗi provider và không đổi gì.
 
 ### Thu trùng
 
@@ -455,7 +460,8 @@ review; module **không bao giờ** tự đổi reference và không có thời 
 cổng SePay, rồi gọi `retry_with_new_reference` với `note` ghi kết quả đối soát (bắt buộc; DB từ chối
 note trống). Ngay trước khi đổi, module kiểm lại một lần nữa rằng tra cứu không thấy gì và, nếu
 reference đã từng được gửi POST, kiểm tra trạng thái không thấy job nào: tra cứu không thấy job còn
-đang chạy, và có bất kỳ câu trả lời job nào thì từ chối đổi (`ReferenceStillExists`).
+đang chạy, và có bất kỳ câu trả lời job nào thì từ chối đổi (`ReferenceStillExists`), trừ job
+`Failed` có kết quả đã xác nhận thì cho đổi.
 `PROVIDER_TIMEOUT` với `details.last_poll_error = "transient_error"` nghĩa là các lần kiểm cuối
 không nhận được câu trả lời dùng được (ví dụ lần kiểm cứ trả về reference khác).
 `STALE_REFERENCE_FOUND` (sweep thấy bản ghi dưới reference đã thay): xử lý tại cổng theo bảng của

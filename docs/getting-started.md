@@ -379,6 +379,11 @@ the current number (also when nothing was sent yet, for example after `AUTH_FAIL
 getting a token); they never restore the automatic date resend. If that POST is refused or its
 result is lost again, the document comes back to review. After a rotation that crashed half way,
 the first `retry` grants one POST; `retry` again if it fails.
+When the lookup finds nothing after a POST, `retry` first checks the job by reference: a `Failed`
+job with a confirmed outcome left no invoice (SePay `xu-ly-loi`: lookup `404`, "có thể gửi lại")
+and gets exactly one resend with a fresh request, a job in any other state is polled
+(`pending_provider`, no POST), an unconfirmed outcome is refused (`provider_unconfirmed`), and a
+check without a clear answer raises the provider error and changes nothing.
 
 ### Duplicate payment
 
@@ -471,8 +476,8 @@ no time limit. Reconcile the old reference at the SePay portal, then call
 refuses a blank note). Right before the change the module checks once more that the lookup finds
 nothing and, once a POST was sent under the reference, that its status check finds no job: the
 lookup does not see a job that is still running, and any job answer refuses the change
-(`ReferenceStillExists`). A `PROVIDER_TIMEOUT` with `details.last_poll_error = "transient_error"` means the
-last checks got no usable answer (for example a check that kept echoing another reference).
+(`ReferenceStillExists`) except a `Failed` job with a confirmed outcome, which lets it through.
+A `PROVIDER_TIMEOUT` with `details.last_poll_error = "transient_error"` means the last checks got no usable answer (for example a check that kept echoing another reference).
 `STALE_REFERENCE_FOUND` (the sweep found a record under a replaced reference): settle it at the
 portal following the accountant's table below, then `acknowledge`.
 
