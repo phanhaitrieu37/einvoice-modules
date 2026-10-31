@@ -7,7 +7,8 @@ per operator grant), so no path can send a third automatic create for a referenc
 whose outcome is unknown is followed by a lookup before anything else is sent, and by a status
 check of its job when the lookup finds nothing: the lookup does not see an invoice whose job is
 still running. A 409 whose lookup finds nothing checks the job the same way before any review.
-The reference code never changes here.
+A lookup or check that gives no clear answer backs off within the attempt budget and ends in the
+max-attempts review. The reference code never changes here.
 """
 
 import logging
@@ -238,7 +239,7 @@ class IssueQueued:
         try:
             found = await self._provider.find_by_reference(account, creds, document.reference_code)
         except ProviderTransient as exc:
-            return await self._backoff(document, exc.retry_after)
+            return await self._transient(document, exc.retry_after)
         except ProviderAuthFailed:
             return await self._fail(
                 document, IssueErrorCode.AUTH_FAILED, ReviewReason.AUTH_FAILED, {"phase": "lookup"}
@@ -523,7 +524,7 @@ class IssueQueued:
         try:
             found = await self._provider.find_by_reference(account, creds, document.reference_code)
         except ProviderTransient as exc:
-            return await self._backoff(document, exc.retry_after, request_authorized_resend=False)
+            return await self._transient(document, exc.retry_after, request_authorized_resend=False)
         if found is None:
             # A 409 means the reference is taken or in use: a job still running is invisible to
             # the lookup, so its status check decides before any review.
@@ -557,7 +558,7 @@ class IssueQueued:
         try:
             found = await self._provider.find_by_reference(account, creds, document.reference_code)
         except ProviderTransient as exc:
-            return await self._backoff(document, exc.retry_after, request_authorized_resend=False)
+            return await self._transient(document, exc.retry_after, request_authorized_resend=False)
         if found is not None:
             if found.state == "failed":
                 return await self._fail(

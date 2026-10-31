@@ -16,6 +16,7 @@ from tests.fakes.fake_einvoice_provider import (
     PROVIDER_UNCONFIRMED,
     TRANSIENT,
     check_rejected,
+    rejected,
 )
 from tests.fakes.recording import Crash
 
@@ -442,3 +443,89 @@ async def test_failed_job_with_permission_at_the_budget_limit_is_labelled_failed
         "lookup_state": "failed",
         "date_resend_used": False,
     }
+
+
+async def at_last_attempt(world, settled):
+    """The next claim of ``settled`` spends the last attempt of a three-attempt budget."""
+    await world.set_columns(settled.document_id, attempts=2)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [ProviderTransient(retry_after=timedelta(minutes=7)), check_rejected("BAD_REQUEST")],
+    ids=["transient", "refused"],
+)
+async def test_conflict_with_an_unclear_check_on_the_last_attempt_opens_the_review(world, answer):
+    """The claim that spends its last attempt on an unclear check after a 409 opens the
+    max-attempts review, and that review never carries the operator's permission to resend."""
+    world.config = InvoiceModuleConfig(issue_max_attempts=3)
+    world.restart()
+    settled = await world.settle()
+    world.provider.script_create(settled.reference, CONFLICT)
+    world.provider.script_check(settled.reference, answer)
+    await world.set_columns(settled.document_id, request_authorized_resend=True)
+    await at_last_attempt(world, settled)
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert result.outcome == "failed"
+    assert world.provider.ops() == ["create", "find_by_reference", "check_create"]
+    assert (doc.status, doc.last_error_code, doc.attempts, doc.request_authorized_resend) == (
+        "failed",
+        "max_attempts_exceeded",
+        3,
+        False,
+    )
+    assert await world.open_reasons(settled.document_id) == ["MAX_ATTEMPTS_EXCEEDED"]
+    details = await world.reason_details(settled.document_id, "MAX_ATTEMPTS_EXCEEDED")
+    assert details == {"attempts": 3, "issue_max_attempts": 3}
+    assert len(world.provider.posts()) == 1
+
+
+@pytest.mark.parametrize("path", ["frozen_request", "conflict", "date_rejected"])
+async def test_a_lookup_that_never_answers_ends_in_the_max_attempts_review(world, path):
+    """An unclear lookup counts toward the attempt budget on every path that looks up, so the
+    claim that spends the last attempt opens the review instead of backing off once more."""
+    world.config = InvoiceModuleConfig(issue_max_attempts=3)
+    world.restart()
+    if path == "frozen_request":
+        settled = await lost_create(world, TRANSIENT)
+    else:
+        settled = await world.settle()
+        outcome = CONFLICT if path == "conflict" else rejected("issued_date_invalid")
+        world.provider.script_create(settled.reference, outcome)
+    world.provider.script_lookup(settled.reference, TRANSIENT)
+    await world.set_columns(settled.document_id, request_authorized_resend=True)
+    await at_last_attempt(world, settled)
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert result.outcome == "failed"
+    assert world.provider.ops() == ["create", "find_by_reference"]
+    assert (doc.status, doc.last_error_code, doc.attempts) == (
+        "failed",
+        "max_attempts_exceeded",
+        3,
+    )
+    if path != "frozen_request":
+        # The provider answered this POST: the permission to resend it is spent.
+        assert doc.request_authorized_resend is False
+    assert await world.open_reasons(settled.document_id) == ["MAX_ATTEMPTS_EXCEEDED"]
+    details = await world.reason_details(settled.document_id, "MAX_ATTEMPTS_EXCEEDED")
+    assert details == {"attempts": 3, "issue_max_attempts": 3}
+    assert len(world.provider.posts()) == 1
+
+
+@pytest.mark.parametrize("path", ["frozen_request", "conflict", "date_rejected"])
+async def test_a_lookup_that_does_not_answer_backs_off_below_the_budget(world, path):
+    if path == "frozen_request":
+        settled = await lost_create(world, TRANSIENT)
+    else:
+        settled = await world.settle()
+        outcome = CONFLICT if path == "conflict" else rejected("issued_date_invalid")
+        world.provider.script_create(settled.reference, outcome)
+    world.provider.script_lookup(settled.reference, TRANSIENT)
+    [result] = await world.issue()
+    doc = await world.doc(settled.document_id)
+    assert result.outcome == "backoff"
+    assert (doc.status, doc.last_error_code) == ("queued", "transient_error")
+    assert await world.cases(settled.document_id) == []
+    assert len(world.provider.posts()) == 1
