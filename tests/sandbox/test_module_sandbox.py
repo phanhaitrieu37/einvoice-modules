@@ -612,19 +612,18 @@ async def test_module_discount_line_total_matches_lookup_sandbox(
 
 
 def _readiness_evidence() -> Path:
-    """``INVOICE_READINESS_EVIDENCE``, else the newest probe evidence of the main checkout."""
+    """``INVOICE_READINESS_EVIDENCE``, else the probe's ``evidence.json`` of the main checkout
+    (the probe also writes one file per scenario next to it)."""
     override = os.environ.get("INVOICE_READINESS_EVIDENCE")
     if override:
         return Path(override).expanduser()
-    found = sorted((_evidence_dir().parent / "sandbox").glob("*.json"))
-    assert found, "no probe evidence file: run tools.einvoice_probe evidence first"
-    return found[-1]
+    return _evidence_dir().parent / "sandbox" / "evidence.json"
 
 
 async def test_record_issuer_readiness_sandbox(module_sandbox: ModuleSandbox) -> None:
     """The probe's evidence file is recorded on the sandbox account; no create."""
     evidence = _readiness_evidence()
-    assert evidence.is_file(), "readiness evidence file missing"
+    assert evidence.is_file(), "no probe evidence file: run tools.einvoice_probe evidence first"
     world = module_sandbox.world
     readiness = world.invoice.record_issuer_readiness
     assert readiness is not None
