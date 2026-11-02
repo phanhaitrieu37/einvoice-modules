@@ -321,16 +321,22 @@ async def test_check_unknown_tracking_shape(sandbox: Any) -> None:
         accept=tuple(range(200, 600)),
     )
     checks = [c for c in sandbox.wire if c.path == _check_path(tracking_code)]
+    raw_gets = len(checks)
+    progress = await sandbox.provider.check_create(sandbox.account, sandbox.creds, tracking_code)
+    checks = [c for c in sandbox.wire if c.path == _check_path(tracking_code)]
     sandbox.evidence(
         "check_unknown_tracking",
         {
             "gets": len(checks),
             "status": response.status,
-            "content_type": checks[-1].content_type,
+            "content_type": checks[0].content_type,
             "body": response.body,
+            "adapter_returns_none": progress is None,
         },
     )
-    assert len(checks) == 1
+    assert raw_gets == 1
+    assert progress is None
+    assert len(checks) == 2
     assert len(sandbox.creates()) == creates_before
 
 

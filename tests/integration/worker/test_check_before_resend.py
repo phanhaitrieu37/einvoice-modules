@@ -522,10 +522,14 @@ async def test_a_lookup_that_does_not_answer_backs_off_below_the_budget(world, p
         settled = await world.settle()
         outcome = CONFLICT if path == "conflict" else rejected("issued_date_invalid")
         world.provider.script_create(settled.reference, outcome)
-    world.provider.script_lookup(settled.reference, TRANSIENT)
+    world.provider.script_lookup(
+        settled.reference, ProviderTransient(retry_after=timedelta(minutes=7))
+    )
+    now = world.clock.now()
     [result] = await world.issue()
     doc = await world.doc(settled.document_id)
     assert result.outcome == "backoff"
     assert (doc.status, doc.last_error_code) == ("queued", "transient_error")
+    assert doc.next_attempt_at == now + timedelta(minutes=7)
     assert await world.cases(settled.document_id) == []
     assert len(world.provider.posts()) == 1

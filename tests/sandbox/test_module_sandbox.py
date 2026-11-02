@@ -334,6 +334,8 @@ async def test_module_s1_settled_to_issued_sandbox(module_sandbox: ModuleSandbox
             "tracking_equals_reference": document.tracking_code == document.reference_code,
             "check_document_type": invoice.get("document_type"),
             "check_invoice_status": invoice.get("status"),
+            # SePay returns no invoice id, so the artifacts came by reference.
+            "provider_invoice_id_is_null": document.provider_invoice_id is None,
             "artifact_fetch_seconds": round(fetch_seconds, 2),
             "artifact_timeout_s": config.artifact_timeout_s,
             "creates": module_sandbox.creates() - creates_before,
@@ -410,9 +412,13 @@ async def _lost_response_recovers(
     order: Order,
     document: Any,
     send: Callable[[], Awaitable[Any]],
-) -> tuple[Any, int]:
+) -> tuple[Any, int, dict[str, Any]]:
     """``send`` makes the worker send the create whose answer is lost; the lease then runs out
-    and the next claim looks the reference up before anything else."""
+    and the next claim looks the reference up before anything else.
+
+    The third value records the first claim after the crash: whether it consulted the job
+    check (only when the lookup did not yet see the accepted create) and what the lookup
+    answered first."""
     creates_before = module_sandbox.creates()
     module_sandbox.provider.lose.add(document.reference_code)
     with pytest.raises(SimulatedCrash):
@@ -425,15 +431,24 @@ async def _lost_response_recovers(
     paths_before = len(module_sandbox.paths())
     assert module_sandbox.world.invoice.issue_queued is not None
     await module_sandbox.world.invoice.issue_queued.run_batch()
-    first_after = module_sandbox.paths()[paths_before:]
+    first_calls = module_sandbox.sandbox.wire[paths_before:]
+    first_after = [call.path for call in first_calls]
     lookup_path = ENDPOINTS["get_by_reference"][1].replace(
         "{reference_code}", document.reference_code
     )
+    check_path = ENDPOINTS["check_create"][1].replace("{tracking_code}", document.reference_code)
     assert lookup_path in first_after and CREATE_PATH not in first_after
+    first_lookup = next(call for call in first_calls if call.path == lookup_path)
+    first_claim = {
+        "check_consulted": check_path in first_after,
+        "first_lookup_status": first_lookup.status,
+        "first_lookup_error_code": first_lookup.error_code,
+    }
     after_claim = await module_sandbox.world.original(order)
+    first_claim["status_after_first_claim"] = after_claim.status
     assert after_claim.status in ("pending_provider", "issued"), after_claim.status
     issued = await module_sandbox.issued(order)
-    return issued, module_sandbox.creates() - creates_before
+    return issued, module_sandbox.creates() - creates_before, first_claim
 
 
 async def test_module_lost_response_recovers_via_lookup_sandbox(
@@ -445,7 +460,7 @@ async def test_module_lost_response_recovers_via_lookup_sandbox(
     order, document = await module_sandbox.settle()
     issue = module_sandbox.world.invoice.issue_queued
     assert issue is not None
-    issued, creates = await _lost_response_recovers(
+    issued, creates, first_claim = await _lost_response_recovers(
         module_sandbox, order, document, issue.run_batch
     )
     found = await module_sandbox.lookup(issued.reference_code)
@@ -454,6 +469,7 @@ async def test_module_lost_response_recovers_via_lookup_sandbox(
         {
             "status": issued.status,
             "creates": creates,
+            **first_claim,
             "lookup_state": found.state if found else None,
             "lookup_number_matches": bool(found and found.invoice_number == issued.invoice_number),
         },
@@ -474,7 +490,7 @@ async def test_module_manual_create_lost_response_recovers_sandbox(
     await module_sandbox.world.invoice.approve_draft_invoice.execute(document.id, ACCOUNTANT)
     issue = module_sandbox.world.invoice.issue_queued
     assert issue is not None
-    issued, creates = await _lost_response_recovers(
+    issued, creates, first_claim = await _lost_response_recovers(
         module_sandbox, order, document, issue.run_batch
     )
     found = await module_sandbox.lookup(issued.reference_code)
@@ -483,6 +499,7 @@ async def test_module_manual_create_lost_response_recovers_sandbox(
         {
             "status": issued.status,
             "creates": creates,
+            **first_claim,
             "issued_date_is_provider_date": bool(found and issued.issued_date == found.issued_date),
             "approved_by_recorded": issued.approved_by == ACCOUNTANT,
         },

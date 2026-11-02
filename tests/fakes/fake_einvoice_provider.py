@@ -161,8 +161,9 @@ class FakeEInvoiceProvider:
         self._any_create.extend(outcomes)
 
     def script_lookup(self, reference_code: str, *results: Any) -> None:
-        """Each item is ``None``, ``TRANSIENT``, ``AUTH_FAILED`` or a ``ProviderInvoice``
-        returned once."""
+        """Each item is ``None``, ``TRANSIENT``, ``AUTH_FAILED``, an exception raised as it is
+        (for example ``ProviderTransient(retry_after=...)``) or a ``ProviderInvoice`` returned
+        once."""
         self._lookup_scripts.setdefault(reference_code, deque()).extend(results)
 
     def script_check(self, reference_code: str, *results: Any) -> None:
@@ -419,6 +420,8 @@ class FakeEInvoiceProvider:
                     raise ProviderTransient()
                 if scripted is AUTH_FAILED:
                     raise ProviderAuthFailed("forbidden")
+                if isinstance(scripted, Exception):
+                    raise scripted
                 return scripted
             invoice = self.invoices.get(reference_code)
             if invoice is None or (
