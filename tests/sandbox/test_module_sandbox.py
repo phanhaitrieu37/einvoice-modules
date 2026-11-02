@@ -9,18 +9,19 @@ checkout; the latency test writes ``.evidence/p5/latency.json``.
 
 Create budget per full run (the quota precheck asks for 40): register none, s1 one, the
 redelivery one, the two lost responses one each, manual one, fractional one, discount one,
-latency twenty.
+readiness none, latency twenty.
 """
 
 import asyncio
 import json
+import logging
 import os
 import statistics
 import subprocess
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -610,15 +611,117 @@ async def test_module_discount_line_total_matches_lookup_sandbox(
     assert found is not None and found.total_amount_vnd == issued.total_vnd
 
 
+def _readiness_evidence() -> Path:
+    """``INVOICE_READINESS_EVIDENCE``, else the newest probe evidence of the main checkout."""
+    override = os.environ.get("INVOICE_READINESS_EVIDENCE")
+    if override:
+        return Path(override).expanduser()
+    found = sorted((_evidence_dir().parent / "sandbox").glob("*.json"))
+    assert found, "no probe evidence file: run tools.einvoice_probe evidence first"
+    return found[-1]
+
+
+async def test_record_issuer_readiness_sandbox(module_sandbox: ModuleSandbox) -> None:
+    """The probe's evidence file is recorded on the sandbox account; no create."""
+    evidence = _readiness_evidence()
+    assert evidence.is_file(), "readiness evidence file missing"
+    world = module_sandbox.world
+    readiness = world.invoice.record_issuer_readiness
+    assert readiness is not None
+    creates_before = module_sandbox.creates()
+    result = await readiness.execute(module_sandbox.issuer.id, str(evidence), ACTOR)
+    accounts = world.inv.issuer_accounts
+    stored = await world.scalar(
+        sa.select(accounts.c.sandbox_evidence_ref).where(accounts.c.id == module_sandbox.issuer.id)
+    )
+    record_evidence(
+        "test_record_issuer_readiness_sandbox",
+        {
+            "evidence_file": evidence.name,
+            "account_matches": result.account_id == module_sandbox.issuer.id,
+            "warnings": list(result.warnings),
+            "evidence_ref_stored": stored == str(evidence),
+            "creates": module_sandbox.creates() - creates_before,
+        },
+    )
+    assert result.account_id == module_sandbox.issuer.id
+    assert result.warnings == ()
+    assert stored == str(evidence)
+    assert module_sandbox.creates() - creates_before == 0
+
+
+def _call_kind(path: str) -> str:
+    if path == CREATE_PATH:
+        return "create"
+    if path.startswith(CREATE_PATH + "/check/"):
+        return "check"
+    if "/download" in path:
+        return "download"
+    if path.startswith("/v1/invoices/"):
+        return "lookup"
+    return "other"
+
+
+class _ClientLog(logging.Handler):
+    """Counts the SePay client's warning lines (abandoned requests and non-OK answers) without
+    keeping any of their text."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+        self.deadlines: list[str] = []
+        self.failures: list[str] = []
+        self.answers: list[tuple[str, str, int]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        args = record.args if isinstance(record.args, tuple) else ()
+        message = record.msg if isinstance(record.msg, str) else ""
+        if message.endswith("total deadline passed") and args:
+            self.deadlines.append(str(args[0]))
+        elif message == "sepay einvoice %s request failed: %s" and len(args) == 2:
+            self.failures.append(f"{args[0]} {args[1]}")
+        elif message.startswith("sepay einvoice %s %s -> HTTP") and len(args) >= 3:
+            kind = _call_kind(str(args[1]).split("?")[0])
+            self.answers.append((str(args[0]), kind, int(args[2])))
+
+    def marks(self) -> tuple[int, int, int]:
+        return len(self.deadlines), len(self.failures), len(self.answers)
+
+    def summary(self, since: tuple[int, int, int] = (0, 0, 0)) -> dict[str, Any]:
+        deadlines = self.deadlines[since[0] :]
+        failures = self.failures[since[1] :]
+        answers = self.answers[since[2] :]
+        return {
+            "deadline_passed": {m: deadlines.count(m) for m in sorted(set(deadlines))},
+            "request_failed": {f: failures.count(f) for f in sorted(set(failures))},
+            "non_ok_answers": {
+                f"{method} {kind} {status}": answers.count((method, kind, status))
+                for method, kind, status in sorted(set(answers))
+            },
+        }
+
+
 @pytest.mark.timeout(1800)
 async def test_latency_p95_twenty_settlements(module_sandbox: ModuleSandbox) -> None:
-    """Twenty settlements, one after the other, with the worker running as a host runs it."""
+    """Twenty settlements, one after the other, with the worker running as a host runs it.
+
+    Besides the percentiles, ``latency.json`` records the provider's health during the run
+    (abandoned requests and non-OK answers), each settlement's send and poll counters, and
+    one lookup per reference after the run."""
     world = module_sandbox.world
+    config = world.invoice.config
+    client_log = _ClientLog()
+    client_logger = logging.getLogger("invoice_module.adapters.sepay.client")
+    client_logger.addHandler(client_log)
+    started_at = datetime.now(UTC).isoformat(timespec="seconds")
     stop = asyncio.Event()
     running = asyncio.create_task(InvoiceWorker(world.build_invoice(), WORKER).run(stop))
     seconds: list[float] = []
+    documents: list[Any] = []
+    per_settlement: list[dict[str, Any]] = []
     try:
         for _ in range(20):
+            since = client_log.marks()
+            wire_from = len(module_sandbox.sandbox.wire)
             order = await world.order(module_sandbox.merchant, lines=module_sandbox.lines())
             await world.pay(order)
             assert await world.dispatch() == 1
@@ -626,9 +729,33 @@ async def test_latency_p95_twenty_settlements(module_sandbox: ModuleSandbox) -> 
                 while (document := await world.original(order)).status != "issued":
                     await asyncio.sleep(0.5)
             seconds.append((document.issued_at - document.settled_at).total_seconds())
+            documents.append(document)
+            mine = [
+                _call_kind(call.path.split("?")[0])
+                for call in module_sandbox.sandbox.wire[wire_from:]
+                if document.reference_code in call.path or call.path == CREATE_PATH
+            ]
+            per_settlement.append(
+                {
+                    "seconds": round(seconds[-1], 2),
+                    "post_count": document.post_count,
+                    "attempts": document.attempts,
+                    "poll_count": document.poll_count,
+                    "answered_calls": mine,
+                    **client_log.summary(since),
+                }
+            )
     finally:
         stop.set()
         await running
+        client_logger.removeHandler(client_log)
+    finished_at = datetime.now(UTC).isoformat(timespec="seconds")
+    for document, row in zip(documents, per_settlement, strict=True):
+        found = await module_sandbox.lookup(document.reference_code)
+        row["provider_state"] = found.state if found else None
+        row["lookup_number_matches"] = bool(
+            found and found.invoice_number == document.invoice_number
+        )
     ordered = sorted(seconds)
     latency = {
         "n": len(ordered),
@@ -636,8 +763,22 @@ async def test_latency_p95_twenty_settlements(module_sandbox: ModuleSandbox) -> 
         "p95_s": round(ordered[max(0, -(-95 * len(ordered) // 100) - 1)], 2),
         "max_s": round(ordered[-1], 2),
     }
+    record = {
+        **latency,
+        "run": {
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "http_timeout_s": config.http_timeout_s,
+            "lease_seconds": config.lease_seconds,
+            "poll_schedule_s": list(config.poll_schedule_s),
+            "worker_issue_s": WORKER.issue_s,
+            "worker_poll_s": WORKER.poll_s,
+        },
+        "provider_health": client_log.summary(),
+        "settlements": per_settlement,
+    }
     path = _evidence_dir() / "latency.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(latency, indent=2) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(mask_ids(record), indent=2) + "\n", encoding="utf-8")
     assert latency["n"] == 20
     assert latency["p95_s"] <= 60, latency
