@@ -124,6 +124,9 @@ class IssueQueued:
         results = []
         for document in claimed:
             try:
+                if not await self._renew_lease(document):
+                    results.append(self._lease_lost(document))
+                    continue
                 results.append(await self._process(document))
             except Exception as exc:
                 # The lease expires and a later claim looks the reference up before any send.
@@ -134,6 +137,23 @@ class IssueQueued:
                 self._count("invoice_issue_errors_total", error=type(exc).__name__)
                 results.append(IssueResult(document.id, "error"))
         return results
+
+    async def _renew_lease(self, document: DocumentRow) -> bool:
+        """The batch is claimed under one lease but processed one document at a time, so each
+        document gets a full lease when its turn comes: a slow document earlier in the batch can
+        no longer leave a later one too little lease to send, and abort it unsent. The write is
+        fenced by the claim's generation; ``False`` means the claim was lost meanwhile."""
+        now = self._clock.now()
+        async with self._uow_factory() as uow:
+            renewed = await uow.documents.update_leased(
+                document.id,
+                document.lease_generation,
+                lease_until=now + timedelta(seconds=self._config.lease_seconds),
+                updated_at=now,
+            )
+            if renewed:
+                await uow.commit()
+        return renewed
 
     # -- claim routing ---------------------------------------------------------------------
 
