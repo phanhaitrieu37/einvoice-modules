@@ -7,6 +7,8 @@ import sys
 
 import pytest
 
+import invoice_module.cli
+
 MAIN = "invoice_module.cli.__main__"
 TYPED_URL = "postgresql+asyncpg://synuser:SYNTHPW0MARKER@127.0.0.1:5433/postgres"
 # Runs the command line as ``python -m invoice_module.cli`` would, with SQLAlchemy missing.
@@ -17,9 +19,12 @@ WITHOUT_SQLALCHEMY = (
 
 
 def fresh_import(monkeypatch: pytest.MonkeyPatch, missing: str) -> object:
+    """Import the entry point as a fresh process would, whatever this session imported."""
     monkeypatch.setitem(sys.modules, missing, None)
     monkeypatch.delitem(sys.modules, MAIN, raising=False)
     monkeypatch.delitem(sys.modules, "invoice_module.cli.approvals", raising=False)
+    # ``from invoice_module.cli import approvals`` reads the package attribute first.
+    monkeypatch.delattr(invoice_module.cli, "approvals", raising=False)
     return importlib.import_module(MAIN)
 
 
