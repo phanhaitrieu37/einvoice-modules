@@ -74,7 +74,8 @@ class HoldDraftInvoice:
             await uow.commit()
         logger.info(
             "invoice_draft_held",
-            extra={"document_id": str(document_id), "actor": actor, "note": note},
+            # The note stays in the review case; it may name the buyer, so the log has its length.
+            extra={"document_id": str(document_id), "actor": actor, "note_length": len(note)},
         )
         increment_safely(self._metrics, "invoice_draft_held_total", {})
         return HoldResult(document_id, case_id, DocumentStatus.BLOCKED)

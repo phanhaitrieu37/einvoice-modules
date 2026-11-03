@@ -75,7 +75,8 @@ class ApproveDraftInvoice:
             await uow.commit()
         logger.info(
             "invoice_draft_approved",
-            extra={"document_id": str(document_id), "actor": actor, "note": note},
+            # The note is free operator text and may name the buyer: only its length is logged.
+            extra={"document_id": str(document_id), "actor": actor, "note_length": len(note or "")},
         )
         increment_safely(self._metrics, "invoice_draft_approved_total", {})
         return ApprovalResult(document_id, DocumentStatus.APPROVED, already_approved=False)

@@ -79,7 +79,10 @@ async def test_approve_moves_awaiting_to_approved_with_actor(world, caplog):
     assert world.metrics.count("invoice_draft_approved_total") == 1
     [record] = [r for r in caplog.records if r.message == "invoice_draft_approved"]
     assert record.actor == "accountant-a"
+    assert record.note_length == len("Checked against the delivery note")
+    assert not hasattr(record, "note")
     assert all("Synthetic Buyer Name" not in str(value) for value in record.__dict__.values())
+    assert all("delivery note" not in str(value) for value in record.__dict__.values())
 
 
 @pytest.mark.parametrize("actor", ["", " ", "\t", "\n", " \t\n "])
