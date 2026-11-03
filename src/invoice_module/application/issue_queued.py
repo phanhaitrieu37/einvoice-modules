@@ -13,7 +13,7 @@ max-attempts review. The reference code never changes here.
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from types import MappingProxyType
 from typing import Any
@@ -118,16 +118,17 @@ class IssueQueued:
                 self._config.lease_seconds,
                 self._owner,
                 limit or self._config.batch_size,
-                count_attempt=True,
+                count_attempt=False,
             )
             await uow.commit()
         results = []
         for document in claimed:
             try:
-                if not await self._renew_lease(document):
+                renewed = await self._renew_lease(document)
+                if renewed is None:
                     results.append(self._lease_lost(document))
                     continue
-                results.append(await self._process(document))
+                results.append(await self._process(renewed))
             except Exception as exc:
                 # The lease expires and a later claim looks the reference up before any send.
                 logger.error(
@@ -138,22 +139,30 @@ class IssueQueued:
                 results.append(IssueResult(document.id, "error"))
         return results
 
-    async def _renew_lease(self, document: DocumentRow) -> bool:
+    async def _renew_lease(self, document: DocumentRow) -> DocumentRow | None:
         """The batch is claimed under one lease but processed one document at a time, so each
         document gets a full lease when its turn comes: a slow document earlier in the batch can
-        no longer leave a later one too little lease to send, and abort it unsent. The write is
-        fenced by the claim's generation; ``False`` means the claim was lost meanwhile."""
+        no longer leave a later one too little lease to send, and abort it unsent.
+
+        An attempt is counted here, when a document's turn starts, not when its batch is claimed:
+        a claim that loses the document before its turn costs nothing, so documents waiting in a
+        batch that another worker takes over never spend their budget unsent. The write is fenced
+        by the claim's generation, which keeps every other writer out, and the row returned
+        carries the charged count; ``None`` means the claim was lost meanwhile."""
         now = self._clock.now()
+        lease_until = now + timedelta(seconds=self._config.lease_seconds)
+        attempts = document.attempts + 1
         async with self._uow_factory() as uow:
-            renewed = await uow.documents.update_leased(
+            if not await uow.documents.update_leased(
                 document.id,
                 document.lease_generation,
-                lease_until=now + timedelta(seconds=self._config.lease_seconds),
+                attempts=attempts,
+                lease_until=lease_until,
                 updated_at=now,
-            )
-            if renewed:
-                await uow.commit()
-        return renewed
+            ):
+                return None
+            await uow.commit()
+        return replace(document, attempts=attempts, lease_until=lease_until)
 
     # -- claim routing ---------------------------------------------------------------------
 
