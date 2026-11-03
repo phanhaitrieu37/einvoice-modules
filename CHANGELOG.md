@@ -65,6 +65,11 @@ and `dist/SHA256SUMS`.
 - No cancellation through the API: an invoice is cancelled at the provider's portal and
   recorded with `mark_cancelled_externally`. Adjustment and replacement invoices come in 0.2.
 - Verified on the SePay eInvoice sandbox only; the Live environment has not been exercised.
+- The module relies on SePay returning the reference code as the `tracking_code` of a create.
+  Every sandbox create did, but the create docs do not promise it. Any other code is never taken
+  as an acceptance, so nothing is issued twice, but such an invoice may need review and its
+  status check and download may not find it; the adapter logs `sepay_tracking_code_mismatch`.
+  Check the first Live invoice (getting started, sections 5 and 13).
 - Issue latency on the sandbox (settlement to issued, `auto` mode, 20 settlements):
   TODO: p95 measured in the sandbox run, not yet recorded.
 - Readiness scenario s3 (an asynchronous `Failed` job) is `INCONCLUSIVE`: the sandbox could not
@@ -75,6 +80,7 @@ and `dist/SHA256SUMS`.
 - A second settlement for the same order is never invoiced on its own: it stays `blocked` with
   a `DUPLICATE_SETTLEMENT` review until an operator retries (invoice it) or waives it (refund
   or offset).
-- The actor of an issuer account status change is written to the log only; storing it in the
-  database waits for `schema_v2` in 0.2.
+- The actor of an issuer account status change, and the actor who records an account's
+  readiness evidence (log `invoice_issuer_readiness_recorded`), are written to the log only;
+  storing them in the database waits for `schema_v2` in 0.2.
 - Artifacts on the local filesystem only; one provider (SePay eInvoice).

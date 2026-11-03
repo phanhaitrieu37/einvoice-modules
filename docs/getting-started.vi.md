@@ -195,7 +195,9 @@ async def onboard_issuer(invoice, merchant_id, accounting: dict, provider_accoun
   không phải `INCONCLUSIVE` với `details.s3_variant` là `not_triggerable` hoặc `sync_reject`.
   Lệnh cảnh báo nhưng không chặn khi `tax_authority_approved_date` của tài khoản live sau hôm
   nay (`before_tax_approval_date`; docs: `422 INVOICE_DATE_BEFORE_TAX_APPROVAL` chỉ kiểm ở
-  production) hoặc chưa có (`approval_date_unknown`).
+  production) hoặc chưa có (`approval_date_unknown`). Dòng tài khoản chỉ giữ đường dẫn bằng
+  chứng (`sandbox_evidence_ref`); actor chỉ được ghi vào dòng log
+  `invoice_issuer_readiness_recorded`.
 - **Hoá đơn Live đầu tiên.** Module chờ SePay trả lời lệnh tạo với `tracking_code` chính là
   reference code, như mọi lần tạo trên sandbox (mục 12). Với hoá đơn Live đầu tiên, kiểm rằng
   log không có cảnh báo `sepay_tracking_code_mismatch`, document đã tới `issued`, và PDF, XML

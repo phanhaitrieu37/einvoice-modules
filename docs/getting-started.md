@@ -200,7 +200,9 @@ async def onboard_issuer(invoice, merchant_id, accounting: dict, provider_accoun
   `sync_reject`. It warns without blocking when the live account's
   `tax_authority_approved_date` is after today (`before_tax_approval_date`; docs: `422
   INVOICE_DATE_BEFORE_TAX_APPROVAL` is checked in production only) or not reported
-  (`approval_date_unknown`).
+  (`approval_date_unknown`). The account row keeps only the evidence path
+  (`sandbox_evidence_ref`); the actor is written to the `invoice_issuer_readiness_recorded` log
+  line only.
 - **First Live invoice.** The module expects SePay to answer a create with the reference code
   as its `tracking_code`, as every sandbox create did (section 12). On the first Live invoice,
   check that the log has no `sepay_tracking_code_mismatch` warning, that the document reached
