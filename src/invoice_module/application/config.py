@@ -32,10 +32,13 @@ class InvoiceModuleConfig:
     batch_size: int = 20
 
     def __post_init__(self) -> None:
-        # A client timeout never proves the provider stopped working on a request, so there is
-        # no timeout/lease inequality to enforce here; the timeout only has to be a real wait.
+        # A client timeout never proves the provider stopped working on a request; the lease
+        # only has to outlast one wait, because a POST is granted only while the claim's lease
+        # covers the whole timeout. The host passes the same ``http_timeout_s`` to the client.
         if not math.isfinite(self.http_timeout_s) or self.http_timeout_s <= 0:
             raise ValueError("http_timeout_s must be a positive finite number")
+        if self.lease_seconds <= self.http_timeout_s:
+            raise ValueError("lease_seconds must be greater than http_timeout_s")
         if not math.isfinite(self.artifact_timeout_s) or self.artifact_timeout_s <= 0:
             raise ValueError("artifact_timeout_s must be a positive finite number")
         if not self.poll_schedule_s:

@@ -125,6 +125,10 @@ def build_invoice(engine: AsyncEngine, http: httpx.AsyncClient, artifact_root) -
   Lease tải tệp là `2 × artifact_timeout_s + 30` giây (mặc định 210 giây); timeout của client
   dài hơn giá trị của module để worker khác giành document giữa lúc đang tải. Sandbox từng mất
   khoảng 38 giây cho một lần tải.
+- Truyền cùng một `http_timeout_s` cho `SePayEInvoiceClient` và `InvoiceModuleConfig` (mặc
+  định 20 giây). Config từ chối `lease_seconds` không lớn hơn `http_timeout_s` (`ValueError`):
+  POST chỉ được cấp khi lease của document còn phủ hết thời gian timeout, và vòng xuất gia hạn
+  lease của từng document ngay trước khi xử lý document đó.
 - Dùng use case của module (`module.discard_draft`, `module.submit_draft`, ...) thay vì tự tạo:
   constructor như `DiscardDraft(uow_factory, clock, metrics)` có thể đổi giữa các bản minor.
 

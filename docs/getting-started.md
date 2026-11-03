@@ -128,6 +128,10 @@ def build_invoice(engine: AsyncEngine, http: httpx.AsyncClient, artifact_root) -
   The artifact lease is `2 × artifact_timeout_s + 30` seconds (210 s by default); a client
   timeout longer than the module's value lets another worker take over a document mid-download.
   The sandbox served one download in about 38 s.
+- Pass the same `http_timeout_s` to `SePayEInvoiceClient` and to `InvoiceModuleConfig` (20 s
+  by default). The config refuses a `lease_seconds` that is not greater than `http_timeout_s`
+  (`ValueError`): a POST is granted only while the document's lease covers the whole timeout,
+  and the issue loop renews each document's lease just before it handles that document.
 - Use the module's use cases (`module.discard_draft`, `module.submit_draft`, ...) instead of
   constructing them: constructors such as `DiscardDraft(uow_factory, clock, metrics)` may change
   between minor versions.
