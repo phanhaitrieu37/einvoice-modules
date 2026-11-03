@@ -1,0 +1,16 @@
+{
+  "_comment": "Placeholder values only. Copy this file outside the repository, replace every value with the accountant's settings, and pass it with --accounting-config or INVOICE_ACCOUNTING_CONFIG.",
+  "template_code": "1",
+  "invoice_series_template": "C{YY}TXX",
+  "payment_method": "TM/CK",
+  "buyer_fallback_name": "Người mua không lấy hóa đơn",
+  "buyer_fallback_address": "",
+  "issue_date_cross_day_action": "issue",
+  "product_lines": [
+    {
+      "name": "Placeholder service",
+      "unit": "month",
+      "tax_rate": 10
+    }
+  ]
+}

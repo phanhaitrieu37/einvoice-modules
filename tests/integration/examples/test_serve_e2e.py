@@ -718,6 +718,51 @@ def test_serve_command_line_defaults_and_refusals(tmp_path, capsys):
         serve.read_issuer_config(empty)
 
 
+def test_accounting_config_has_no_default(tmp_path, monkeypatch):
+    monkeypatch.delenv(serve.ACCOUNTING_CONFIG_ENV, raising=False)
+    with pytest.raises(
+        serve.ServeError, match="--accounting-config or set INVOICE_ACCOUNTING_CONFIG"
+    ):
+        serve.accounting_config_path(None)
+    named, given = tmp_path / "named.json", tmp_path / "given.json"
+    monkeypatch.setenv(serve.ACCOUNTING_CONFIG_ENV, str(named))
+    assert serve.accounting_config_path(None) == named
+    assert serve.accounting_config_path(given) == given
+    with pytest.raises(serve.ServeError, match="could not read the accounting configuration"):
+        serve.read_issuer_config(tmp_path / "missing.json")
+    broken = tmp_path / "broken.json"
+    broken.write_text("{")
+    with pytest.raises(serve.ServeError, match="not valid JSON"):
+        serve.read_issuer_config(broken)
+
+
+async def test_commands_without_accounting_config_refuse_without_traceback(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.delenv(serve.ACCOUNTING_CONFIG_ENV, raising=False)
+    # The env files do not exist: the configuration is refused before any of them is read.
+    argv = ["--pm-env", str(tmp_path / "pm.env"), "--inv-env", str(tmp_path / "inv.env")]
+    argv += ["--database-url", "postgresql://x", "--artifact-root", str(tmp_path / "a")]
+    argv += ["--pid-file", str(tmp_path / "p"), "--bank-code", BANK_CODE]
+    argv += ["--account-number", BANK_ACCOUNT]
+    assert await asyncio.to_thread(serve.main, argv) == 1
+    refusal = (
+        "the accounting configuration is required: pass --accounting-config or set "
+        "INVOICE_ACCOUNTING_CONFIG (keys: accounting-config.example.json)"
+    )
+    assert capsys.readouterr().err == f"serve: error: {refusal}\n"
+    order = ["place-order", "--database-url", "postgresql://x", "--amount", "110000"]
+    assert await e2e.run(order) == e2e.EXIT_USAGE
+    assert capsys.readouterr().err == f"e2e place-order: error: {refusal}\n"
+
+
+def test_example_accounting_config_has_every_key_the_host_reads():
+    config = serve.read_issuer_config(serve.ACCOUNTING_CONFIG_EXAMPLE)
+    assert set(ISSUER_CONFIG) - {"rounding_rule"} <= set(config)
+    [line] = e2e.order_lines(config["product_lines"][0], 110_000, "SYN-1")
+    assert line["unit_price_vnd"] == 100_000
+
+
 TYPED_URL = "postgresql+asyncpg://synuser:SYNTHPW0MARKER@127.0.0.1:5433/postgres"
 
 

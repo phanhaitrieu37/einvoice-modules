@@ -12,7 +12,12 @@ The example host [`examples/invoice_host`](../examples/invoice_host) runs the wh
 PostgreSQL with a fake provider and mounts the payment-module webhook router behind a real HTTP
 listener. Its `onboard(payment, invoice, issuer_config, *, provider_account_id)` takes the SePay
 account id as a required keyword, because that id comes from SePay, not from the accountant's
-configuration file.
+configuration file. Its `serve` and `e2e place-order` commands read that file from
+`--accounting-config` or the `INVOICE_ACCOUNTING_CONFIG` variable and refuse to start without
+one; [`accounting-config.example.json`](../examples/invoice_host/accounting-config.example.json)
+shows its keys (`template_code`, `invoice_series_template`, `payment_method`,
+`buyer_fallback_name`, `buyer_fallback_address`, `issue_date_cross_day_action`, and
+`product_lines` with `name`, `unit` and `tax_rate`) with placeholder values.
 
 What the module owns and what your host owns: the module records every `PaymentSettled`,
 freezes the draft your host submitted and issues exactly one original invoice for it at SePay

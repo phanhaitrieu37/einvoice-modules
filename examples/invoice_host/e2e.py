@@ -1,6 +1,7 @@
 """Drive one order of the running example host (``serve``) from the outside.
 
-    python -m examples.invoice_host.e2e place-order --database-url URL --amount N
+    python -m examples.invoice_host.e2e place-order --database-url URL --amount N \\
+        --accounting-config CONFIG_JSON
     python -m examples.invoice_host.e2e pay-local --database-url URL --pm-env PM_ENV_FILE \\
         --url http://127.0.0.1:8787 --intent-id UUID
     python -m examples.invoice_host.e2e wait --database-url URL --intent-id UUID \\
@@ -12,7 +13,8 @@ transaction and prints one JSON line with ``intent_id``, ``payment_reference``,
 it is placed; a transfer that arrives later does not settle it, so make the SePay Test
 transfer within that window (or place a new order). The draft line is the accountant's first
 product line (name, unit, tax rate) with the unit price that makes the total, tax included,
-exactly N.
+exactly N. The accountant's configuration comes from ``--accounting-config`` or
+``INVOICE_ACCOUNTING_CONFIG``, as for ``serve``; without either the command exits 2.
 
 ``pay-local`` stands in for SePay Test: it signs a transfer into the intent's receiving
 account (its bank code and number, as onboarded by ``serve``) with
@@ -56,7 +58,8 @@ from tools.einvoice_probe.envfile import load_env_file
 from .main import TENANT, HostTables, Onboarded, build, define_host_tables, place_order
 from .serve import (
     PM_WEBHOOK_SECRET,
-    default_accounting_config,
+    ServeError,
+    accounting_config_path,
     parse_hiding_values,
     read_issuer_config,
 )
@@ -351,7 +354,7 @@ async def run(argv: Sequence[str]) -> int:
     args = parse_hiding_values(build_parser(), list(argv))
     try:
         if args.command == "place-order":
-            config = read_issuer_config(args.accounting_config or default_accounting_config())
+            config = read_issuer_config(accounting_config_path(args.accounting_config))
             placed = await place(
                 args.database_url,
                 args.amount,
@@ -379,7 +382,7 @@ async def run(argv: Sequence[str]) -> int:
             interval_s=args.interval,
             table_prefix=args.table_prefix,
         )
-    except UsageError as exc:
+    except (UsageError, ServeError) as exc:
         print(f"e2e {args.command}: error: {exc}", file=sys.stderr)
         return EXIT_USAGE
 

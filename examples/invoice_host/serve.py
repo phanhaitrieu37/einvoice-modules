@@ -3,23 +3,28 @@
     python -m examples.invoice_host.serve --pm-env PM_ENV_FILE --inv-env INV_ENV_FILE \\
         --database-url "$DATABASE_URL" --port 8787 \\
         --bank-code BANK --account-number NUMBER \\
-        --artifact-root .evidence/p5/artifacts --pid-file .evidence/p5/serve.pid
+        --artifact-root .evidence/p5/artifacts --pid-file .evidence/p5/serve.pid \\
+        --accounting-config CONFIG_JSON
 
 Both env files are read inside this process and never printed: the payment-module file gives
 ``SEPAY_TEST_WEBHOOK_SECRET`` (the secret SePay Test signs its webhooks with), the invoice
 file gives the sandbox credentials named by ``env:SEPAY_EINVOICE_SANDBOX`` and must declare
 ``SEPAY_EINVOICE_ENVIRONMENT=test``. ``DATABASE_URL`` names a PostgreSQL that is already
-running; this process never starts one. On the first run the tables are created and the
-payment side and the sandbox issuer account (from the accountant's configuration file) are
-onboarded; a later run reuses them. ``--bank-code`` and ``--account-number`` name the account
-SePay Test reports the transfers into (the webhook's ``gateway`` and ``accountNumber``, for
-example ``ACB`` and the account number shown on SePay Test); a webhook for any other account
-settles nothing. Once listening on ``127.0.0.1:PORT`` the process prints
-``READY locator=<locator>`` (SePay Test posts to ``/webhooks/sepay/<locator>``). SIGTERM or
-SIGINT stops the workers and the listener, deletes the pid file and exits 0. A refused start
-(the port already in use, a pid file naming a running process, a database onboarded for
-another account, a wrong env file) prints ``serve: error: ...`` and exits 1; a usage error
-exits 2 without repeating a typed value that could hold the database URL.
+running; this process never starts one. The accountant's configuration file (template code,
+series template, payment method, buyer fallback, cross-day policy and the product lines) is
+named by ``--accounting-config`` or ``INVOICE_ACCOUNTING_CONFIG``; there is no default, and
+``accounting-config.example.json`` next to this file shows the keys with placeholder values.
+On the first run the tables are created and the payment side and the sandbox issuer account
+(from that file) are onboarded; a later run reuses them. ``--bank-code`` and
+``--account-number`` name the account SePay Test reports the transfers into (the webhook's
+``gateway`` and ``accountNumber``, for example ``ACB`` and the account number shown on SePay
+Test); a webhook for any other account settles nothing. Once listening on
+``127.0.0.1:PORT`` the process prints ``READY locator=<locator>`` (SePay Test posts to
+``/webhooks/sepay/<locator>``). SIGTERM or SIGINT stops the workers and the listener, deletes
+the pid file and exits 0. A refused start (no accounting configuration, the port already in
+use, a pid file naming a running process, a database onboarded for another account, a wrong
+env file) prints ``serve: error: ...`` and exits 1; a usage error exits 2 without repeating a
+typed value that could hold the database URL.
 """
 
 from __future__ import annotations
@@ -31,7 +36,6 @@ import json
 import os
 import signal
 import socket
-import subprocess
 import sys
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -64,6 +68,8 @@ SANDBOX_CREDENTIAL_REF = "env:SEPAY_EINVOICE_SANDBOX"
 # stores the reference ``env:SEPAY_TEST_WEBHOOK_SECRET``, resolved in-process.
 PM_WEBHOOK_SECRET = "SEPAY_TEST_WEBHOOK_SECRET"
 WEBHOOK_SECRET_REF = f"env:{PM_WEBHOOK_SECRET}"
+ACCOUNTING_CONFIG_ENV = "INVOICE_ACCOUNTING_CONFIG"
+ACCOUNTING_CONFIG_EXAMPLE = Path(__file__).with_name("accounting-config.example.json")
 # What ``build`` gives the invoice module: the adapter must not wait longer for an answer
 # than the lease the module extends before each send (``http_timeout_s``).
 MODULE_CONFIG = InvoiceModuleConfig()
@@ -87,24 +93,31 @@ class ServeError(RuntimeError):
     """A start-up condition this process refuses; the message holds no secret."""
 
 
-def default_accounting_config() -> Path:
-    """``INVOICE_ACCOUNTING_CONFIG``, else ``plans/reports/accounting-config.json`` of the main
-    checkout (the configuration file the accountant's answers were copied into)."""
-    override = os.environ.get("INVOICE_ACCOUNTING_CONFIG")
-    if override:
-        return Path(override).expanduser()
-    common = subprocess.run(
-        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    return Path(common).parent / "plans" / "reports" / "accounting-config.json"
+def accounting_config_path(given: Path | None) -> Path:
+    """The accountant's configuration file: ``--accounting-config``, else
+    ``INVOICE_ACCOUNTING_CONFIG``. There is no default; ``ACCOUNTING_CONFIG_EXAMPLE`` shows the
+    keys with placeholder values."""
+    if given is not None:
+        return given.expanduser()
+    named = os.environ.get(ACCOUNTING_CONFIG_ENV)
+    if named:
+        return Path(named).expanduser()
+    raise ServeError(
+        f"the accounting configuration is required: pass --accounting-config or set "
+        f"{ACCOUNTING_CONFIG_ENV} (keys: {ACCOUNTING_CONFIG_EXAMPLE.name})"
+    )
 
 
 def read_issuer_config(path: Path) -> dict[str, Any]:
-    config = json.loads(path.read_text(encoding="utf-8"))
-    if not config.get("product_lines"):
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise ServeError(
+            f"could not read the accounting configuration {path} ({exc.strerror})"
+        ) from None
+    except ValueError:
+        raise ServeError(f"the accounting configuration {path} is not valid JSON") from None
+    if not isinstance(config, dict) or not config.get("product_lines"):
         raise ServeError("the accounting configuration has no product line")
     return config
 
@@ -369,10 +382,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 async def _main(args: argparse.Namespace) -> int:
+    issuer_config = read_issuer_config(accounting_config_path(args.accounting_config))
     environ = sandbox_environ(
         load_env_file(args.pm_env.expanduser()), load_env_file(args.inv_env.expanduser())
     )
-    issuer_config = read_issuer_config(args.accounting_config or default_accounting_config())
     options = ServeOptions(
         database_url=args.database_url,
         issuer_config=issuer_config,

@@ -11,7 +11,13 @@ hoá đơn khi tiền về. Nửa sau là runbook cho operator: hàng đợi rev
 Host mẫu [`examples/invoice_host`](../examples/invoice_host) chạy trọn luồng trên PostgreSQL
 với provider giả và gắn router webhook của payment-module sau một listener HTTP thật. Hàm
 `onboard(payment, invoice, issuer_config, *, provider_account_id)` của nó nhận mã tài khoản SePay
-qua keyword bắt buộc, vì mã đó do SePay cấp, không nằm trong file cấu hình của kế toán.
+qua keyword bắt buộc, vì mã đó do SePay cấp, không nằm trong file cấu hình của kế toán. Lệnh
+`serve` và `e2e place-order` của nó đọc file đó từ `--accounting-config` hoặc biến
+`INVOICE_ACCOUNTING_CONFIG` và từ chối chạy khi thiếu cả hai;
+[`accounting-config.example.json`](../examples/invoice_host/accounting-config.example.json)
+cho thấy các khoá (`template_code`, `invoice_series_template`, `payment_method`,
+`buyer_fallback_name`, `buyer_fallback_address`, `issue_date_cross_day_action`, và
+`product_lines` với `name`, `unit`, `tax_rate`) bằng giá trị giữ chỗ.
 
 Phần của module và phần của host: module ghi nhận mọi `PaymentSettled`, đóng băng bản nháp host
 đã nộp và phát hành đúng một hoá đơn gốc cho nó trên SePay eInvoice. Host giữ sản phẩm, giá,
