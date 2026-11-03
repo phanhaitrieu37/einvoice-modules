@@ -346,6 +346,9 @@ tiến trình worker có thể chạy trên cùng DB.
   thì document mở `PROVIDER_TIMEOUT`. Module không bao giờ gửi lại khi job đang chờ (docs
   `xu-ly-loi`: "Nhận Pending có nên tự gửi lại không? Không.").
 - Vòng tải tệp tải PDF và XML, lưu lại và ghi sha256 của chúng.
+- `module.get_document_status` (`by_settlement`, `by_host_ref`) chỉ trả `issued_date` cho
+  document ở `issued`, `replaced` hoặc `cancelled_externally`, khi đó là ngày lập do provider ghi;
+  ở mọi trạng thái khác là `None`, kể cả khi module đã chọn ngày sẽ gửi.
 - Sau `401` trên create, client bỏ token đã cache và không bao giờ gửi lại POST đó trong cùng
   lượt claim; POST đó vẫn tính vào ngân sách. Mỗi tiến trình giữ cache token riêng, nên một
   token bị thu hồi có thể tốn một POST cho mỗi tiến trình.

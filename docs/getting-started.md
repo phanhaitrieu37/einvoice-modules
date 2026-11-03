@@ -353,6 +353,10 @@ database. Several worker processes may run against the same database.
   docs' 2-hour window) the document opens `PROVIDER_TIMEOUT`. The module never resends while a
   job is pending (docs `xu-ly-loi`: "Nhận Pending có nên tự gửi lại không? Không.").
 - The artifact loop downloads the PDF and the XML, stores them and records their sha256.
+- `module.get_document_status` (`by_settlement`, `by_host_ref`) returns `issued_date` only for
+  an `issued`, `replaced` or `cancelled_externally` document, where it is the provider's issue
+  date; in every other status it is `None`, even after the module has chosen the date it will
+  send.
 - After a `401` on a create the client drops its cached token and never resends that POST in
   the same claim; the POST still counts against the budget. Several processes each keep their
   own token cache, so a revoked token may cost one POST per process.
