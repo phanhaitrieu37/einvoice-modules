@@ -4,9 +4,23 @@ import sys
 from collections.abc import Sequence
 from typing import NoReturn
 
-from invoice_module.cli import approvals
-
 PROG = "python -m invoice_module.cli"
+# Without the database extras the commands cannot be imported; one fixed line replaces the
+# traceback. This exit code is defined here because ``approvals`` is what failed to import.
+EXIT_MISSING_EXTRAS = 1
+MISSING_EXTRAS_HINT = (
+    f"{PROG}: error: the operator commands need the database extras; "
+    "install invoice-module[sqlalchemy,postgres]"
+)
+
+try:
+    from invoice_module.cli import approvals
+except ModuleNotFoundError as missing:
+    if (missing.name or "").partition(".")[0] == "invoice_module":
+        raise
+    print(MISSING_EXTRAS_HINT, file=sys.stderr)
+    sys.exit(EXIT_MISSING_EXTRAS)
+
 HIDDEN = "<hidden>"
 # A value that cannot hold a database URL or a password stays readable in a usage error.
 _PLAIN_VALUE = re.compile(r"[\w.-]+")
