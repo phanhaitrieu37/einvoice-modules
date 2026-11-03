@@ -190,6 +190,11 @@ async def onboard_issuer(invoice, merchant_id, accounting: dict, provider_accoun
   Lệnh cảnh báo nhưng không chặn khi `tax_authority_approved_date` của tài khoản live sau hôm
   nay (`before_tax_approval_date`; docs: `422 INVOICE_DATE_BEFORE_TAX_APPROVAL` chỉ kiểm ở
   production) hoặc chưa có (`approval_date_unknown`).
+- **Hoá đơn Live đầu tiên.** Module chờ SePay trả lời lệnh tạo với `tracking_code` chính là
+  reference code, như mọi lần tạo trên sandbox (mục 12). Với hoá đơn Live đầu tiên, kiểm rằng
+  log không có cảnh báo `sepay_tracking_code_mismatch`, document đã tới `issued`, và PDF, XML
+  đã tải về (lệnh tải dùng reference). Nếu cảnh báo xuất hiện, ngừng xuất thêm trên Live cho
+  tới khi xử lý xong (mục 13).
 
 ## 6. Nộp bản nháp cùng CreateIntent
 
@@ -559,6 +564,7 @@ Metric đi vào `MetricsSink` host truyền vào (`increment` kèm tag). Cảnh 
 | `invoice_stale_reference_found_total` | Reference đã thay vẫn sinh bản ghi |
 | log `invoice_document_failed` (warning) | Mọi document chuyển sang `failed`, kèm `error_code`, `reason`, `provider_state` và `provider_message_length` |
 | `worker_loop_errors_total` | Một bước worker ném lỗi |
+| log `sepay_tracking_code_mismatch` (warning) | Lệnh tạo được trả lời bằng tracking code khác reference; không bao giờ coi là đã nhận (tra cứu trước, không có hoá đơn thứ hai). Trên Live, xem mục 13 |
 
 Document hết hạn mức đứng ở `queued` hoặc `approved` và không có lượt chạy kế tiếp, nên cảnh báo
 stale bắn ở mọi lần sweep cho tới khi gia hạn hạn mức và operator `retry`: đây là hành vi chấp
@@ -592,6 +598,11 @@ FROM inv_documents WHERE status = 'issued' AND kind = 'original';
   nháp không tính vào hạn ngạch"; module chưa kiểm được câu này (và không tạo nháp trên SePay). Theo
   dõi `invoice_quota_exhausted_total` trên Live và kiểm `GET /v1/usage` trước đợt xuất lớn (docs:
   "Kiểm tra số lượt còn lại bằng API kiểm tra hạn mức trước khi xuất hóa đơn").
+- **Tracking code.** Docs của lệnh tạo chỉ mô tả `tracking_code` là "Mã tracking để theo dõi
+  trạng thái", và ví dụ của docs trả về mã khác `reference_code` đã gửi; câu "đồng thời là
+  reference_code của hóa đơn mới" thuộc phản hồi điều chỉnh và thay thế. Ví dụ kiểm tra trạng
+  thái của docs và mọi lần tạo trên sandbox từ 25/09/2026 đều trả về chính reference code, và
+  module dựa vào điều đó (mục 13).
 - **Chính sách log.** Adapter và worker chỉ log method, path, HTTP status, mã lỗi, trạng thái job
   và độ dài thông điệp. Văn bản của SePay chỉ nằm trong `review_cases.details.provider_message`.
 
@@ -609,6 +620,11 @@ FROM inv_documents WHERE status = 'issued' AND kind = 'original';
   Người dùng và kế toán đã chấp nhận; đối chiếu với Nghị định 254/2026/NĐ-CP Điều 9 khoản 2 là
   trách nhiệm của kế toán.
 - Thông điệp "chưa xác nhận" không được lưu ở lần kiểm `Pending` hoặc `Success` (mục 9).
+- Module dựa vào việc SePay trả `tracking_code` của lệnh tạo bằng chính reference code; sandbox
+  làm vậy nhưng docs của lệnh tạo không hứa (mục 12); Live chưa kiểm. Mã khác không bao giờ được
+  coi là đã nhận, nên không có hoá đơn nào bị xuất hai lần, nhưng hoá đơn đó chỉ được tìm thấy
+  qua tra cứu và có thể vào review, còn lệnh kiểm trạng thái và lệnh tải, cùng dùng reference,
+  có thể không thấy nó. Kiểm hoá đơn Live đầu tiên (mục 5).
 
 ## 14. Duyệt hoá đơn xuất thủ công
 

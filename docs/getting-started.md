@@ -196,6 +196,12 @@ async def onboard_issuer(invoice, merchant_id, accounting: dict, provider_accoun
   `tax_authority_approved_date` is after today (`before_tax_approval_date`; docs: `422
   INVOICE_DATE_BEFORE_TAX_APPROVAL` is checked in production only) or not reported
   (`approval_date_unknown`).
+- **First Live invoice.** The module expects SePay to answer a create with the reference code
+  as its `tracking_code`, as every sandbox create did (section 12). On the first Live invoice,
+  check that the log has no `sepay_tracking_code_mismatch` warning, that the document reached
+  `issued`, and that its PDF and XML were downloaded (the download is addressed by the
+  reference). If the warning appears, issue nothing more on Live until it is resolved
+  (section 13).
 
 ## 6. Submit the draft with CreateIntent
 
@@ -574,6 +580,7 @@ Metrics go to the `MetricsSink` you pass (`increment` with tags). Alert on:
 | `invoice_stale_reference_found_total` | A replaced reference produced a record |
 | log `invoice_document_failed` (warning) | Every document that goes to `failed`, with `error_code`, `reason`, `provider_state` and `provider_message_length` |
 | `worker_loop_errors_total` | A worker step raised |
+| log `sepay_tracking_code_mismatch` (warning) | A create was answered with a tracking code other than the reference; it is never taken as an acceptance (lookup first, no second invoice). On Live, see section 13 |
 
 A document out of quota stays `queued` or `approved` with no next attempt, so the stale alert
 fires on every sweep until the quota is topped up and the operator retries: this is expected,
@@ -608,6 +615,11 @@ FROM inv_documents WHERE status = 'issued' AND kind = 'original';
   no provider drafts). Watch `invoice_quota_exhausted_total` on Live and check `GET /v1/usage`
   before a large batch (docs: "Kiểm tra số lượt còn lại bằng API kiểm tra hạn mức trước khi xuất
   hóa đơn").
+- **Tracking code.** The create docs describe `tracking_code` only as "Mã tracking để theo dõi
+  trạng thái", and their example returns a code that differs from the `reference_code` sent;
+  the sentence "đồng thời là reference_code của hóa đơn mới" belongs to the adjust and replace
+  responses. The docs' status-check example and every sandbox create since 25/09/2026 returned
+  the reference code itself, and the module relies on that (section 13).
 - **Log policy.** The adapter and the worker log only the method, the path, the HTTP status,
   the error code, the job status and the length of a message. SePay's text is stored only in
   `review_cases.details.provider_message`.
@@ -626,6 +638,12 @@ FROM inv_documents WHERE status = 'issued' AND kind = 'original';
   (usually the approval day). The user and the accountant accepted this; checking it against
   Decree 254/2026/NĐ-CP Article 9, clause 2 is the accountant's responsibility.
 - The unconfirmed message is not stored on `Pending` or `Success` checks (section 9).
+- The module relies on SePay returning the reference code as the `tracking_code` of a create,
+  which the sandbox does but the create docs do not promise (section 12); Live is unverified.
+  Any other code is never taken as an acceptance, so no invoice is issued twice, but such an
+  invoice is found only through the lookup and may end in review, and the status check and the
+  download, both addressed by the reference, may not find it. Check the first Live invoice
+  (section 5).
 
 ## 14. Approve manual-delivery invoices
 

@@ -2,6 +2,7 @@
 
 import base64
 import binascii
+import logging
 from collections.abc import Mapping
 from datetime import date
 from urllib.parse import quote
@@ -30,6 +31,8 @@ from invoice_module.ports.provider import (
     ProviderRejected,
     ProviderTransient,
 )
+
+logger = logging.getLogger(__name__)
 
 NOT_FOUND = 404
 SERVER_ERROR = 500
@@ -71,8 +74,12 @@ class SePayEInvoiceProvider:
         Only ``success: true`` with a tracking code is an acceptance. Any other 2xx is an
         error: a provider error code maps like an error response, and a body without one
         (HTML, empty, 204) is transient, so the caller looks the reference up first. The
-        tracking code "đồng thời là reference_code của hóa đơn mới" (create docs); any other
-        code is an unclear answer (transient), never an acceptance of this request.
+        module expects the tracking code to equal the reference code: every sandbox create
+        returned it so, and the status check of the docs echoes it as ``reference_code``, but
+        the create docs describe ``tracking_code`` only as "Mã tracking để theo dõi trạng thái"
+        (the sentence that it is also the reference code belongs to the adjust and replace
+        responses). Any other code is an unclear answer (transient), never an acceptance of
+        this request, and is logged as ``sepay_tracking_code_mismatch`` without its value.
         """
         method, path = endpoint("create")
         response = await self._client.request(
@@ -82,6 +89,10 @@ class SePayEInvoiceProvider:
         if accepted is None:
             raise _not_accepted(response)
         if accepted.tracking_code != request.get("reference_code"):
+            logger.warning(
+                "sepay_tracking_code_mismatch",
+                extra={"method": method, "path": path, "http_status": response.status},
+            )
             raise ProviderTransient(retry_after=None)
         return accepted
 
