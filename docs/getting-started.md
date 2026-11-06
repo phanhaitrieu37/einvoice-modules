@@ -35,7 +35,7 @@ your host needs:
 
 ```sh
 uv pip install "payment-module[sqlalchemy,postgres,sepay,fastapi] @ https://github.com/phanhaitrieu37/payment-modules/releases/download/v0.1.0/payment_module-0.1.0-py3-none-any.whl"
-uv pip install "invoice-module[sqlalchemy,postgres,sepay,payment]"
+uv pip install "invoice-module[sqlalchemy,postgres,sepay,payment] @ https://github.com/phanhaitrieu37/einvoice-modules/releases/download/v0.1.0/invoice_module-0.1.0-py3-none-any.whl"
 ```
 
 Extras: `sqlalchemy` (tables, repositories, unit of work, Alembic), `postgres` (asyncpg),
