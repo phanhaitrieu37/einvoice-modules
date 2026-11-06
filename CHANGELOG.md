@@ -4,7 +4,7 @@ Every release lists its changes under four contracts: Public API, Event consumpt
 and Known limitations. In 0.x a breaking change to any of them bumps the minor version; fixes
 and additive changes bump the patch version.
 
-## 0.1.0 — TODO: release date (set when the tag is made)
+## 0.1.0 — 2026-11-06
 
 First release of `invoice-module` (import `invoice_module`): one VAT e-invoice through SePay
 eInvoice for every `PaymentSettled` of `payment-module`. The setup is in the
@@ -70,8 +70,10 @@ and `dist/SHA256SUMS`.
   as an acceptance, so nothing is issued twice, but such an invoice may need review and its
   status check and download may not find it; the adapter logs `sepay_tracking_code_mismatch`.
   Check the first Live invoice (getting started, sections 5 and 13).
-- Issue latency on the sandbox (settlement to issued, `auto` mode, 20 settlements):
-  TODO: p95 measured in the sandbox run, not yet recorded.
+- Issue latency on the sandbox (settlement to issued, `auto` mode, 20 settlements, measured
+  2026-11-02): p50 22.8 s, p95 42.0 s, max 43.3 s. An earlier run the same day, while the
+  sandbox answered slowly, measured p95 75.3 s (max 93.0 s); latency follows the provider.
+  A real SePay Test transfer was issued 9.8 s after its webhook arrived (2026-11-06).
 - Readiness scenario s3 (an asynchronous `Failed` job) is `INCONCLUSIVE`: the sandbox could not
   be made to produce one. It is accepted on the evidence of the fake-provider tests of the
   failed-job path.
