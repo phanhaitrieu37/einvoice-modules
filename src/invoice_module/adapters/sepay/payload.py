@@ -7,6 +7,7 @@ it); the code comes from the host's draft and is sent only when the host supplie
 """
 
 import re
+import unicodedata
 from collections.abc import Mapping
 from datetime import date, datetime
 from decimal import Decimal
@@ -44,7 +45,8 @@ _ISO_DATE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
 # "trạng thái hóa đơn chưa xác định. Không gửi lại yêu cầu - hãy liên hệ SePay". After strip
 # the message is this sentence, or this sentence followed by "." and more text (the docs
 # example ``failed_unverified`` adds a second sentence); it is reported as an error code at
-# any job status. No other provider text is interpreted.
+# any job status. Both sides are compared in Unicode NFC, so a decomposed spelling of the same
+# sentence still matches. No other provider text is interpreted.
 PROVIDER_UNCONFIRMED_MESSAGE = (
     "Hệ thống chưa xác nhận được kết quả phát hành với nhà cung cấp hóa đơn"
 )
@@ -237,7 +239,7 @@ def parse_accepted(body: Any) -> Accepted | None:
 
 
 def _unconfirmed(message: str | None) -> str | None:
-    text = message.strip() if message is not None else ""
+    text = unicodedata.normalize("NFC", message.strip()) if message is not None else ""
     if text == PROVIDER_UNCONFIRMED_MESSAGE or text.startswith(PROVIDER_UNCONFIRMED_MESSAGE + "."):
         return PROVIDER_UNCONFIRMED
     return None

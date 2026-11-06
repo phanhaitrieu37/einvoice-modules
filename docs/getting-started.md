@@ -12,7 +12,12 @@ The example host [`examples/invoice_host`](../examples/invoice_host) runs the wh
 PostgreSQL with a fake provider and mounts the payment-module webhook router behind a real HTTP
 listener. Its `onboard(payment, invoice, issuer_config, *, provider_account_id)` takes the SePay
 account id as a required keyword, because that id comes from SePay, not from the accountant's
-configuration file.
+configuration file. Its `serve` and `e2e place-order` commands read that file from
+`--accounting-config` or the `INVOICE_ACCOUNTING_CONFIG` variable and refuse to start without
+one; [`accounting-config.example.json`](../examples/invoice_host/accounting-config.example.json)
+shows its keys (`template_code`, `invoice_series_template`, `payment_method`,
+`buyer_fallback_name`, `buyer_fallback_address`, `issue_date_cross_day_action`, and
+`product_lines` with `name`, `unit` and `tax_rate`) with placeholder values.
 
 What the module owns and what your host owns: the module records every `PaymentSettled`,
 freezes the draft your host submitted and issues exactly one original invoice for it at SePay
@@ -128,6 +133,10 @@ def build_invoice(engine: AsyncEngine, http: httpx.AsyncClient, artifact_root) -
   The artifact lease is `2 × artifact_timeout_s + 30` seconds (210 s by default); a client
   timeout longer than the module's value lets another worker take over a document mid-download.
   The sandbox served one download in about 38 s.
+- Pass the same `http_timeout_s` to `SePayEInvoiceClient` and to `InvoiceModuleConfig` (20 s
+  by default). The config refuses a `lease_seconds` that is not greater than `http_timeout_s`
+  (`ValueError`): a POST is granted only while the document's lease covers the whole timeout,
+  and the issue loop renews each document's lease just before it handles that document.
 - Use the module's use cases (`module.discard_draft`, `module.submit_draft`, ...) instead of
   constructing them: constructors such as `DiscardDraft(uow_factory, clock, metrics)` may change
   between minor versions.
@@ -191,7 +200,15 @@ async def onboard_issuer(invoice, merchant_id, accounting: dict, provider_accoun
   `sync_reject`. It warns without blocking when the live account's
   `tax_authority_approved_date` is after today (`before_tax_approval_date`; docs: `422
   INVOICE_DATE_BEFORE_TAX_APPROVAL` is checked in production only) or not reported
-  (`approval_date_unknown`).
+  (`approval_date_unknown`). The account row keeps only the evidence path
+  (`sandbox_evidence_ref`); the actor is written to the `invoice_issuer_readiness_recorded` log
+  line only.
+- **First Live invoice.** The module expects SePay to answer a create with the reference code
+  as its `tracking_code`, as every sandbox create did (section 12). On the first Live invoice,
+  check that the log has no `sepay_tracking_code_mismatch` warning, that the document reached
+  `issued`, and that its PDF and XML were downloaded (the download is addressed by the
+  reference). If the warning appears, issue nothing more on Live until it is resolved
+  (section 13).
 
 ## 6. Submit the draft with CreateIntent
 
@@ -338,6 +355,10 @@ database. Several worker processes may run against the same database.
   docs' 2-hour window) the document opens `PROVIDER_TIMEOUT`. The module never resends while a
   job is pending (docs `xu-ly-loi`: "Nhận Pending có nên tự gửi lại không? Không.").
 - The artifact loop downloads the PDF and the XML, stores them and records their sha256.
+- `module.get_document_status` (`by_settlement`, `by_host_ref`) returns `issued_date` only for
+  an `issued`, `replaced` or `cancelled_externally` document, where it is the provider's issue
+  date; in every other status it is `None`, even after the module has chosen the date it will
+  send.
 - After a `401` on a create the client drops its cached token and never resends that POST in
   the same claim; the POST still counts against the budget. Several processes each keep their
   own token cache, so a revoked token may cost one POST per process.
@@ -379,6 +400,11 @@ the current number (also when nothing was sent yet, for example after `AUTH_FAIL
 getting a token); they never restore the automatic date resend. If that POST is refused or its
 result is lost again, the document comes back to review. After a rotation that crashed half way,
 the first `retry` grants one POST; `retry` again if it fails.
+When the lookup finds nothing after a POST, `retry` first checks the job by reference: a `Failed`
+job with a confirmed outcome left no invoice (SePay `xu-ly-loi`: lookup `404`, "có thể gửi lại")
+and gets exactly one resend with a fresh request, a job in any other state is polled
+(`pending_provider`, no POST), an unconfirmed outcome is refused (`provider_unconfirmed`), and a
+check without a clear answer raises the provider error and changes nothing.
 
 ### Duplicate payment
 
@@ -468,9 +494,11 @@ lease fencing discards it; a `retry` whose lookup finds nothing queues the docum
 error: the document stays in review; the module **never** changes the reference by itself and has
 no time limit. Reconcile the old reference at the SePay portal, then call
 `retry_with_new_reference` with a `note` recording what you found (required; the database
-refuses a blank note). The module checks once more that the lookup finds nothing right before
-the change. A `PROVIDER_TIMEOUT` with `details.last_poll_error = "transient_error"` means the
-last checks got no usable answer (for example a check that kept echoing another reference).
+refuses a blank note). Right before the change the module checks once more that the lookup finds
+nothing and, once a POST was sent under the reference, that its status check finds no job: the
+lookup does not see a job that is still running, and any job answer refuses the change
+(`ReferenceStillExists`) except a `Failed` job with a confirmed outcome, which lets it through.
+A `PROVIDER_TIMEOUT` with `details.last_poll_error = "transient_error"` means the last checks got no usable answer (for example a check that kept echoing another reference).
 `STALE_REFERENCE_FOUND` (the sweep found a record under a replaced reference): settle it at the
 portal following the accountant's table below, then `acknowledge`.
 
@@ -495,14 +523,15 @@ lý lỗi dựa trên error.code, không khớp theo chuỗi error.message").
 | `400 SELLER_STORE_INACTIVE` | `PROVIDER_REJECTED` (`seller_store_invalid`) |
 | `422 INVOICE_DATE_BEFORE_TAX_APPROVAL` | `PROVIDER_REJECTED` (`registration_not_approved`); production only |
 | `422 REGISTRATION_NOT_TAX_APPROVED` | `PROVIDER_REJECTED` (`registration_not_approved`) |
-| `409 EINVOICE_DOCUMENT_EXISTED` | Every `409` on a create: lookup by reference; never success by itself |
+| `409 EINVOICE_DOCUMENT_EXISTED` | Every `409` on a create: lookup by reference, and the job's status check when the lookup finds nothing (a job answer goes to polling); never success by itself |
 | `500 QUOTA_HAS_BEEN_USERD_UP` | `QUOTA_EXHAUSTED`, no automatic resend |
 | `500 REGISTRATION_NOT_COMPLETE` | `PROVIDER_REJECTED`, account status |
 | `500 BILLING_IS_UNPAID` | `PROVIDER_REJECTED`, account status |
 | `500 EINVOICE_ACCOUNT_NOT_FOUND` | `PROVIDER_REJECTED`, account status |
 | `401` (`TOKEN_EXPIRED`; docs `xu-ly-loi`: "Token quá 24 giờ. Lấy token mới") | New token; on a create no resend in the same claim, and the POST counts |
 | `5xx` without a known code | Transient: retry later, lookup first |
-| `404 EINVOICE_DOCUMENT_NOT_FOUND` on a lookup | No invoice under the reference (the code SePay really returns) |
+| `404 EINVOICE_DOCUMENT_NOT_FOUND` on a lookup | No invoice under the reference (the code SePay really returns), but not proof the create was never received: the lookup does not see a job that is still pending, so the job is checked by reference before any resend, before a `409` opens a review, and before `retry_with_new_reference` replaces the reference |
+| `404 EINVOICE_CREATE_TRACKING_NOT_FOUND` on a status check (matched by code, also on a `500`) | No job under the reference: after a lookup that found nothing, this answer lets the resend through; a job that ended `Failed` is resent only with an operator's `retry` permission, and an unconfirmed outcome never |
 | `2xx` carrying `EINVOICE_DOCUMENT_EXISTED` | Not an acceptance: `PROVIDER_REJECTED` |
 
 ### Corrections after issue (accountant's table)
@@ -562,6 +591,7 @@ Metrics go to the `MetricsSink` you pass (`increment` with tags). Alert on:
 | `invoice_stale_reference_found_total` | A replaced reference produced a record |
 | log `invoice_document_failed` (warning) | Every document that goes to `failed`, with `error_code`, `reason`, `provider_state` and `provider_message_length` |
 | `worker_loop_errors_total` | A worker step raised |
+| log `sepay_tracking_code_mismatch` (warning) | A create was answered with a tracking code other than the reference; it is never taken as an acceptance (lookup first, no second invoice). On Live, see section 13 |
 
 A document out of quota stays `queued` or `approved` with no next attempt, so the stale alert
 fires on every sweep until the quota is topped up and the operator retries: this is expected,
@@ -596,6 +626,11 @@ FROM inv_documents WHERE status = 'issued' AND kind = 'original';
   no provider drafts). Watch `invoice_quota_exhausted_total` on Live and check `GET /v1/usage`
   before a large batch (docs: "Kiểm tra số lượt còn lại bằng API kiểm tra hạn mức trước khi xuất
   hóa đơn").
+- **Tracking code.** The create docs describe `tracking_code` only as "Mã tracking để theo dõi
+  trạng thái", and their example returns a code that differs from the `reference_code` sent;
+  the sentence "đồng thời là reference_code của hóa đơn mới" belongs to the adjust and replace
+  responses. The docs' status-check example and every sandbox create since 25/09/2026 returned
+  the reference code itself, and the module relies on that (section 13).
 - **Log policy.** The adapter and the worker log only the method, the path, the HTTP status,
   the error code, the job status and the length of a message. SePay's text is stored only in
   `review_cases.details.provider_message`.
@@ -614,6 +649,12 @@ FROM inv_documents WHERE status = 'issued' AND kind = 'original';
   (usually the approval day). The user and the accountant accepted this; checking it against
   Decree 254/2026/NĐ-CP Article 9, clause 2 is the accountant's responsibility.
 - The unconfirmed message is not stored on `Pending` or `Success` checks (section 9).
+- The module relies on SePay returning the reference code as the `tracking_code` of a create,
+  which the sandbox does but the create docs do not promise (section 12); Live is unverified.
+  Any other code is never taken as an acceptance, so no invoice is issued twice, but such an
+  invoice is found only through the lookup and may end in review, and the status check and the
+  download, both addressed by the reference, may not find it. Check the first Live invoice
+  (section 5).
 
 ## 14. Approve manual-delivery invoices
 

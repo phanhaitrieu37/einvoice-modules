@@ -178,7 +178,7 @@ async def test_reclaim_with_frozen_request_looks_up_before_post(world):
     await world.issue()
     world.past_lease()
     await world.issue()
-    assert world.provider.ops() == ["create", "find_by_reference", "create"]
+    assert world.provider.ops() == ["create", "find_by_reference", "check_create", "create"]
     assert (await world.doc(settled.document_id)).status == "pending_provider"
 
 
@@ -203,7 +203,7 @@ async def test_reclaim_next_day_review_action_blocks(world):
     doc = await world.doc(settled.document_id)
     assert doc.status == "blocked" and doc.request is not None
     assert await world.open_reasons(settled.document_id) == ["ISSUE_DATE_CROSSED_DAY"]
-    assert world.provider.ops() == ["create", "find_by_reference"]
+    assert world.provider.ops() == ["create", "find_by_reference", "check_create"]
 
 
 async def test_reclaim_next_day_issue_action_refreezes_with_new_date(world):

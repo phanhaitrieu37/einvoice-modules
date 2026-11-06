@@ -12,9 +12,19 @@ from invoice_module.domain.enums import DeliveryMode, DocumentStatus
 from invoice_module.ports.clock import Clock
 from invoice_module.ports.unit_of_work import InvoiceUnitOfWorkFactory
 
+# Statuses in which ``issued_date`` is the provider's issue date. Before the invoice is issued
+# the column holds the date frozen into the unsent request, which is not shown to the host.
+_ISSUED_BY_PROVIDER = frozenset(
+    {DocumentStatus.ISSUED, DocumentStatus.REPLACED, DocumentStatus.CANCELLED_EXTERNALLY}
+)
+
 
 @dataclass(frozen=True)
 class DocumentStatusView:
+    """One document as a host sees it. ``issued_date`` is the provider's issue date, set only
+    once the invoice is ``issued`` (and kept for ``replaced`` and ``cancelled_externally``);
+    ``None`` in every other status."""
+
     document_id: UUID
     settlement_id: UUID
     status: DocumentStatus
@@ -91,7 +101,7 @@ class GetDocumentStatus:
             document.reference_code,
             document.invoice_number,
             document.tax_authority_code,
-            document.issued_date,
+            document.issued_date if document.status in _ISSUED_BY_PROVIDER else None,
             document.pdf_uri,
             document.xml_uri,
             tuple(await uow.review_cases.open_reasons(document.id)),

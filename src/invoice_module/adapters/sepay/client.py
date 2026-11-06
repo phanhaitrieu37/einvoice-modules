@@ -6,9 +6,15 @@ fetches a new one. ``before_send`` runs exactly once per call, after the token a
 limiter and immediately before the transport, so a hook that records the right to POST
 corresponds to at most one request on the wire.
 
-``http_timeout_s`` only ends the client's wait. It does not prove that the provider dropped
-the request; a document whose outcome is unclear stays for the operator to reconcile and
-its reference is never changed here.
+Each request is bounded by a total wall-clock deadline (``http_timeout_s``, or the call's
+``timeout_s`` for a download), not only by httpx's per-read timeout, so an answer that keeps
+trickling in cannot hold a call open longer. A create's deadline starts before
+``before_send``, whose POST grant requires the send lease to outlive ``http_timeout_s``
+from that moment (the module keeps ``lease_seconds`` above ``http_timeout_s``): the call is
+abandoned as ``ProviderTransient`` before another worker can claim the document, and the
+caller looks the reference up before any resend. The deadline only ends the client's wait.
+It does not prove that the provider dropped the request; a document whose outcome is unclear
+stays for the operator to reconcile and its reference is never changed here.
 
 The access token travels only inside ``_Token`` and ``_BearerAuth``, whose reprs hide it, so
 no frame argument or local of a failure traceback shows it. Only a token of the RFC 6750
@@ -21,6 +27,7 @@ The ``httpx.AsyncClient`` is the host's: its own mounts, proxies or event hooks 
 a request really goes, so the sandbox guard here checks the configured base URLs only.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -148,15 +155,16 @@ class SePayEInvoiceClient:
 
         Any other status is raised as a port error. ``SendAborted`` means no request was
         sent because ``before_send`` returned ``False``. ``timeout_s`` replaces
-        ``http_timeout_s`` for this call only.
+        ``http_timeout_s`` for this call only, as the per-read and the total bound.
         """
         url = self.base_url_for(account.environment) + path
         timeout = self._timeout if timeout_s is None else timeout_s
         token, fresh = await self._token(account, creds)
         await self._limiter.acquire()
+        deadline = _deadline(timeout)
         if before_send is not None and not await before_send():
             raise SendAborted()
-        response = await self._send(method, url, token, json, timeout)
+        response = await self._send(method, url, token, json, timeout, deadline)
         if response.status == 401:
             self.invalidate(account)
             if method != "GET":
@@ -166,7 +174,7 @@ class SePayEInvoiceClient:
                 raise ProviderTransient(retry_after=None)
             token, _ = await self._token(account, creds)
             await self._limiter.acquire()
-            response = await self._send(method, url, token, json, timeout)
+            response = await self._send(method, url, token, json, timeout, _deadline(timeout))
             if response.status == 401:
                 self.invalidate(account)
                 raise ProviderAuthFailed("token rejected")
@@ -194,6 +202,7 @@ class SePayEInvoiceClient:
         raw = await self._call(
             method,
             self.base_url_for(account.environment) + path,
+            deadline=_deadline(self._timeout),
             auth=httpx.BasicAuth(creds.client_id, creds.client_secret),
             timeout=self._timeout,
         )
@@ -208,31 +217,45 @@ class SePayEInvoiceClient:
         token: _Token,
         body: Mapping[str, object] | None,
         timeout: float,
+        deadline: float,
     ) -> Response:
         raw = await self._call(
             method,
             url,
+            deadline=deadline,
             json=dict(body) if body is not None else None,
             auth=_BearerAuth(token),
             timeout=timeout,
         )
         return _response(raw)
 
-    async def _call(self, method: str, url: str, **options: Any) -> httpx.Response:
-        """One transport call; a transport failure becomes ``ProviderTransient``.
+    async def _call(
+        self, method: str, url: str, *, deadline: float, **options: Any
+    ) -> httpx.Response:
+        """One transport call, answer body included, abandoned at ``deadline`` (event loop
+        time); a transport failure or the deadline becomes ``ProviderTransient``.
 
         A refused header (``LocalProtocolError``, or a value that cannot be encoded) is not
         chained: its message quotes the header, which may be the ``Authorization`` value.
         """
         try:
-            return await self._http.request(method, url, follow_redirects=False, **options)
+            async with asyncio.timeout_at(deadline):
+                return await self._http.request(method, url, follow_redirects=False, **options)
         except (httpx.LocalProtocolError, UnicodeEncodeError) as error:
             refused = type(error).__name__
+        except TimeoutError as error:
+            logger.warning("sepay einvoice %s request failed: total deadline passed", method)
+            raise ProviderTransient(retry_after=None) from error
         except httpx.HTTPError as error:
             logger.warning("sepay einvoice %s request failed: %s", method, type(error).__name__)
             raise ProviderTransient(retry_after=None) from error
         logger.warning("sepay einvoice %s request failed: %s", method, refused)
         raise ProviderTransient(retry_after=None)
+
+
+def _deadline(timeout_s: float) -> float:
+    """The event-loop time at which a request started now is abandoned."""
+    return asyncio.get_running_loop().time() + timeout_s
 
 
 def _token_key(account: IssuerAccountView) -> tuple[str, Environment]:

@@ -1,3 +1,4 @@
+import logging
 from datetime import timedelta
 
 import pytest
@@ -24,10 +25,11 @@ async def hold(world, settled, actor="accountant-a", note="Wrong buyer name"):
     return await world.module.hold_draft_invoice.execute(settled.document_id, actor, note)
 
 
-async def test_hold_awaiting_moves_to_blocked_with_note_and_actor(world):
+async def test_hold_awaiting_moves_to_blocked_with_note_and_actor(world, caplog):
     settled = await awaiting(world)
     before = await world.doc(settled.document_id)
-    result = await hold(world, settled)
+    with caplog.at_level(logging.INFO):
+        result = await hold(world, settled)
     doc = await world.doc(settled.document_id)
     assert (result.status, doc.status, doc.next_attempt_at) == ("blocked", "blocked", None)
     assert doc.lease_generation == before.lease_generation + 1
@@ -36,6 +38,11 @@ async def test_hold_awaiting_moves_to_blocked_with_note_and_actor(world):
         "held_by": "accountant-a",
     }
     assert world.metrics.count("invoice_draft_held_total") == 1
+    # The note is kept in the review case only; the log line carries its length.
+    [record] = [r for r in caplog.records if r.message == "invoice_draft_held"]
+    assert (record.actor, record.note_length) == ("accountant-a", len("Wrong buyer name"))
+    assert not hasattr(record, "note")
+    assert all("Wrong buyer name" not in str(value) for value in record.__dict__.values())
     await world.drive(rounds=3)
     assert world.provider.calls == []
 

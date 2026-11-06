@@ -2,6 +2,7 @@ import base64
 import copy
 import json
 import time
+import unicodedata
 from collections.abc import Callable
 from datetime import date, datetime
 from decimal import Decimal
@@ -14,6 +15,7 @@ import httpx
 import pytest
 
 from invoice_module.adapters.sepay import endpoints, payload
+from invoice_module.adapters.sepay.errors import CHECK_TRACKING_NOT_FOUND
 from invoice_module.adapters.sepay.payload import (
     build_create_payload,
     parse_accepted,
@@ -334,6 +336,19 @@ def test_parse_check_unconfirmed_docs_example_sets_error_code() -> None:
     assert progress.provider_message == UNCONFIRMED_DOCS_EXAMPLE
 
 
+@pytest.mark.parametrize("status", ["Failed", "Pending", "Success"])
+def test_parse_check_unconfirmed_message_in_decomposed_form_sets_error_code(status: str) -> None:
+    """The same sentence spelled with combining marks (NFD) is still the docs sentence."""
+    for message in (UNCONFIRMED, UNCONFIRMED_DOCS_EXAMPLE):
+        decomposed = unicodedata.normalize("NFD", message)
+        assert decomposed != message
+        body = {"success": True, "data": {"status": status, "message": f" {decomposed}\n"}}
+        assert parse_progress(body).error_code == "provider_unconfirmed"
+    other = unicodedata.normalize("NFD", UNCONFIRMED.replace("hóa", "hoá"))
+    body = {"success": True, "data": {"status": status, "message": other}}
+    assert parse_progress(body).error_code is None
+
+
 # --- provider over a replayed transport -------------------------------------------------
 
 
@@ -417,6 +432,79 @@ async def test_provider_find_by_reference_none_on_404(
     failing = harness(lambda request: httpx.Response(500, json={}))
     with pytest.raises(ProviderTransient):
         await failing.provider.find_by_reference(account, creds, REFERENCE)
+
+
+def test_recorded_unknown_tracking_fixture_is_404_with_envelope(recorded: Loader) -> None:
+    record = recorded("check_unknown_tracking.json")
+    assert record["status"] == 404
+    assert record["request"] == {"method": "GET", "path": endpoints.ENDPOINTS["check_create"][1]}
+    assert record["headers"]["content-type"].startswith("application/json")
+    assert record["body"]["success"] is False
+    assert record["body"]["error"]["code"] == CHECK_TRACKING_NOT_FOUND
+    assert isinstance(record["body"]["error"]["message"], str)
+    assert "data" not in record["body"]
+
+
+@pytest.mark.parametrize("status", [404, 500])
+async def test_provider_check_create_none_when_no_job(
+    status: int,
+    harness: Callable[..., Any],
+    recorded: Loader,
+    account: IssuerAccountView,
+    creds: Any,
+) -> None:
+    """Replays the sandbox answer for a tracking code it never received; the code decides."""
+    h = harness(lambda request: _json(recorded("check_unknown_tracking.json"), status))
+    assert await h.provider.check_create(account, creds, REFERENCE) is None
+    assert [r.url.path for r in h.calls("/v1/invoices/")] == [
+        f"/v1/invoices/create/check/{REFERENCE}"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("response", "error"),
+    [
+        (
+            httpx.Response(404, json={"success": False, "error": {"code": "NOT_FOUND"}}),
+            ProviderRejected,
+        ),
+        (httpx.Response(404, text="<html>Not Found</html>"), ProviderRejected),
+        (
+            httpx.Response(
+                500, json={"success": False, "error": {"code": "EINVOICE_DRAFT_NOT_FOUND"}}
+            ),
+            ProviderTransient,
+        ),
+        (httpx.Response(500, json={}), ProviderTransient),
+        (
+            httpx.Response(
+                200, json={"success": False, "error": {"code": CHECK_TRACKING_NOT_FOUND}}
+            ),
+            ProviderTransient,
+        ),
+        (
+            httpx.Response(
+                404, json={"success": True, "error": {"code": CHECK_TRACKING_NOT_FOUND}}
+            ),
+            ProviderRejected,
+        ),
+        (
+            httpx.Response(500, json={"success": False, "error": {"code": "BILLING_IS_UNPAID"}}),
+            ProviderRejected,
+        ),
+    ],
+)
+async def test_provider_check_create_other_not_found_answers_are_not_no_job(
+    response: httpx.Response,
+    error: type[Exception],
+    harness: Callable[..., Any],
+    account: IssuerAccountView,
+    creds: Any,
+) -> None:
+    """Only the recorded code in an error envelope means "no such job"."""
+    h = harness(lambda request: response)
+    with pytest.raises(error):
+        await h.provider.check_create(account, creds, REFERENCE)
 
 
 @pytest.mark.parametrize(
@@ -892,6 +980,50 @@ async def test_non_finite_or_huge_json_number_is_transient_and_fast(
     assert time.perf_counter() - started < 2
     assert raised.value.retry_after is None
     assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    ("number", "expected"), [("1e18", 10**18), ("9.99e18", 9_990_000_000_000_000_000)]
+)
+async def test_json_number_just_below_ten_to_the_nineteenth_is_read(
+    number: str,
+    expected: int,
+    recorded: Loader,
+    harness: Callable[..., Any],
+    account: IssuerAccountView,
+    creds: Any,
+) -> None:
+    """The refusal starts at 10**19: ``1e18`` is a number like any other, ``1e19`` is not."""
+    facts = await _call_with_number("usage", number, recorded, harness, account, creds)
+    assert facts.quota_remaining == expected
+    assert payload.bounded_decimal(number) == Decimal(number)
+    with pytest.raises(ProviderTransient):
+        await _call_with_number("usage", "1e19", recorded, harness, account, creds)
+    assert payload.bounded_decimal("1e19") is None
+
+
+@pytest.mark.parametrize("number", ["NaN", "1e19", "-Infinity"])
+@pytest.mark.parametrize("path", ["data.invoice.total_amount", "data.invoice.tax_amount"])
+async def test_success_check_with_a_stray_unusable_number_is_never_read(
+    path: str,
+    number: str,
+    recorded: Loader,
+    harness: Callable[..., Any],
+    account: IssuerAccountView,
+    creds: Any,
+) -> None:
+    """A finished check answer with one unusable number anywhere is an unclear answer on every
+    poll: never ``success`` with its invoice number, never ``failed``."""
+    body = copy.deepcopy(recorded("check_success.json")["body"])
+    raw = _with_number(body, path, number)
+    h = harness(lambda request: httpx.Response(200, content=raw))
+    for _ in range(3):
+        with pytest.raises(ProviderTransient) as raised:
+            await h.provider.check_create(account, creds, REFERENCE)
+        assert raised.value.retry_after is None
+    assert len(h.calls("/check/")) == 3
+    clean = harness(lambda request: httpx.Response(200, json=body))
+    assert (await clean.provider.check_create(account, creds, REFERENCE)).state == "success"
 
 
 async def test_json_numbers_are_read_as_decimal_never_float(

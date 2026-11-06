@@ -248,7 +248,14 @@ async def test_review_overdue_counts_business_days(world):
 
 async def test_previous_reference_recheck_opens_review_when_found(world):
     settled = await rotated(world)
-    world.provider.seed_invoice(FakeInvoice(settled.reference, date(2026, 10, 21), 100))
+    world.provider.seed_invoice(
+        FakeInvoice(
+            settled.reference,
+            date(2026, 10, 21),
+            100,
+            provider_invoice_id=f"inv-{settled.reference}",
+        )
+    )
     world.advance(timedelta(hours=1))
     report = await escalate(world)
     assert report.stale_references == [(settled.document_id, settled.reference)]

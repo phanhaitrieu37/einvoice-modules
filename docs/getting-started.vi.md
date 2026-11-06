@@ -11,7 +11,13 @@ hoá đơn khi tiền về. Nửa sau là runbook cho operator: hàng đợi rev
 Host mẫu [`examples/invoice_host`](../examples/invoice_host) chạy trọn luồng trên PostgreSQL
 với provider giả và gắn router webhook của payment-module sau một listener HTTP thật. Hàm
 `onboard(payment, invoice, issuer_config, *, provider_account_id)` của nó nhận mã tài khoản SePay
-qua keyword bắt buộc, vì mã đó do SePay cấp, không nằm trong file cấu hình của kế toán.
+qua keyword bắt buộc, vì mã đó do SePay cấp, không nằm trong file cấu hình của kế toán. Lệnh
+`serve` và `e2e place-order` của nó đọc file đó từ `--accounting-config` hoặc biến
+`INVOICE_ACCOUNTING_CONFIG` và từ chối chạy khi thiếu cả hai;
+[`accounting-config.example.json`](../examples/invoice_host/accounting-config.example.json)
+cho thấy các khoá (`template_code`, `invoice_series_template`, `payment_method`,
+`buyer_fallback_name`, `buyer_fallback_address`, `issue_date_cross_day_action`, và
+`product_lines` với `name`, `unit`, `tax_rate`) bằng giá trị giữ chỗ.
 
 Phần của module và phần của host: module ghi nhận mọi `PaymentSettled`, đóng băng bản nháp host
 đã nộp và phát hành đúng một hoá đơn gốc cho nó trên SePay eInvoice. Host giữ sản phẩm, giá,
@@ -125,6 +131,10 @@ def build_invoice(engine: AsyncEngine, http: httpx.AsyncClient, artifact_root) -
   Lease tải tệp là `2 × artifact_timeout_s + 30` giây (mặc định 210 giây); timeout của client
   dài hơn giá trị của module để worker khác giành document giữa lúc đang tải. Sandbox từng mất
   khoảng 38 giây cho một lần tải.
+- Truyền cùng một `http_timeout_s` cho `SePayEInvoiceClient` và `InvoiceModuleConfig` (mặc
+  định 20 giây). Config từ chối `lease_seconds` không lớn hơn `http_timeout_s` (`ValueError`):
+  POST chỉ được cấp khi lease của document còn phủ hết thời gian timeout, và vòng xuất gia hạn
+  lease của từng document ngay trước khi xử lý document đó.
 - Dùng use case của module (`module.discard_draft`, `module.submit_draft`, ...) thay vì tự tạo:
   constructor như `DiscardDraft(uow_factory, clock, metrics)` có thể đổi giữa các bản minor.
 
@@ -185,7 +195,14 @@ async def onboard_issuer(invoice, merchant_id, accounting: dict, provider_accoun
   không phải `INCONCLUSIVE` với `details.s3_variant` là `not_triggerable` hoặc `sync_reject`.
   Lệnh cảnh báo nhưng không chặn khi `tax_authority_approved_date` của tài khoản live sau hôm
   nay (`before_tax_approval_date`; docs: `422 INVOICE_DATE_BEFORE_TAX_APPROVAL` chỉ kiểm ở
-  production) hoặc chưa có (`approval_date_unknown`).
+  production) hoặc chưa có (`approval_date_unknown`). Dòng tài khoản chỉ giữ đường dẫn bằng
+  chứng (`sandbox_evidence_ref`); actor chỉ được ghi vào dòng log
+  `invoice_issuer_readiness_recorded`.
+- **Hoá đơn Live đầu tiên.** Module chờ SePay trả lời lệnh tạo với `tracking_code` chính là
+  reference code, như mọi lần tạo trên sandbox (mục 12). Với hoá đơn Live đầu tiên, kiểm rằng
+  log không có cảnh báo `sepay_tracking_code_mismatch`, document đã tới `issued`, và PDF, XML
+  đã tải về (lệnh tải dùng reference). Nếu cảnh báo xuất hiện, ngừng xuất thêm trên Live cho
+  tới khi xử lý xong (mục 13).
 
 ## 6. Nộp bản nháp cùng CreateIntent
 
@@ -331,6 +348,9 @@ tiến trình worker có thể chạy trên cùng DB.
   thì document mở `PROVIDER_TIMEOUT`. Module không bao giờ gửi lại khi job đang chờ (docs
   `xu-ly-loi`: "Nhận Pending có nên tự gửi lại không? Không.").
 - Vòng tải tệp tải PDF và XML, lưu lại và ghi sha256 của chúng.
+- `module.get_document_status` (`by_settlement`, `by_host_ref`) chỉ trả `issued_date` cho
+  document ở `issued`, `replaced` hoặc `cancelled_externally`, khi đó là ngày lập do provider ghi;
+  ở mọi trạng thái khác là `None`, kể cả khi module đã chọn ngày sẽ gửi.
 - Sau `401` trên create, client bỏ token đã cache và không bao giờ gửi lại POST đó trong cùng
   lượt claim; POST đó vẫn tính vào ngân sách. Mỗi tiến trình giữ cache token riêng, nên một
   token bị thu hồi có thể tốn một POST cho mỗi tiến trình.
@@ -371,6 +391,11 @@ cùng reference, cho phép đúng **một** POST nữa tính từ số POST hi�
 nào, ví dụ sau `AUTH_FAILED` khi lấy token); chúng không khôi phục lượt tự gửi lại do ngày. POST
 đó bị từ chối hay lại mất kết quả thì document quay lại review. Sau một lần đổi reference bị
 crash giữa chừng, `retry` đầu tiên cho một POST; thất bại thì `retry` lần nữa.
+Khi tra cứu không thấy gì sau một POST, `retry` kiểm tra job theo reference trước: job `Failed` có
+kết quả đã xác nhận không để lại hoá đơn (SePay `xu-ly-loi`: tra cứu `404`, "có thể gửi lại") và
+được gửi lại đúng một lần với request mới, job ở trạng thái khác được poll (`pending_provider`,
+không POST), kết quả chưa xác nhận bị từ chối (`provider_unconfirmed`), còn lần kiểm không có câu
+trả lời rõ thì báo lỗi provider và không đổi gì.
 
 ### Thu trùng
 
@@ -453,7 +478,10 @@ của lease bỏ qua nó; `retry` mà tra cứu không thấy gì thì xếp hà
 `DOCUMENT_EXISTED_UNRESOLVED`, `PROVIDER_TIMEOUT` và tra cứu không thấy gì sau lỗi: document ở lại
 review; module **không bao giờ** tự đổi reference và không có thời hạn. Đối soát reference cũ tại
 cổng SePay, rồi gọi `retry_with_new_reference` với `note` ghi kết quả đối soát (bắt buộc; DB từ chối
-note trống). Module kiểm lại một lần nữa rằng tra cứu không thấy gì ngay trước khi đổi.
+note trống). Ngay trước khi đổi, module kiểm lại một lần nữa rằng tra cứu không thấy gì và, nếu
+reference đã từng được gửi POST, kiểm tra trạng thái không thấy job nào: tra cứu không thấy job còn
+đang chạy, và có bất kỳ câu trả lời job nào thì từ chối đổi (`ReferenceStillExists`), trừ job
+`Failed` có kết quả đã xác nhận thì cho đổi.
 `PROVIDER_TIMEOUT` với `details.last_poll_error = "transient_error"` nghĩa là các lần kiểm cuối
 không nhận được câu trả lời dùng được (ví dụ lần kiểm cứ trả về reference khác).
 `STALE_REFERENCE_FOUND` (sweep thấy bản ghi dưới reference đã thay): xử lý tại cổng theo bảng của
@@ -480,14 +508,15 @@ Module quyết định theo `error.code` và HTTP status, không bao giờ theo 
 | `400 SELLER_STORE_INACTIVE` | `PROVIDER_REJECTED` (`seller_store_invalid`) |
 | `422 INVOICE_DATE_BEFORE_TAX_APPROVAL` | `PROVIDER_REJECTED` (`registration_not_approved`); chỉ production |
 | `422 REGISTRATION_NOT_TAX_APPROVED` | `PROVIDER_REJECTED` (`registration_not_approved`) |
-| `409 EINVOICE_DOCUMENT_EXISTED` | Mọi `409` trên create: tra cứu theo reference; tự nó không bao giờ là thành công |
+| `409 EINVOICE_DOCUMENT_EXISTED` | Mọi `409` trên create: tra cứu theo reference, và kiểm tra trạng thái job khi tra cứu không thấy gì (có job thì chuyển sang poll); tự nó không bao giờ là thành công |
 | `500 QUOTA_HAS_BEEN_USERD_UP` | `QUOTA_EXHAUSTED`, không tự gửi lại |
 | `500 REGISTRATION_NOT_COMPLETE` | `PROVIDER_REJECTED`, trạng thái tài khoản |
 | `500 BILLING_IS_UNPAID` | `PROVIDER_REJECTED`, trạng thái tài khoản |
 | `500 EINVOICE_ACCOUNT_NOT_FOUND` | `PROVIDER_REJECTED`, trạng thái tài khoản |
 | `401` (`TOKEN_EXPIRED`; docs `xu-ly-loi`: "Token quá 24 giờ. Lấy token mới") | Lấy token mới; trên create không gửi lại trong cùng lượt claim, và POST vẫn tính |
 | `5xx` không kèm mã nhận diện được | Tạm thời: thử lại sau, tra cứu trước |
-| `404 EINVOICE_DOCUMENT_NOT_FOUND` khi tra cứu | Không có hoá đơn dưới reference (mã SePay thật sự trả) |
+| `404 EINVOICE_DOCUMENT_NOT_FOUND` khi tra cứu | Không có hoá đơn dưới reference (mã SePay thật sự trả), nhưng không chứng minh create chưa tới SePay: tra cứu không thấy job còn đang xử lý, nên module kiểm tra job theo reference trước mọi lần gửi lại, trước khi một `409` mở review, và trước khi `retry_with_new_reference` thay reference |
+| `404 EINVOICE_CREATE_TRACKING_NOT_FOUND` khi kiểm tra trạng thái (khớp theo mã, cả khi là `500`) | Không có job dưới reference: sau một lần tra cứu không thấy gì, câu trả lời này cho gửi lại; job đã kết thúc `Failed` chỉ gửi lại khi operator cho phép bằng `retry`, còn kết quả chưa xác nhận thì không bao giờ |
 | `2xx` mang `EINVOICE_DOCUMENT_EXISTED` | Không phải tiếp nhận: `PROVIDER_REJECTED` |
 
 ### Sửa sai sau khi phát hành (bảng của kế toán)
@@ -546,6 +575,7 @@ Metric đi vào `MetricsSink` host truyền vào (`increment` kèm tag). Cảnh 
 | `invoice_stale_reference_found_total` | Reference đã thay vẫn sinh bản ghi |
 | log `invoice_document_failed` (warning) | Mọi document chuyển sang `failed`, kèm `error_code`, `reason`, `provider_state` và `provider_message_length` |
 | `worker_loop_errors_total` | Một bước worker ném lỗi |
+| log `sepay_tracking_code_mismatch` (warning) | Lệnh tạo được trả lời bằng tracking code khác reference; không bao giờ coi là đã nhận (tra cứu trước, không có hoá đơn thứ hai). Trên Live, xem mục 13 |
 
 Document hết hạn mức đứng ở `queued` hoặc `approved` và không có lượt chạy kế tiếp, nên cảnh báo
 stale bắn ở mọi lần sweep cho tới khi gia hạn hạn mức và operator `retry`: đây là hành vi chấp
@@ -579,6 +609,11 @@ FROM inv_documents WHERE status = 'issued' AND kind = 'original';
   nháp không tính vào hạn ngạch"; module chưa kiểm được câu này (và không tạo nháp trên SePay). Theo
   dõi `invoice_quota_exhausted_total` trên Live và kiểm `GET /v1/usage` trước đợt xuất lớn (docs:
   "Kiểm tra số lượt còn lại bằng API kiểm tra hạn mức trước khi xuất hóa đơn").
+- **Tracking code.** Docs của lệnh tạo chỉ mô tả `tracking_code` là "Mã tracking để theo dõi
+  trạng thái", và ví dụ của docs trả về mã khác `reference_code` đã gửi; câu "đồng thời là
+  reference_code của hóa đơn mới" thuộc phản hồi điều chỉnh và thay thế. Ví dụ kiểm tra trạng
+  thái của docs và mọi lần tạo trên sandbox từ 25/09/2026 đều trả về chính reference code, và
+  module dựa vào điều đó (mục 13).
 - **Chính sách log.** Adapter và worker chỉ log method, path, HTTP status, mã lỗi, trạng thái job
   và độ dài thông điệp. Văn bản của SePay chỉ nằm trong `review_cases.details.provider_message`.
 
@@ -596,6 +631,11 @@ FROM inv_documents WHERE status = 'issued' AND kind = 'original';
   Người dùng và kế toán đã chấp nhận; đối chiếu với Nghị định 254/2026/NĐ-CP Điều 9 khoản 2 là
   trách nhiệm của kế toán.
 - Thông điệp "chưa xác nhận" không được lưu ở lần kiểm `Pending` hoặc `Success` (mục 9).
+- Module dựa vào việc SePay trả `tracking_code` của lệnh tạo bằng chính reference code; sandbox
+  làm vậy nhưng docs của lệnh tạo không hứa (mục 12); Live chưa kiểm. Mã khác không bao giờ được
+  coi là đã nhận, nên không có hoá đơn nào bị xuất hai lần, nhưng hoá đơn đó chỉ được tìm thấy
+  qua tra cứu và có thể vào review, còn lệnh kiểm trạng thái và lệnh tải, cùng dùng reference,
+  có thể không thấy nó. Kiểm hoá đơn Live đầu tiên (mục 5).
 
 ## 14. Duyệt hoá đơn xuất thủ công
 

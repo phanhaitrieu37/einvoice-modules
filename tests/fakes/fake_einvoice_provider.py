@@ -6,6 +6,11 @@ moment it receives the request, as the sandbox did with ``400 ISSUED_DATE_INVALI
 requests are built by the SePay adapter's own payload builder, so a frozen request has the shape
 the provider receives.
 
+Like SePay, no answer carries a provider invoice id unless a test sets one, a status check of a
+tracking code the provider never received answers "no such job" (``None``), and
+``lag_lookup`` makes the lookup blind to an invoice whose job is still pending, as the sandbox
+was right after accepting a create.
+
 Counting: ``calls`` holds one entry per transport request (a POST that reached the provider,
 whatever its answer) and per read; ``effective_creates`` counts invoices that really exist at the
 provider for a reference (a job that ends ``Failed`` is not an invoice).
@@ -59,6 +64,8 @@ BLOCK = "block"  # the POST waits until the test releases it
 
 # The provider's quota code, spelled exactly as the API returns it.
 QUOTA_CODE = "QUOTA_HAS_BEEN_USERD_UP"
+# A status check answered "no such job" (the adapter returns ``None``).
+NO_JOB = "no_job"
 # The code the adapter sets on a status check whose outcome the provider could not confirm.
 PROVIDER_UNCONFIRMED = "provider_unconfirmed"
 
@@ -104,6 +111,9 @@ class FakeInvoice:
     provider_invoice_id: str | None = None
     # A failed record that does not consume the reference lets a new create succeed.
     consumes_reference: bool = True
+    # A job that ended Failed without an invoice: the lookup answers 404 (``None``) while the
+    # status check still reports the job.
+    lookup_404_when_failed: bool = False
 
 
 @dataclass
@@ -133,6 +143,7 @@ class FakeEInvoiceProvider:
         self._receive_delay: dict[str, deque[timedelta]] = {}
         self._omit_issued_date: dict[str, set[str]] = {}
         self._artifact_failures: Counter[str] = Counter()
+        self._lookup_lags: set[str] = set()
         self._gates: dict[str, _Gate] = {}
         self._built: dict[str, tuple[int, date]] = {}
         self._next_hooks: dict[str, deque[Callable[[], Awaitable[None] | None]]] = {}
@@ -150,12 +161,14 @@ class FakeEInvoiceProvider:
         self._any_create.extend(outcomes)
 
     def script_lookup(self, reference_code: str, *results: Any) -> None:
-        """Each item is ``None``, ``TRANSIENT``, ``AUTH_FAILED`` or a ``ProviderInvoice``
-        returned once."""
+        """Each item is ``None``, ``TRANSIENT``, ``AUTH_FAILED``, an exception raised as it is
+        (for example ``ProviderTransient(retry_after=...)``) or a ``ProviderInvoice`` returned
+        once."""
         self._lookup_scripts.setdefault(reference_code, deque()).extend(results)
 
     def script_check(self, reference_code: str, *results: Any) -> None:
-        """Each item is ``TRANSIENT``, ``AUTH_FAILED``, ``check_rejected(code)`` or a
+        """Each item is ``TRANSIENT``, ``AUTH_FAILED``, ``NO_JOB``, ``check_rejected(code)``,
+        an exception raised as it is (for example ``ProviderTransient(retry_after=...)``) or a
         ``ProviderProgress`` returned once."""
         self._check_scripts.setdefault(reference_code, deque()).extend(results)
 
@@ -200,13 +213,20 @@ class FakeEInvoiceProvider:
         final_state: str = "success",
         message: str | None = None,
         total_amount_vnd: int | None = None,
+        without_record: bool = False,
     ) -> None:
-        """How the next invoice created for ``reference_code`` behaves."""
+        """How the next invoice created for ``reference_code`` behaves.
+
+        ``without_record`` (with ``final_state="failed"``): the job fails and leaves no invoice,
+        as SePay's error-handling guide describes for a ``Failed`` job whose lookup answers 404
+        ("chưa có hóa đơn nào được ghi nhận, có thể gửi lại"): the lookup answers ``None``, the
+        status check still reports the failed job and the reference may be sent again."""
         self._new_invoice[reference_code] = {
             "pending_polls": pending_polls,
             "state": final_state,
             "provider_message": message,
             "total_amount_vnd": total_amount_vnd,
+            "without_record": without_record,
         }
 
     def receive_delay(self, reference_code: str, *delays: timedelta) -> None:
@@ -216,6 +236,10 @@ class FakeEInvoiceProvider:
     def omit_issued_date(self, reference_code: str, *ops: str) -> None:
         self._omit_issued_date[reference_code] = set(ops or ("check", "lookup"))
 
+    def lag_lookup(self, reference_code: str) -> None:
+        """The lookup answers ``None`` while the job of ``reference_code`` is pending."""
+        self._lookup_lags.add(reference_code)
+
     def fail_artifacts(self, reference_code: str, times: int = 1) -> None:
         self._artifact_failures[reference_code] += times
 
@@ -223,7 +247,6 @@ class FakeEInvoiceProvider:
         """A record that already exists at the provider (for example an earlier failed job)."""
         if invoice.invoice_number is None and invoice.state == "success":
             invoice.invoice_number = self._next_number()
-        invoice.provider_invoice_id = invoice.provider_invoice_id or f"inv-{invoice.reference_code}"
         self.invoices[invoice.reference_code] = invoice
 
     def set_account_facts(self, **facts: Any) -> None:
@@ -353,7 +376,7 @@ class FakeEInvoiceProvider:
 
     async def check_create(
         self, account: IssuerAccountView, creds: ClientCredentials, tracking_code: str
-    ) -> ProviderProgress:
+    ) -> ProviderProgress | None:
         self.calls.append(Call("check_create", tracking_code, self.clock.now()))
         scripted = self._pop_one(self._check_scripts, tracking_code)
         try:
@@ -361,13 +384,17 @@ class FakeEInvoiceProvider:
                 raise ProviderTransient()
             if scripted is AUTH_FAILED:
                 raise ProviderAuthFailed("forbidden")
+            if scripted is NO_JOB:
+                return None
+            if isinstance(scripted, Exception):
+                raise scripted
             if isinstance(scripted, tuple) and scripted[0] == "check_rejected":
                 raise ProviderRejected(scripted[1])
             if scripted is not None:
                 return scripted
             invoice = self.invoices.get(tracking_code)
             if invoice is None:
-                raise ProviderTransient()
+                return None
             if invoice.pending_polls > 0:
                 invoice.pending_polls -= 1
                 return ProviderProgress(state="pending")
@@ -393,9 +420,15 @@ class FakeEInvoiceProvider:
                     raise ProviderTransient()
                 if scripted is AUTH_FAILED:
                     raise ProviderAuthFailed("forbidden")
+                if isinstance(scripted, Exception):
+                    raise scripted
                 return scripted
             invoice = self.invoices.get(reference_code)
-            if invoice is None:
+            if invoice is None or (
+                reference_code in self._lookup_lags and invoice.pending_polls > 0
+            ):
+                return None
+            if invoice.lookup_404_when_failed and invoice.pending_polls == 0:
                 return None
             state = "pending" if invoice.pending_polls > 0 else invoice.state
             return ProviderInvoice(
@@ -416,7 +449,7 @@ class FakeEInvoiceProvider:
         account: IssuerAccountView,
         creds: ClientCredentials,
         reference_code: str,
-        provider_invoice_id: str,
+        provider_invoice_id: str | None,
     ) -> Artifacts:
         self.calls.append(Call("fetch_artifacts", reference_code, self.clock.now()))
         try:
@@ -483,8 +516,10 @@ class FakeEInvoiceProvider:
             pending_polls=settings.get("pending_polls", 0),
             provider_message=settings.get("provider_message"),
             invoice_number=self._next_number() if state == "success" else None,
-            provider_invoice_id=f"inv-{reference_code}",
         )
+        if settings.get("without_record") and state == "failed":
+            invoice.lookup_404_when_failed = True
+            invoice.consumes_reference = False
         self.invoices[reference_code] = invoice
         if state == "success":  # a job that ends Failed leaves no invoice behind
             self.effective_creates[reference_code] += 1

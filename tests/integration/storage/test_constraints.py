@@ -1334,6 +1334,25 @@ async def test_awaiting_approval_requires_frozen_request(rows: Rows, status: str
     )
 
 
+@pytest.mark.parametrize("status", ["approved", "awaiting_approval", "pending_provider"])
+async def test_request_ck_rejects_null_request_with_other_markers_set(
+    rows: Rows, status: str
+) -> None:
+    acc = await account(rows)
+    if status == "pending_provider":
+        values = _frozen(acc, status=status, pending_since=_now())
+    else:
+        values = _manual(acc, status=status)
+    if status == "approved":
+        values |= _approval("ref-manual")
+    values |= _frozen_request() | {"request": None}
+    await rows.expect_violation(
+        "documents_request_ck", rows.tables.documents, **rows.document_row(**values)
+    )
+    # The same row with a request is accepted, so the request alone was refused.
+    await rows.document(**values | {"request": {}})
+
+
 @pytest.mark.parametrize("amount", [0, -1])
 async def test_original_settled_amount_must_be_positive(rows: Rows, amount: int) -> None:
     acc = await account(rows)

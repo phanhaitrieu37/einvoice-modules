@@ -113,7 +113,9 @@ class EInvoiceProvider(Protocol):
 
     async def check_create(
         self, account: IssuerAccountView, creds: ClientCredentials, tracking_code: str
-    ) -> ProviderProgress: ...
+    ) -> ProviderProgress | None:
+        """The job of ``tracking_code``; ``None`` when the provider has no such job."""
+        ...
 
     async def find_by_reference(
         self, account: IssuerAccountView, creds: ClientCredentials, reference_code: str
@@ -136,8 +138,11 @@ class EInvoiceProvider(Protocol):
         account: IssuerAccountView,
         creds: ClientCredentials,
         reference_code: str,
-        provider_invoice_id: str,
-    ) -> Artifacts: ...
+        provider_invoice_id: str | None,
+    ) -> Artifacts:
+        """PDF and XML of the invoice under ``reference_code``; ``provider_invoice_id`` is
+        ``None`` when the provider never reported one."""
+        ...
 
     async def describe_account(
         self, account: IssuerAccountView, creds: ClientCredentials

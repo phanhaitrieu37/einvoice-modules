@@ -2,8 +2,9 @@
 
 Polls count in ``poll_count`` and never in ``attempts``; the three-hour timeout is decided only
 by the overdue sweep. The issue date recorded is always the provider's, never the poll date.
-Only a ``success`` answer reaches ``issued``; a status check that is refused is followed by a
-lookup by reference, and an outcome the provider could not confirm goes to review at once.
+Only a ``success`` answer reaches ``issued``; a status check that is refused or finds no job
+is followed by a lookup by reference, and an outcome the provider could not confirm goes to review
+at once.
 """
 
 import logging
@@ -21,7 +22,7 @@ from invoice_module.application.issuance import (
     finalize_issued,
     missing_issued_facts,
 )
-from invoice_module.application.issue_queued import failed_job_details
+from invoice_module.application.issue_queued import PROVIDER_UNCONFIRMED, failed_job_details
 from invoice_module.domain.enums import DocumentStatus, IssueErrorCode, ReviewReason
 from invoice_module.ports.clock import Clock
 from invoice_module.ports.credentials import CredentialResolver
@@ -41,9 +42,8 @@ from invoice_module.ports.unit_of_work import InvoiceUnitOfWorkFactory
 logger = logging.getLogger(__name__)
 
 _TRANSIENT_DELAY = timedelta(seconds=3)
-# Set by the adapter on a status check, in any state, when the provider says it could not
-# confirm the outcome and asks not to resend: the code is read, never the message.
-PROVIDER_UNCONFIRMED = "provider_unconfirmed"
+# ``check_status`` recorded when the provider has no job under the tracking code.
+CHECK_NO_JOB = "no_job"
 
 
 @dataclass(frozen=True)
@@ -113,6 +113,9 @@ class PollPending:
                 except ProviderAuthFailed:
                     # The check is a read: it is retried like any unclear answer.
                     return await self._reschedule(document, _TRANSIENT_DELAY, count_poll=False)
+                if progress is None:
+                    # No job under the tracking code proves nothing about the invoice either.
+                    return await self._check_rejected(document, account, creds, CHECK_NO_JOB)
                 lookup: ProviderInvoice | None = None
             else:
                 lookup = await self._provider.find_by_reference(

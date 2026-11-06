@@ -68,7 +68,8 @@ class FetchArtifacts:
             assert document.issuer_account_id is not None
             async with self._uow_factory() as uow:
                 account = await uow.issuer_accounts.get_view(document.issuer_account_id)
-            assert account is not None and document.provider_invoice_id is not None
+            # SePay reports no provider invoice id: the download is addressed by reference.
+            assert account is not None
             creds = await self._credentials.client_credentials(account.credential_ref)
             artifacts = await self._provider.fetch_artifacts(
                 account, creds, document.reference_code, document.provider_invoice_id
